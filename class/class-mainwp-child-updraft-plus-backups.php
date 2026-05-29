@@ -4340,11 +4340,11 @@ ENDHERE;
 
         MainWP_Helper::instance()->check_methods( $updraftplus_admin, 'include_template' );
 
-        $has_addons = has_filter( 'updraft_backupnow_database_showmoreoptions' ) ? true : false;
+        $has_addons = file_exists( UPDRAFTPLUS_DIR . '/addons/moredatabase.php' ) ? true : false;
 
         return array(
-            'files_selection'  => $has_addons ? $this->files_selector_widgetry( 'backupnow_files_', false, 'sometimes' ) : '',
-            'tables_selection' => $this->backupnow_database_showmoreoptions(),
+            'tables_selection' => $has_addons ? $this->backupnow_database_showmoreoptions() : '',
+            'files_selection'  => $this->files_selector_widgetry( 'backupnow_files_', false, 'sometimes' ),
             'remote_selection' => $this->backup_now_remote_message(),
         );
     }

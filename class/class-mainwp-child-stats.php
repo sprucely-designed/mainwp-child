@@ -436,6 +436,14 @@ class MainWP_Child_Stats { //phpcs:ignore -- NOSONAR - multi methods.
             $information['password_policy_options'] = MainWP_Child_Password_Policy::instance()->get_policy_options();
         }
 
+        if ( class_exists( '\MainWP\Child\SystemMonitor\MainWP_Child_System_Monitor_Storage' ) && class_exists( '\MainWP\Child\SystemMonitor\MainWP_Child_System_Monitor_Runner' ) ) {
+            $information['child_monitor_data'] = array(
+                'issues'                => \MainWP\Child\SystemMonitor\MainWP_Child_System_Monitor_Storage::get_issues( 'cron' ),
+                'last_monitor_run'      => \MainWP\Child\SystemMonitor\MainWP_Child_System_Monitor_Runner::get_last_run(),
+                'last_monitor_cron_run' => \MainWP\Child\SystemMonitor\MainWP_Child_System_Monitor_Runner::get_last_cron_run(),
+            );
+        }
+
         if ( $exit_done ) {
             MainWP_Helper::write( $information );
         }

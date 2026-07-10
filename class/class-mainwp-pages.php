@@ -124,7 +124,7 @@ class MainWP_Pages {
                 // translators: 1: Opening link tag, 2: Closing link tag.
                 $settings_link = sprintf( esc_html__( ' %1$splugin settings%2$s. ', 'mainwp-child' ), '<a href="admin.php?page=mainwp_child_tab">', '</a>' );
                 $msg          .= '<div style="font-size:1.2em;">' . esc_html__( 'For additional security options, visit the ', 'mainwp-child' ) . esc_html( $child_name ) . $settings_link . '</div>';
-                $msg .= '<div style="clear:both"></div>';
+                $msg          .= '<div style="clear:both"></div>';
             }
             $msg .= '</div>';
             echo $msg; //phpcs:ignore -- NOSONAR - ok
@@ -473,7 +473,8 @@ class MainWP_Pages {
                 background: #2D3B44;
             }
 
-            #mainwp-child-settings-page-tabs {
+            #mainwp-child-settings-page-tabs,
+            #mainwp-child-page-content{
                 padding: 20px;
             }
 
@@ -609,7 +610,14 @@ class MainWP_Pages {
                         <a class="nav-tab pos-nav-tab <?php echo ( 'settings' === $shownPage ) ? 'nav-tab-active' : ''; ?>" tab-slug="settings" href="<?php echo $subpage ? 'options-general.php?page=mainwp_child_tab&tab=settings' : '#'; ?>"><?php esc_html_e( 'Settings', 'mainwp-child' ); ?></a>
                     <?php endif; ?>
                     <?php if ( ! $hide_restore && $show_clone_funcs ) : ?>
-                        <a class="nav-tab pos-nav-tab <?php echo ( 'restore-clone' === $shownPage ) ? 'nav-tab-active' : ''; ?>" tab-slug="restore-clone" href="<?php echo $subpage ? 'options-general.php?page=mainwp_child_tab&tab=restore-clone' : '#'; ?>"><?php if ( 0 !== (int) $sitesToClone ) { esc_html_e( 'Restore / Clone', 'mainwp-child' ); } else { esc_html_e( 'Restore', 'mainwp-child' ); } ?></a>
+                        <a class="nav-tab pos-nav-tab <?php echo ( 'restore-clone' === $shownPage ) ? 'nav-tab-active' : ''; ?>" tab-slug="restore-clone" href="<?php echo $subpage ? 'options-general.php?page=mainwp_child_tab&tab=restore-clone' : '#'; ?>">
+                        <?php
+                        if ( 0 !== (int) $sitesToClone ) {
+                            esc_html_e( 'Restore / Clone', 'mainwp-child' );
+                        } else {
+                            esc_html_e( 'Restore', 'mainwp-child' ); }
+                        ?>
+                        </a>
                     <?php endif; ?>
                     <?php if ( ! $hide_server_info ) : ?>
                         <a class="nav-tab pos-nav-tab <?php echo ( 'server-info' === $shownPage ) ? 'nav-tab-active' : ''; ?>" tab-slug="server-info" href="<?php echo $subpage ? 'options-general.php?page=mainwp_child_tab&tab=server-info' : '#'; ?>"><?php esc_html_e( 'Server Information', 'mainwp-child' ); ?></a>
@@ -698,17 +706,24 @@ class MainWP_Pages {
                 <h3><?php esc_html_e( 'Password Authentication - Initial Connection Security', 'mainwp-child' ); ?></h3>
                 <hr/>
             </header>
-            <p><?php
+            <p>
+            <?php
             // translators: 1: Branding title, 2: Branding title, 3: Branding title.
-            printf( esc_html__( '%1$s requests that you connect using an admin account and password for the initial setup. Rest assured, your password is never stored by your Dashboard and never sent to %2$s.com. Once this initial connection is complete, your %3$s Dashboard generates a secure Public and Private key pair (2048 bits) using OpenSSL, allowing future connections without needing your password again. For added security, you can even change this admin password once connected just be sure not to delete the admin account, as this would disrupt the connection.', 'mainwp-child' ), esc_html( $branding_title ), esc_html( $branding_title ), esc_html( $branding_title ) ); ?></p>
-            <h4><strong><?php
+            printf( esc_html__( '%1$s requests that you connect using an admin account and password for the initial setup. Rest assured, your password is never stored by your Dashboard and never sent to %2$s.com. Once this initial connection is complete, your %3$s Dashboard generates a secure Public and Private key pair (2048 bits) using OpenSSL, allowing future connections without needing your password again. For added security, you can even change this admin password once connected just be sure not to delete the admin account, as this would disrupt the connection.', 'mainwp-child' ), esc_html( $branding_title ), esc_html( $branding_title ), esc_html( $branding_title ) );
+            ?>
+            </p>
+            <h4><strong>
+            <?php
             // translators: %s: Branding title.
             printf( esc_html__( 'Dedicated %s Admin Account', 'mainwp-child' ), esc_html( $branding_title ) );
-            ?></strong></h4>
-            <p><?php
+            ?>
+            </strong></h4>
+            <p>
+            <?php
             // translators: 1: Branding title, 2: Branding title, 3: Branding title.
             printf( esc_html__( 'For further security, we recommend creating a dedicated admin account specifically for %1$s. This \'%2$s Admin\' account can be used exclusively by %3$s, allowing you to easily track any actions performed by the plugin. To set this up, go to Users to create the account, then return to your Dashboard to connect it.', 'mainwp-child' ), esc_html( $branding_title ), esc_html( $branding_title ), esc_html( $branding_title ) );
-            ?></p>
+            ?>
+            </p>
             <h4><strong><?php esc_html_e( 'Disabling Password Security', 'mainwp-child' ); ?></strong></h4>
             <p><?php esc_html_e( 'If you prefer not to use password security, you can disable it by unchecking the box below. When password authentication is disabled, Unique Security ID is required for passwordless initial connections.', 'mainwp-child' ); ?></p>
             <p>
@@ -740,10 +755,12 @@ class MainWP_Pages {
                 <h3><?php esc_html_e( 'Unique Security ID', 'mainwp-child' ); ?></h3>
                 <hr/>
             </header>
-            <p><?php
+            <p>
+            <?php
             // translators: %s: Branding title (e.g., "MainWP").
             printf( esc_html__( 'Add an extra layer of security for connecting this site to your %s Dashboard.', 'mainwp-child' ), esc_html( stripslashes( $branding_title ) ) );
-            ?></p>
+            ?>
+            </p>
 
             <table class="form-table">
                 <tbody>
@@ -835,14 +852,18 @@ class MainWP_Pages {
             <h3><?php esc_html_e( 'Site Connection Management', 'mainwp-child' ); ?></h3>
             <hr/>
         </header>
-        <form method="post" onsubmit="return confirm('<?php
+        <form method="post" onsubmit="return confirm('
+        <?php
             // translators: %s: Branding title (e.g., "MainWP").
             echo esc_js( sprintf( __( 'Are you sure you want to Disconnect Site from your %s Dashboard?', 'mainwp-child' ), $branding_title ) );
-        ?>');"  action="options-general.php?page=mainwp_child_tab">
-            <p><?php
+        ?>
+        ');"  action="options-general.php?page=mainwp_child_tab">
+            <p>
+            <?php
             // translators: %s: Branding title (e.g., "MainWP").
             printf( esc_html__( 'Click this button to disconnect this site from your %s Dashboard.', 'mainwp-child' ), esc_html( stripslashes( $branding_title ) ) );
-            ?></p>
+            ?>
+            </p>
             <p class="submit">
                 <input <?php echo empty( get_option( 'mainwp_child_pubkey' ) ) ? ' disabled="disabled" ' : ''; ?> type="submit" name="submit" id="submit2" class="mainwp-basic-button" value="<?php esc_attr_e( 'Clear Connection Data', 'mainwp-child' ); ?>">
             </p>

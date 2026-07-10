@@ -390,6 +390,7 @@ class MainWP_Child_Server_Information extends MainWP_Child_Server_Information_Ba
                 </p>
                 <div id="mwp-server-information"><textarea readonly="readonly" wrap="off"></textarea></div>
             </div>
+            <?php do_action( 'mainwp_child_top_server_information' ); ?>
             <br/>
             <div class="mwp_server_info_box">
                 <h2><?php esc_html_e( 'Server Information', 'mainwp-child' ); ?></h2>

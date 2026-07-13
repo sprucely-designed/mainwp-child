@@ -39,7 +39,7 @@ function bootstrap() {
             if ( ! isset( $schedules['minute'] ) ) {
                 $schedules['minute'] = array(
                     'interval' => MINUTE_IN_SECONDS,
-                    'display'  => __( 'Every Minute', 'mainwp' ),
+                    'display'  => __( 'Every Minute', 'mainwp-child' ),
                 );
             }
             return $schedules;

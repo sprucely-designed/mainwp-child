@@ -120,7 +120,7 @@ class MainWP_Child_System_Monitor_Runner {
             if ( ! $fallback && $scheduled ) {
                 self::update_last_cron_run();
             }
-        } catch ( Exception $e ) {
+        } catch ( \Exception $e ) {
             // Optional.
         } finally {
             self::unlock();

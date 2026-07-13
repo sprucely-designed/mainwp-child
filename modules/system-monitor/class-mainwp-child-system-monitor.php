@@ -9,8 +9,6 @@
 
 namespace MainWP\Child\SystemMonitor;
 
-use MainWP\Child\MainWP_DB;
-
 if ( ! defined( 'ABSPATH' ) ) {
     exit;
 }
@@ -70,7 +68,6 @@ class MainWP_Child_System_Monitor {
      */
     public static function activate() {
 
-        self::maybe_install();
         self::init_schedule_cron();
 
         // Generate an initial baseline immediately.

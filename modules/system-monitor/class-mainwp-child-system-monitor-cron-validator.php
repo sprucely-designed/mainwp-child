@@ -23,7 +23,7 @@ class MainWP_Child_System_Monitor_Cron_Validator {
      */
     const STALE_WARNING          = 15 * MINUTE_IN_SECONDS;
     const STALE_ERROR            = 60 * MINUTE_IN_SECONDS;
-    const FIRST_RUN_GRACE_PERIOD = 5 * MINUTE_IN_SECONDS;
+    const FIRST_RUN_GRACE_PERIOD = 15 * MINUTE_IN_SECONDS;
 
 
     /**

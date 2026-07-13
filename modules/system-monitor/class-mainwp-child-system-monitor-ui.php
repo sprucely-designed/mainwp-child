@@ -9,7 +9,6 @@
 
 namespace MainWP\Child\SystemMonitor;
 
-use MainWP\Child\MainWP_DB;
 
 if ( ! defined( 'ABSPATH' ) ) {
     exit;
@@ -83,7 +82,7 @@ class MainWP_Child_System_Monitor_UI {
             printf(
                 '<p><a href="%1$s" target="_blank" rel="noopener noreferrer">%2$s</a></p>',
                 esc_url( $url ),
-                esc_html__( 'Learn more', 'mainwp' )
+                esc_html__( 'Learn more', 'mainwp-child' )
             );
         }
 

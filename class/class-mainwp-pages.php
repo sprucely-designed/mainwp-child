@@ -852,12 +852,18 @@ class MainWP_Pages {
             <h3><?php esc_html_e( 'Site Connection Management', 'mainwp-child' ); ?></h3>
             <hr/>
         </header>
-        <form method="post" onsubmit="return confirm('
         <?php
             // translators: %s: Branding title (e.g., "MainWP").
-            echo esc_js( sprintf( __( 'Are you sure you want to Disconnect Site from your %s Dashboard?', 'mainwp-child' ), $branding_title ) );
+            $confirm_message = sprintf(
+                __( 'Are you sure you want to disconnect this site from your %s Dashboard?', 'mainwp-child' ),
+                $branding_title
+            );
         ?>
-        ');"  action="options-general.php?page=mainwp_child_tab">
+            <form
+                method="post"
+                action="options-general.php?page=mainwp_child_tab"
+                onsubmit="return confirm('<?php echo esc_js( $confirm_message ); ?>');"
+            >
             <p>
             <?php
             // translators: %s: Branding title (e.g., "MainWP").

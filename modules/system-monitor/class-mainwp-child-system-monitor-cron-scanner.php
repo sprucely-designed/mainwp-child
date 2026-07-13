@@ -2,6 +2,8 @@
 /**
  * MainWP Child System Monitor Cron Scanner.
  *
+ * @since 6.1.4
+ *
  * @package     MainWP/Child
  */
 

@@ -64,18 +64,18 @@ class MainWP_Child_System_Monitor_Issues {
                 );
                 if ( ! empty( $payload['wp_cron_disabled'] ) ) {
                     return sprintf(
-                        __( 'Scheduled tasks has not run for %s. WP-Cron is disabled, so verify that your external cron job is running correctly.', 'mainwp' ),
+                        __( 'Scheduled tasks has not run for %s. WP-Cron is disabled, so verify that your external cron job is running correctly.', 'mainwp-child' ),
                         $human
                     );
                 }
                 return sprintf(
-                    __( 'Scheduled tasks has not run for %s. Verify that WP-Cron is functioning correctly.', 'mainwp' ),
+                    __( 'Scheduled tasks has not run for %s. Verify that WP-Cron is functioning correctly.', 'mainwp-child' ),
                     $human
                 );
             case MainWP_Child_System_Monitor_Cron::ISSUE_MONITOR_FALLBACK:
                 return __(
                     'The scheduled System Monitor task was overdue, so it was executed during a page request. If this happens frequently, verify that WP-Cron or an external cron job is working correctly.',
-                    'mainwp'
+                    'mainwp-child'
                 );
             default:
                 // Nothing.
@@ -141,15 +141,15 @@ class MainWP_Child_System_Monitor_Issues {
             MainWP_Child_System_Monitor_Cron::ISSUE_MONITOR_STALE          => array(
                 'code'        => MainWP_Child_System_Monitor_Cron::ISSUE_MONITOR_STALE,
                 'severity'    => self::SEVERITY_WARNING, // default severity.
-                'title'       => __( 'Scheduled tasks have not run recently.', 'mainwp' ),
-                'description' => __( 'The System Monitor cron has not executed within the expected interval.', 'mainwp' ),
+                'title'       => __( 'Scheduled tasks have not run recently.', 'mainwp-child' ),
+                'description' => __( 'The System Monitor cron has not executed within the expected interval.', 'mainwp-child' ),
                 'help'        => 'customization/delayed-wp-cron',
             ),
             MainWP_Child_System_Monitor_Cron::ISSUE_MONITOR_FALLBACK => array(
                 'code'        => MainWP_Child_System_Monitor_Cron::ISSUE_MONITOR_FALLBACK,
                 'severity'    => self::SEVERITY_WARNING,
-                'title'       => __( 'System Monitor fallback execution was used.', 'mainwp' ),
-                'description' => __( 'The scheduled System Monitor task was executed during a page request because it did not run on schedule. Verify that WP-Cron or your external cron job is working correctly.', 'mainwp' ),
+                'title'       => __( 'System Monitor fallback execution was used.', 'mainwp-child' ),
+                'description' => __( 'The scheduled System Monitor task was executed during a page request because it did not run on schedule. Verify that WP-Cron or your external cron job is working correctly.', 'mainwp-child' ),
                 'help'        => 'customization/delayed-wp-cron',
             ),
         );

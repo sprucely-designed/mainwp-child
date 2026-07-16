@@ -335,6 +335,7 @@ class MainWP_Child_Updraft_Plus_Backups { //phpcs:ignore -- NOSONAR - multi meth
             'updraft_googlecloud',
             'updraft_retain_extrarules',
             'updraft_backblaze',
+            'updraft_pcloud',
         );
     }
 
@@ -772,6 +773,20 @@ class MainWP_Child_Updraft_Plus_Backups { //phpcs:ignore -- NOSONAR - multi meth
                             $bpath = str_replace( '_', '', $bpath );
                             $opts['settings'][ $settings_key ]['bucket_name'] = $bname;
                             $opts['settings'][ $settings_key ]['backup_path'] = $bpath;
+                            \UpdraftPlus_Options::update_updraft_option( $key, $opts );
+                        }
+                    } elseif ( 'updraft_pcloud' === $key ) {
+                        $opts = \UpdraftPlus_Options::get_updraft_option( 'updraft_pcloud' );
+                        if ( ! is_array( $opts ) ) {
+                            $opts = array();
+                        }
+                        if ( is_array( $opts ) && isset( $opts['settings'] ) && is_array( $settings[ $key ] ) && isset( $settings[ $key ]['folder'] ) ) {
+                            $settings_key                                    = key( $opts['settings'] );
+                            $opts['settings'][ $settings_key ]['folder'] = $settings[ $key ]['folder'];
+                            $bpath = $this->replace_tokens( $settings[ $key ]['folder'] );
+                            $bpath = str_replace( '.', '-', $bpath );
+                            $bpath = str_replace( '_', '', $bpath );
+                            $opts['settings'][ $settings_key ]['folder'] = $bpath;
                             \UpdraftPlus_Options::update_updraft_option( $key, $opts );
                         }
                     } elseif ( 'updraft_interval_increments' === $key ) {

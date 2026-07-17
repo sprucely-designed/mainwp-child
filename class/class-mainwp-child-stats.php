@@ -630,6 +630,27 @@ class MainWP_Child_Stats { //phpcs:ignore -- NOSONAR - multi methods.
                 if ( isset( $results[ $slug ] ) ) {
                     continue;
                 }
+
+                // The cached info can be up to a day old; do not re-add an update that
+                // has been applied since it was cached (MWP-1660 / C1).
+                if ( is_array( $theme_update ) ) {
+                    $update_data = isset( $theme_update['update'] ) ? $theme_update['update'] : null;
+                } else {
+                    $update_data = isset( $theme_update->update ) ? $theme_update->update : null;
+                }
+                $new_version = '';
+                if ( is_array( $update_data ) && ! empty( $update_data['new_version'] ) ) {
+                    $new_version = $update_data['new_version'];
+                } elseif ( is_object( $update_data ) && ! empty( $update_data->new_version ) ) {
+                    $new_version = $update_data->new_version;
+                }
+                if ( '' !== $new_version ) {
+                    $installed_theme = wp_get_theme( $slug );
+                    if ( $installed_theme->exists() && version_compare( $installed_theme->get( 'Version' ), $new_version, '>=' ) ) {
+                        continue;
+                    }
+                }
+
                 $results[ $slug ] = $theme_update;
             }
         }
@@ -866,18 +887,24 @@ class MainWP_Child_Stats { //phpcs:ignore -- NOSONAR - multi methods.
         // Fixes premium plugins update.
         $cached_plugins_update = get_site_transient( 'mainwp_update_plugins_cached' );
         if ( is_array( $cached_plugins_update ) && ( count( $cached_plugins_update ) > 0 ) ) {
+            $installed_plugins = function_exists( 'get_plugins' ) ? get_plugins() : array();
             foreach ( $cached_plugins_update as $slug => $plugin_update ) {
 
                 // Fixes incorrect info.
-                if ( ! property_exists( $plugin_update, 'new_version' ) || empty( $plugin_update->new_version ) ) { // may do not need to check this?
+                $new_version = '';
+                if ( property_exists( $plugin_update, 'new_version' ) && ! empty( $plugin_update->new_version ) ) {
+                    $new_version = $plugin_update->new_version;
+                } elseif ( property_exists( $plugin_update, 'update' ) && is_object( $plugin_update->update ) && property_exists( $plugin_update->update, 'new_version' ) && ! empty( $plugin_update->update->new_version ) ) {
                     // Fixes some premiums update info.
-                    if ( property_exists( $plugin_update, 'update' ) ) {
-                        if ( ! property_exists( $plugin_update->update, 'new_version' ) || empty( $plugin_update->update->new_version ) ) {
-                            continue;
-                        }
-                    } else {
-                        continue;
-                    }
+                    $new_version = $plugin_update->update->new_version;
+                } else {
+                    continue;
+                }
+
+                // The cached info can be up to a day old; do not re-add an update that
+                // has been applied since it was cached (MWP-1660 / C1).
+                if ( isset( $installed_plugins[ $slug ]['Version'] ) && version_compare( $installed_plugins[ $slug ]['Version'], $new_version, '>=' ) ) {
+                    continue;
                 }
 
                 if ( ! isset( $results[ $slug ] ) ) {

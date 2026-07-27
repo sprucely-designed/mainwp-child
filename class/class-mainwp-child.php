@@ -533,14 +533,15 @@ class MainWP_Child {
         $mainwpsignature = isset( $_POST['mainwpsignature'] ) ? rawurldecode( wp_unslash( $_POST['mainwpsignature'] ) ) : ''; //phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized
         $function        = isset( $_POST['function'] ) ? sanitize_text_field( wp_unslash( $_POST['function'] ) ) : null;
         $nonce           = MainWP_System::instance()->validate_params( 'nonce' );
+        $connect_sign    = isset( $_POST['data_signature'] ) ? wp_unslash( $_POST['data_signature'] ) : null; //phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized
 
         // phpcs:enable
 
         // Authenticate here.
-        $auth = MainWP_Connect::instance()->auth( $mainwpsignature, $function, $nonce );
+        $auth = MainWP_Connect::instance()->auth( $mainwpsignature, $function, $nonce, $connect_sign );
 
         // Parse auth, if it is not correct actions then exit with message or return.
-        if ( ! MainWP_Connect::instance()->parse_init_auth( $auth ) ) {
+        if ( ! MainWP_Connect::instance()->parse_init_auth( $auth, $connect_sign ) ) {
             return;
         }
 
@@ -603,6 +604,12 @@ class MainWP_Child {
                     deactivate_plugins( $this->plugin_slug, true );
                 }
             }
+        }
+
+        $last_cleanup = (int) get_option( 'mainwp_child_request_ids_last_cleanup', 0 );
+        if ( time() - $last_cleanup > HOUR_IN_SECONDS ) {
+            MainWP_Child_DB::cleanup_request_ids();
+            update_option( 'mainwp_child_request_ids_last_cleanup', time(), false );
         }
     }
 

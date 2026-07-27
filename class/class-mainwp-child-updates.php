@@ -1128,9 +1128,21 @@ class MainWP_Child_Updates { //phpcs:ignore -- NOSONAR - multi methods.
      * @uses \MainWP\Child\MainWP_Child_Callable::is_callable_function()
      * @uses \MainWP\Child\MainWP_Child_Callable::call_function()
      */
-    public function detect_premium_themesplugins_updates() {
+    public function detect_premium_themesplugins_updates() {// phpcs:ignore -- NOSONAR - complex.
+
+        // Close and response the request.
+        MainWP_Utility::close_connection(
+            array(
+                'result'  => 'SUCCESS',
+                'message' => __( 'Premium update is being processed.', 'mainwp-child' ),
+            )
+        );
+
+        $premium_action = ! empty( $_GET['_mainwp_premium_update_request'] ) ? sanitize_text_field( wp_unslash( $_GET['_mainwp_premium_update_request'] ) ) : '';
+
+        // Legacy process compatibility.
         // phpcs:disable WordPress.Security.NonceVerification
-        if ( isset( $_GET['_detect_plugins_updates'] ) && 'yes' === $_GET['_detect_plugins_updates'] ) {
+        if ( 'detect_plugin' === $premium_action || ( isset( $_GET['_detect_plugins_updates'] ) && 'yes' === $_GET['_detect_plugins_updates'] ) ) {
             // to fix some premium plugins update notification.
             $current = get_site_transient( 'update_plugins' );
             set_site_transient( 'update_plugins', $current );
@@ -1147,7 +1159,7 @@ class MainWP_Child_Updates { //phpcs:ignore -- NOSONAR - multi methods.
             }
         }
 
-        if ( isset( $_GET['_detect_themes_updates'] ) && 'yes' === $_GET['_detect_themes_updates'] ) {
+        if ( 'detect_theme' === $premium_action || ( isset( $_GET['_detect_themes_updates'] ) && 'yes' === $_GET['_detect_themes_updates'] ) ) {
             add_filter( 'pre_site_transient_update_themes', $this->filterFunction, 99 );
             $this->add_http_timeout_guard();
 
@@ -1162,7 +1174,7 @@ class MainWP_Child_Updates { //phpcs:ignore -- NOSONAR - multi methods.
 
         $type = isset( $_GET['_request_update_premiums_type'] ) ? sanitize_text_field( wp_unslash( $_GET['_request_update_premiums_type'] ) ) : '';
 
-        if ( 'plugin' === $type || 'theme' === $type ) {
+        if ( ( 'update_plugin' === $premium_action || 'update_theme' === $premium_action ) || ( 'plugin' === $type || 'theme' === $type ) ) {
             $list = isset( $_GET['list'] ) ? wp_unslash( $_GET['list'] ) : ''; //phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized
 
             if ( ! empty( $list ) ) {
@@ -1176,6 +1188,57 @@ class MainWP_Child_Updates { //phpcs:ignore -- NOSONAR - multi methods.
             }
         }
         // phpcs:enable WordPress.WP.AlternativeFunctions
+    }
+
+    /**
+     * Handle premium plugins and themes updates processing.
+     *
+     * @return null|array Result.
+     */
+    public function process_premium_updates() { // phpcs:ignore -- NOSONAR - complex.
+        $type = MainWP_System::instance()->validate_params( 'premium_type' );
+        if ( in_array( $type, array( 'plugin', 'theme' ), true ) ) {
+            $perform  = MainWP_System::instance()->validate_params( 'premium_perform' );
+            $raw_args = isset( $_POST['args'] ) && is_array( $_POST['args'] ) ? wp_unslash( $_POST['args'] ) : array(); // phpcs:ignore
+            // Parse GET Query Parameters.
+            $get_args = array();
+            if ( isset( $raw_args['get'] ) && is_string( $raw_args['get'] ) ) {
+                parse_str( $raw_args['get'], $get_args );
+            } elseif ( isset( $raw_args['get'] ) && is_array( $raw_args['get'] ) ) {
+                $get_args = $raw_args['get'];
+            }
+
+            if ( ! is_array( $get_args ) ) {
+                $get_args = array();
+            }
+
+            $target_path    = '';
+            $request_action = '';
+            if ( in_array( $type, array( 'plugin', 'theme' ), true ) && ! empty( $perform ) ) {
+                if ( 'detect_update' === $perform ) {
+                    if ( 'plugin' === $type ) {
+                        $target_path    = 'plugins.php';
+                        $request_action = 'detect_plugin';
+                    } else {
+                        $target_path    = 'update-core.php';
+                        $request_action = 'detect_theme';
+                    }
+                } elseif ( 'premium_update' === $perform ) {
+                    if ( 'plugin' === $type ) {
+                        $target_path    = 'plugins.php';
+                        $request_action = 'update_plugin';
+                    } else {
+                        $target_path    = 'update-core.php';
+                        $request_action = 'update_theme';
+                    }
+                }
+            }
+            if ( ! empty( $request_action ) ) {
+                $get_args['_mainwp_premium_update_request'] = $request_action;
+                return MainWP_Utility::instance()->simulate_admin_visit( $target_path, $get_args );
+            }
+        }
+        return null;
     }
 
     /**

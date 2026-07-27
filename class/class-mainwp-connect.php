@@ -529,19 +529,49 @@ class MainWP_Connect { //phpcs:ignore -- NOSONAR - multi methods.
      * @param  string $signature MainWP Dashboard signature.
      * @param  string $func      Function to run.
      * @param  string $nonce     Security nonce.
+     * @param  string $connect_sign Connect sign json string encoded.
      *
      * @return int|bool $auth  Returns 1 if authenticated, false if authentication fails.
      */
-    public function auth( $signature, $func, $nonce ) {
+    public function auth( $signature, $func, $nonce, $connect_sign = '' ) { // phpcs:ignore -- NOSONAR -complex.
         // phpcs:disable WordPress.Security.NonceVerification
         if ( empty( $signature ) || ! isset( $func ) || ! get_option( 'mainwp_child_pubkey' ) ) {
             $auth = false;
         } else {
-                $algo = false;
+            $algo = false;
             if ( isset( $_REQUEST['sign_algo'] ) ) {
                 $algo = sanitize_text_field( wp_unslash( $_REQUEST['sign_algo'] ) );
             }
-            $auth = static::connect_verify( $func . $nonce, base64_decode( $signature ), base64_decode( get_option( 'mainwp_child_pubkey' ) ), $algo ); // phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions -- trust value.
+            $data                = $func . $nonce; // Legacy signature data.
+            $decode_connect_sign = ! empty( $connect_sign ) ? json_decode( $connect_sign, true ) : array();
+
+            if ( is_array( $decode_connect_sign ) && ! empty( $decode_connect_sign['base_function'] ) ) {
+
+                $error_code = '';
+
+                if ( ! empty( $decode_connect_sign['expires'] ) && time() > (int) $decode_connect_sign['expires'] ) {
+                    $error_code = 'AUTH_ERROR1';
+                } elseif ( ! empty( $decode_connect_sign['request_id'] ) ) {
+                    $option_request_id = 'mainwp_child_request_id_' . hash( 'sha256', $decode_connect_sign['request_id'] );
+                    if ( ! add_option( $option_request_id, time(), '', false ) ) {
+                        $error_code = 'AUTH_ERROR2';
+                    }
+                }
+
+                if ( ! empty( $error_code ) ) {
+                    $error_msg = 'AUTH_ERROR1' === $error_code ? __( 'This request has already expired.', 'mainwp-child' ) : __( 'This request has already been used.', 'mainwp-child' );
+                    if ( isset( $_REQUEST['login_required'] ) && '1' === $_REQUEST['login_required'] ) {
+                        status_header( 'AUTH_ERROR1' === $error_code ? 410 : 400 );
+                        exit( esc_html( $error_msg ) );
+                    } else {
+                        MainWP_Helper::instance()->error( $error_msg, $error_code );
+                    }
+                }
+
+                $data = $connect_sign; // phpcs:ignore -- NOSONAR -ok.
+            }
+
+            $auth = static::connect_verify( $data, base64_decode( $signature ), base64_decode( get_option( 'mainwp_child_pubkey' ) ), $algo ); // phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions -- trust value.
             if ( 1 !== $auth ) {
                 $auth = false;
             }
@@ -720,8 +750,10 @@ class MainWP_Connect { //phpcs:ignore -- NOSONAR - multi methods.
         $function = ! empty( $_POST['function'] ) ? sanitize_text_field( wp_unslash( $_POST['function'] ) ) : rawurldecode( $where ); //phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized
         $nonce    = isset( $_REQUEST['nonce'] ) ? sanitize_text_field( wp_unslash( $_REQUEST['nonce'] ) ) : '';
 
+        $connect_sign = isset( $_REQUEST['data_signature'] ) ? wp_unslash( $_REQUEST['data_signature'] ) : null; //phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized
+
         try {
-            $auth = $this->auth( $signature, $function, $nonce );
+            $auth = $this->auth( $signature, $function, $nonce, $connect_sign );
         } catch ( MainWP_Exception $ex ) {
             $auth = false;
         }
@@ -974,9 +1006,10 @@ class MainWP_Connect { //phpcs:ignore -- NOSONAR - multi methods.
         $mainwpsignature = isset( $_POST['mainwpsignature'] ) ? rawurldecode( wp_unslash( $_POST['mainwpsignature'] ) ) : ''; //phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized
         $function        = ! empty( $_POST['function'] ) ? sanitize_text_field( wp_unslash( $_POST['function'] ) ) : rawurldecode( $where );
         $nonce           = MainWP_System::instance()->validate_params( 'nonce' );
+        $connect_sign    = isset( $_POST['data_signature'] ) ? wp_unslash( $_POST['data_signature'] ) : null; //phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized
 
         try {
-            $auth = $this->auth( $mainwpsignature, $function, $nonce );
+            $auth = $this->auth( $mainwpsignature, $function, $nonce, $connect_sign );
         } catch ( MainWP_Exception $ex ) {
             $error = $ex->getMessage();
             if ( ! empty( $error ) && is_string( $error ) ) {

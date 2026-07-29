@@ -82,6 +82,7 @@ class MainWP_Child_Wordfence { //phpcs:ignore -- NOSONAR - multi methods.
         'displayTopLevelOptions',
         'displayTopLevelBlocking',
         'displayTopLevelLiveTraffic',
+        'displayTopLevelAuditLog', // new.
         'alertOn_adminLogin',
         'alertOn_firstAdminLoginOnly',
         'alertOn_scanIssues', // new.
@@ -129,10 +130,13 @@ class MainWP_Child_Wordfence { //phpcs:ignore -- NOSONAR - multi methods.
         'scansEnabled_comments',
         'scansEnabled_core',
         'scansEnabled_diskSpace',
+        'scansEnabled_wafStatus', // new.
         'scansEnabled_dns',
         'scansEnabled_fileContents',
         'scansEnabled_fileContentsGSB',
         'scan_include_extra',
+        'scan_force_ipv4_start', // New.
+        'scan_max_resume_attempts', // New.
         'scansEnabled_checkHowGetIPs',
         'scansEnabled_highSense',
         'lowResourceScansEnabled',
@@ -170,6 +174,7 @@ class MainWP_Child_Wordfence { //phpcs:ignore -- NOSONAR - multi methods.
         'whitelisted',
         'bannedURLs',
         'other_hideWPVersion',
+        'enableRemoteIpLookup', // new.
         'other_noAnonMemberComments',
         'other_scanComments',
         'other_pwStrengthOnUpdate',
@@ -194,6 +199,7 @@ class MainWP_Child_Wordfence { //phpcs:ignore -- NOSONAR - multi methods.
         'wafAlertWhitelist',
         'wafAlertOnAttacks',
         'howGetIPs_trusted_proxies',
+        'howGetIPs_trusted_proxy_preset', // New .
         'other_bypassLitespeedNoabort',
         'disableWAFIPBlocking',
         'other_blockBadPOST',
@@ -798,9 +804,12 @@ class MainWP_Child_Wordfence { //phpcs:ignore -- NOSONAR - multi methods.
             'displayTopLevelOptions',
             'displayTopLevelBlocking',
             'displayTopLevelLiveTraffic',
+            'displayTopLevelAuditLog', // new.
             'howGetIPs',
             'howGetIPs_trusted_proxies',
+            'howGetIPs_trusted_proxy_preset', // New.
             'other_hideWPVersion',
+            'enableRemoteIpLookup', // new.
             'disableCodeExecutionUploads',
             'liveActivityPauseEnabled',
             'actUpdateInterval',
@@ -910,6 +919,7 @@ class MainWP_Child_Wordfence { //phpcs:ignore -- NOSONAR - multi methods.
             'scansEnabled_suspiciousAdminUsers',
             'scansEnabled_passwds',
             'scansEnabled_diskSpace',
+            'scansEnabled_wafStatus', // new.
             'scansEnabled_dns',
             'other_scanOutside',
             'scansEnabled_scanImages',
@@ -922,6 +932,8 @@ class MainWP_Child_Wordfence { //phpcs:ignore -- NOSONAR - multi methods.
             'maxExecutionTime',
             'scan_exclude',
             'scan_include_extra',
+            'scan_force_ipv4_start', // new.
+            'scan_max_resume_attempts', // new .
             'scanType',
             'schedMode',
         );

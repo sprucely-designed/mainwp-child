@@ -541,7 +541,7 @@ class MainWP_Child {
         $auth = MainWP_Connect::instance()->auth( $mainwpsignature, $function, $nonce, $connect_sign );
 
         // Parse auth, if it is not correct actions then exit with message or return.
-        if ( ! MainWP_Connect::instance()->parse_init_auth( $auth, $connect_sign ) ) {
+        if ( ! MainWP_Connect::instance()->parse_init_auth( $auth ) ) {
             return;
         }
 

@@ -674,8 +674,9 @@ class MainWP_Utility { //phpcs:ignore -- NOSONAR - multi methods.
      * Close connection.
      *
      * @param array $val Array containing connection information.
+     * @param bool $http2 http connection close.
      */
-    public static function close_connection( $val = null ) {
+    public static function close_connection( $val = null, $http2 = false ) {
 
         $output = '<mainwp>' . base64_encode( wp_json_encode( $val ) ) . '</mainwp>'; // phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions
 
@@ -689,7 +690,7 @@ class MainWP_Utility { //phpcs:ignore -- NOSONAR - multi methods.
         echo $output; // phpcs:ignore WordPress.Security.EscapeOutput
 
         // Set headers if not already sent.
-        if ( ! headers_sent() ) {
+        if ( ! $http2 && ! headers_sent() ) {
             header( 'Content-Length: ' . ob_get_length() );
             header( 'Connection: close' );
             header( 'Content-Encoding: none' );
@@ -792,11 +793,10 @@ class MainWP_Utility { //phpcs:ignore -- NOSONAR - multi methods.
             return array( 'error' => 'wp_remote_get error: ' . $response->get_error_message() );
         }
 
-        $received_content = wp_remote_retrieve_body( $response );
+        wp_remote_retrieve_body( $response );
 
         return array(
             'success' => 1,
-            'content' => $received_content,
         );
     }
 

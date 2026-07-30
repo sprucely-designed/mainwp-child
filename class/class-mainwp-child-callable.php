@@ -1186,7 +1186,7 @@ class MainWP_Child_Callable { //phpcs:ignore -- NOSONAR - multi methods.
         if ( ! is_array( $response_error ) ) {
             $response_error = array();
         }
-        if ( empty( $response_error['error_code'] ) ) {
+        if ( empty( $response_error['success'] ) ) {
             $response_error['error_code'] = 'PREMIUM_ACTION_ERROR';
         }
         MainWP_Helper::write( $response_error );

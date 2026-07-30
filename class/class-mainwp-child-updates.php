@@ -217,7 +217,6 @@ class MainWP_Child_Updates { //phpcs:ignore -- NOSONAR - multi methods.
      * @param bool  $premiumUpgrader                If true, use premium upgrader.
      *
      * @uses MainWP_Child_Updates::to_upgrade_plugins() Complete the plugins update process.
-     * @uses MainWP_Child_Updates::to_support_some_premiums_updates() Custom support for some premium plugins.
      * @uses \MainWP\Child\MainWP_Helper::instance()->error()
      * @uses get_plugin_updates() The WordPress Core get plugin updates function.
      * @see https://developer.wordpress.org/reference/functions/get_plugin_updates/
@@ -235,8 +234,6 @@ class MainWP_Child_Updates { //phpcs:ignore -- NOSONAR - multi methods.
         MainWP_Utility::remove_filters_by_hook_name( 'update_plugins_oxygenbuilder.com', 10 );
         // phpcs:disable WordPress.Security.NonceVerification
         $plugins = isset( $_POST['list'] ) ? explode( ',', urldecode( wp_unslash( $_POST['list'] ) ) ) : array(); //phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized
-
-        $this->to_support_some_premiums_updates( $plugins );
 
         /**
          * WordPress current filter.
@@ -936,33 +933,6 @@ class MainWP_Child_Updates { //phpcs:ignore -- NOSONAR - multi methods.
             } else {
                 $information['upgrades'][ $slug ] = false;
             }
-        }
-    }
-
-    /**
-     * Method to_support_some_premiums_updates()
-     *
-     * Custom support for some premium plugins.
-     *
-     * @param array $plugins An array containing installed plugins information.
-     *
-     * @used-by MainWP_Child_Updates::upgrade_plugin() Initiate the plugin update process.
-     */
-    private function to_support_some_premiums_updates( $plugins ) {
-        // Custom fix for the iThemes products.
-        if ( in_array( 'backupbuddy/backupbuddy.php', $plugins ) && isset( $GLOBALS['ithemes_updater_path'] ) ) {
-            if ( ! class_exists( '\Ithemes_Updater_Settings' ) ) {
-                require_once $GLOBALS['ithemes_updater_path'] . '/settings.php'; // NOSONAR - WP compatible.
-            }
-            if ( class_exists( '\Ithemes_Updater_Settings' ) ) {
-                $ithemes_updater = new \Ithemes_Updater_Settings();
-                $ithemes_updater->update();
-            }
-        }
-        // Custom fix for the smart-manager-for-wp-e-commerce update.
-        if ( in_array( 'smart-manager-for-wp-e-commerce/smart-manager.php', $plugins ) && file_exists( plugin_dir_path( __FILE__ ) . '../../smart-manager-for-wp-e-commerce/pro/upgrade.php' ) && file_exists( plugin_dir_path( __FILE__ ) . '../../smart-manager-for-wp-e-commerce/smart-manager.php' ) ) {
-            include_once plugin_dir_path( __FILE__ ) . '../../smart-manager-for-wp-e-commerce/smart-manager.php'; // NOSONAR -- WP compatible.
-            include_once plugin_dir_path( __FILE__ ) . '../../smart-manager-for-wp-e-commerce/pro/upgrade.php'; // NOSONAR -- WP compatible.
         }
     }
 

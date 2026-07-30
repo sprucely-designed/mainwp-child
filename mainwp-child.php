@@ -159,3 +159,16 @@ $changes_logs_mod_file = MAINWP_CHILD_PLUGIN_DIR . 'modules' . DIRECTORY_SEPARAT
 if ( file_exists( $changes_logs_mod_file ) ) {
     include_once $changes_logs_mod_file; // NOSONAR - ok.
 }
+
+if ( file_exists( MAINWP_CHILD_PLUGIN_DIR . 'modules/system-monitor/bootstrap.php' ) ) {
+    define( 'MAINWP_CHILD_SYSTEM_MONITOR_FILE', __FILE__ );
+    require_once MAINWP_CHILD_PLUGIN_DIR . 'modules/system-monitor/bootstrap.php'; // NOSONAR - WP compatible.
+    register_activation_hook(
+        MAINWP_CHILD_SYSTEM_MONITOR_FILE,
+        array( MainWP\Child\SystemMonitor\MainWP_Child_System_Monitor::class, 'activate' )
+    );
+    register_deactivation_hook(
+        MAINWP_CHILD_SYSTEM_MONITOR_FILE,
+        array( MainWP\Child\SystemMonitor\MainWP_Child_System_Monitor::class, 'deactivate' )
+    );
+}

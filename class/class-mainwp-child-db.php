@@ -254,4 +254,32 @@ class MainWP_Child_DB {
 
         return $size;
     }
+
+
+    /**
+     * Method cleanup_request_ids()
+     *
+     * Daily checks to clear the dashboard request ids.
+     */
+    public static function cleanup_request_ids() {
+
+        global $wpdb;
+
+        $threshold = 10 * MINUTE_IN_SECONDS;
+
+        $options = $wpdb->get_results( //phpcs:ignore -- NOSONAR -ok.
+            $wpdb->prepare(
+                "SELECT option_name, option_value
+                FROM {$wpdb->options}
+                WHERE option_name LIKE %s",
+                $wpdb->esc_like( 'mainwp_child_request_id_' ) . '%'
+            )
+        );
+
+        foreach ( $options as $option ) {
+            if ( (int) $option->option_value < $threshold ) {
+                delete_option( $option->option_name );
+            }
+        }
+    }
 }

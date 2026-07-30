@@ -107,6 +107,7 @@ class MainWP_Child_Callable { //phpcs:ignore -- NOSONAR - multi methods.
         'patchstack'               => 'patchstack',
         'password_policy_settings' => 'password_policy_settings',
         'clean_up_child_logs'      => 'clean_up_child_logs',
+        'process_premium_updates'  => 'process_premium_updates',
     );
 
     /**
@@ -1175,5 +1176,19 @@ class MainWP_Child_Callable { //phpcs:ignore -- NOSONAR - multi methods.
             MainWP_Helper::instance()->error( $error, $err_code );
         }
         MainWP_Helper::write( $information );
+    }
+
+    /**
+     * Method process_premium_updates()
+     */
+    public function process_premium_updates() {
+        $response_error = MainWP_Child_Updates::get_instance()->process_premium_updates();
+        if ( ! is_array( $response_error ) ) {
+            $response_error = array();
+        }
+        if ( empty( $response_error['success'] ) ) {
+            $response_error['error_code'] = 'PREMIUM_ACTION_ERROR';
+        }
+        MainWP_Helper::write( $response_error );
     }
 }

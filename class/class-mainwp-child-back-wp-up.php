@@ -74,6 +74,13 @@ class MainWP_Child_Back_WP_Up { //phpcs:ignore -- NOSONAR - multi methods.
     public static $information = array();
 
     /**
+     * Whether the MainWP response has already been written.
+     *
+     * @var bool
+     */
+    private static $response_written = false;
+
+    /**
      * Exclusions array
      *
      * @var array
@@ -206,6 +213,9 @@ class MainWP_Child_Back_WP_Up { //phpcs:ignore -- NOSONAR - multi methods.
      * @uses \MainWP\Child\MainWP_Helper::write()
      */
     public static function mainwp_backwpup_handle_fatal_error() {
+        if ( self::$response_written ) {
+            return;
+        }
 
         $error = error_get_last();
         $info  = static::$information;
@@ -249,6 +259,9 @@ class MainWP_Child_Back_WP_Up { //phpcs:ignore -- NOSONAR - multi methods.
             return;
         }
         register_shutdown_function( '\MainWP\Child\MainWP_Child_Back_WP_Up::mainwp_backwpup_handle_fatal_error' );
+
+        $buffer_level = ob_get_level();
+        ob_start();
 
         $information = array();
         $action      = ! empty( $_POST['action'] ) ? sanitize_text_field( wp_unslash( $_POST['action'] ) ) : '';  // phpcs:ignore -- NOSONAR
@@ -327,8 +340,14 @@ class MainWP_Child_Back_WP_Up { //phpcs:ignore -- NOSONAR - multi methods.
             }
         }
 
+        if ( ob_get_level() > $buffer_level ) {
+            ob_end_clean();
+        }
+
         static::$information = $information;
-        exit();
+
+        self::$response_written = true;
+        MainWP_Helper::write( $information );
     }
 
     /**
@@ -1037,25 +1056,51 @@ class MainWP_Child_Back_WP_Up { //phpcs:ignore -- NOSONAR - multi methods.
                 $output        = new \BackWPup_Page_Backups();
                 $output->items = array();
 
-                $jobids = \BackWPup_Option::get_job_ids();
+                $jobids            = \BackWPup_Option::get_job_ids();
+                $requested_job_ids = array();
+                $has_job_filter    = isset( $_POST['settings']['job_ids'] ) && is_array( $_POST['settings']['job_ids'] ); // phpcs:ignore WordPress.Security.NonceVerification.Missing
+
+                if ( $has_job_filter ) {
+                    $requested_job_ids = array_map( 'intval', wp_unslash( $_POST['settings']['job_ids'] ) ); // phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized,WordPress.Security.NonceVerification.Missing
+                    $requested_job_ids = array_values( array_filter( array_unique( $requested_job_ids ) ) );
+                }
+
+                if ( $has_job_filter && empty( $requested_job_ids ) ) {
+                    $jobids = array();
+                } elseif ( ! empty( $requested_job_ids ) && is_array( $jobids ) ) {
+                    $jobids = array_values( array_intersect( array_map( 'intval', $jobids ), $requested_job_ids ) );
+                }
+
                 if ( ! empty( $jobids ) ) {
                     foreach ( $jobids as $jobid ) {
                         if ( \BackWPup_Option::get( $jobid, 'backuptype' ) === 'sync' ) {
                             continue;
                         }
                         $dests = \BackWPup_Option::get( $jobid, 'destinations' );
+                        if ( empty( $dests ) || ! is_array( $dests ) ) {
+                            continue;
+                        }
                         foreach ( $dests as $dest ) {
-                            $dest_class = (object) \BackWPup::get_destination( $dest );
-                            if ( is_null( $dest_class ) ) {
+                            $dest_class = \BackWPup::get_destination( $dest );
+                            if ( empty( $dest_class ) || ! is_object( $dest_class ) || ! method_exists( $dest_class, 'file_get_list' ) ) {
                                 continue;
                             }
-                            $items = $dest_class->file_get_list( $jobid . '_' . $dest );
+                            try {
+                                $items = $dest_class->file_get_list( $jobid . '_' . $dest );
+                            } catch ( \Throwable $e ) {
+                                continue;
+                            }
                             if ( ! empty( $items ) ) {
                                 foreach ( $items as $item ) {
+                                    if ( ! is_array( $item ) || ! isset( $item['time'] ) ) {
+                                        continue;
+                                    }
                                     $temp_single_item         = $item;
                                     $temp_single_item['dest'] = $jobid . '_' . $dest;
                                     // translators: 1: date, 2: time.
-                                    $temp_single_item['timeloc']   = sprintf( esc_html__( '%1$s at %2$s', 'mainwp-child' ), date_i18n( get_option( 'date_format' ), $temp_single_item['time'], true ), date_i18n( get_option( 'time_format' ), $temp_single_item['time'], true ) );
+                                    // Use the child site's timezone explicitly so Dashboard and BackWPup show the same time.
+                                    $backup_timezone              = wp_timezone();
+                                    $temp_single_item['timeloc']   = sprintf( esc_html__( '%1$s at %2$s', 'mainwp-child' ), wp_date( get_option( 'date_format' ), $temp_single_item['time'], $backup_timezone ), wp_date( get_option( 'time_format' ), $temp_single_item['time'], $backup_timezone ) );
                                     $temp_single_item['timestamp'] = $item['time'];
                                     $output->items[]               = $temp_single_item;
                                 }
@@ -1072,7 +1117,7 @@ class MainWP_Child_Back_WP_Up { //phpcs:ignore -- NOSONAR - multi methods.
                 break;
         }
 
-        if ( is_array( $output->items ) ) {
+        if ( isset( $output->items ) && is_array( $output->items ) ) {
             if ( 'jobs' === $type ) {
                 foreach ( $output->items as $key => $val ) {
                     $temp_array                 = array();
@@ -1134,9 +1179,16 @@ class MainWP_Child_Back_WP_Up { //phpcs:ignore -- NOSONAR - multi methods.
 
                     $temp_array['website_id'] = $website_id;
 
-                    if ( ! isset( $without_dupes[ $temp_array['file'] ] ) ) {
-                        $array[]                              = $temp_array;
-                        $without_dupes[ $temp_array['file'] ] = 1;
+                    $dedupe_key_parts = array(
+                        isset( $temp_array['file'] ) ? $temp_array['file'] : '',
+                        isset( $temp_array['filesize'] ) ? $temp_array['filesize'] : '',
+                        isset( $temp_array['timestamp'] ) ? $temp_array['timestamp'] : '',
+                    );
+                    $dedupe_key       = md5( implode( '|', array_map( 'strval', $dedupe_key_parts ) ) );  // phpcs:ignore -- NOSONAR
+
+                    if ( ! isset( $without_dupes[ $dedupe_key ] ) ) {
+                        $array[]                      = $temp_array;
+                        $without_dupes[ $dedupe_key ] = 1;
                     }
                 }
             } else {
@@ -1157,7 +1209,7 @@ class MainWP_Child_Back_WP_Up { //phpcs:ignore -- NOSONAR - multi methods.
      */
     public function init_download_backup() {
         $page = isset( $_GET['page'] ) ? sanitize_text_field( wp_unslash( $_GET['page'] ) ) : '';  // phpcs:ignore -- NOSONAR
-        if ( ! empty( $page ) || 'backwpupbackups' !== $page || ! isset( $page ) || empty( $page ) ) {
+        if ( empty( $page ) || 'backwpupbackups' !== $page ) {
             return;
         }
         ?>
@@ -1166,7 +1218,7 @@ class MainWP_Child_Back_WP_Up { //phpcs:ignore -- NOSONAR - multi methods.
             var download_click_id = <?php echo intval( $_GET['download_click_id'] );  // phpcs:ignore -- NOSONAR ?>;
             document.addEventListener("DOMContentLoaded", function (event) {
                 if (dlClicked === false) {
-                    var downloadLink = document.querySelector(`a.backup-download-link[data-jobid="${download_click_id}"`);
+                    var downloadLink = document.querySelector(`a.backup-download-link[data-jobid="${download_click_id}"]`);
                     if (typeof (downloadLink) !== 'undefined' && downloadLink !== null) {
                         downloadLink.click();
                         dlClicked = true;
@@ -1174,7 +1226,7 @@ class MainWP_Child_Back_WP_Up { //phpcs:ignore -- NOSONAR - multi methods.
                     if (dlClicked === false) { // for new version.
                         setTimeout(
                             function () {
-                                downloadLink = document.querySelector(`button.js-backwpup-download-backup[data-jobid="${download_click_id}"`);
+                                downloadLink = document.querySelector(`button.js-backwpup-download-backup[data-jobid="${download_click_id}"]`);
                                 if (typeof (downloadLink) !== 'undefined' && downloadLink !== null) {
                                     downloadLink.click();
                                 }

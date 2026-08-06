@@ -7,7 +7,7 @@ Plugin URI: https://mainwp.com
 Requires at least: 6.2
 Tested up to: 7.0.2
 Requires PHP: 7.4
-Stable tag: 6.1.5
+Stable tag: 6.1.6
 License: GPLv3 or later
 License URI: https://www.gnu.org/licenses/gpl-3.0.html
 
@@ -114,6 +114,11 @@ Please report security bugs found in the source code of the MainWP Child plugin 
 11. Dashboard Insights
 
 == Changelog ==
+
+= 6.1.6 - 8-5-2026 =
+
+* Fixed: Ensured consistent timezone handling for backup timestamps in the BackWPup integration.
+* Updated: Improved error handling and response processing in the BackWPup integration for more reliable backup operations.
 
 = 6.1.5 - 7-28-2026 =
 

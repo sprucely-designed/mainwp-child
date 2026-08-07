@@ -265,21 +265,21 @@ class MainWP_Child_DB {
 
         global $wpdb;
 
-        $threshold = 10 * MINUTE_IN_SECONDS;
+        $threshold = time() - ( 10 * MINUTE_IN_SECONDS );
 
-        $options = $wpdb->get_results( //phpcs:ignore -- NOSONAR -ok.
+        $options = $wpdb->get_col( // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery -- OK.
             $wpdb->prepare(
-                "SELECT option_name, option_value
+                "SELECT option_name
                 FROM {$wpdb->options}
-                WHERE option_name LIKE %s",
-                $wpdb->esc_like( 'mainwp_child_request_id_' ) . '%'
+                WHERE option_name LIKE %s
+                AND CAST(option_value AS UNSIGNED) < %d",
+                $wpdb->esc_like( 'mainwp_child_request_id_' ) . '%',
+                $threshold
             )
         );
 
-        foreach ( $options as $option ) {
-            if ( (int) $option->option_value < $threshold ) {
-                delete_option( $option->option_name );
-            }
+        foreach ( $options as $option_name ) {
+            delete_option( $option_name );
         }
     }
 }

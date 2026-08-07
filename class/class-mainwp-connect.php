@@ -567,6 +567,7 @@ class MainWP_Connect { //phpcs:ignore -- NOSONAR - multi methods.
             if ( 1 !== $auth ) {
                 $auth = false;
             } elseif ( null === static::$signature_checked ) {  // The signature is verified only once per request.
+                $valid_code = true;
                 if ( ! $this->is_legacy_signature( $decode_connect_sign ) ) {
                     $valid_code = $this->verify_authed_request( $decode_connect_sign );
                 } else {
@@ -671,14 +672,17 @@ class MainWP_Connect { //phpcs:ignore -- NOSONAR - multi methods.
     private function verify_legacy_authed_request() { // phpcs:ignore --NOSONAR - complex.
 
         // phpcs:disable WordPress.Security.NonceVerification
-        $request_id = isset( $_POST['mainwpsignature'] ) ? rawurldecode( wp_unslash( $_POST['mainwpsignature'] ) ) : ''; //phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized
+        $request_id = isset( $_REQUEST['mainwpsignature'] ) ? rawurldecode( wp_unslash( $_REQUEST['mainwpsignature'] ) ) : ''; //phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized
         $error_code = '';
         if ( empty( $request_id ) ) {
             $error_code = 'AUTH_INVALID_SIGN';
         } else {
             $option_request_id = 'mainwp_child_request_id_' . hash( 'sha256', $request_id );
             if ( ! add_option( $option_request_id, time(), '', false ) ) {
-                $error_code = 'AUTH_ERROR2';
+                $request_time = get_option( $option_request_id );
+                if ( empty( $request_time ) || (int) $request_time < time() - 30 ) { // allow 30 secords for safe.
+                    $error_code = 'AUTH_ERROR2';
+                }
             }
         }
         // phpcs:enable WordPress.Security.NonceVerification

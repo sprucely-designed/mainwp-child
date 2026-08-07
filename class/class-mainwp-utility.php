@@ -674,7 +674,7 @@ class MainWP_Utility { //phpcs:ignore -- NOSONAR - multi methods.
      * Close connection.
      *
      * @param array $val Array containing connection information.
-     * @param bool $http2 http connection close.
+     * @param bool  $http2 http connection close.
      */
     public static function close_connection( $val = null, $http2 = false ) {
 
@@ -722,10 +722,11 @@ class MainWP_Utility { //phpcs:ignore -- NOSONAR - multi methods.
      *
      * @since 6.2
      *
-     * @param array $target_path Target path.
-     * @param array $get_args Payload args.
+     * @param array  $target_path Target path.
+     * @param array  $get_args Payload args.
+     * @param string $perform Perform action.
      *
-     * @return array {
+     * @return mixed|array {
      *     Result array indicating request success or failure state.
      *
      *     @type int    $success 1 on success.
@@ -733,7 +734,7 @@ class MainWP_Utility { //phpcs:ignore -- NOSONAR - multi methods.
      *     @type string $content Raw HTML or JSON body returned by the target URL.
      * }
      */
-    public function simulate_admin_visit( $target_path, $get_args ) {
+    public function simulate_admin_visit( $target_path, $get_args, $perform ) {
 
         // Authorization check.
         if ( ! current_user_can( 'manage_options' ) ) {
@@ -790,13 +791,34 @@ class MainWP_Utility { //phpcs:ignore -- NOSONAR - multi methods.
         $response = wp_remote_get( $full_url, $request_args );
 
         if ( is_wp_error( $response ) ) {
-            return array( 'error' => 'wp_remote_get error: ' . $response->get_error_message() );
+            return array( 'error' => $response->get_error_message() );
         }
 
-        wp_remote_retrieve_body( $response );
+        $http_code = wp_remote_retrieve_response_code( $response );
+
+        $html = wp_remote_retrieve_body( $response );
+
+        $content = '';
+        if ( preg_match( '#<mainwp>(.*?)</mainwp>#s', $html, $matches ) ) {
+            $content = $matches[1];
+        }
+
+        $data = ! empty( $content ) ? json_decode( base64_decode( $content ), true ) : ''; // phpcs:ignore -- NOSONAR -compatible.
+
+        if ( is_array( $data ) ) {
+            $data['success']   = 1;
+            $data['http_code'] = $http_code;
+            return $data;
+        }
+
+        if ( 'detect_update' === $perform && 200 === (int) $http_code ) {
+            return array(
+                'success' => 1,
+            );
+        }
 
         return array(
-            'success' => 1,
+            'http_code' => $http_code,
         );
     }
 

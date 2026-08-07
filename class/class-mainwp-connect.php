@@ -570,8 +570,6 @@ class MainWP_Connect { //phpcs:ignore -- NOSONAR - multi methods.
                 $valid_code = true;
                 if ( ! $this->is_legacy_signature( $decode_connect_sign ) ) {
                     $valid_code = $this->verify_authed_request( $decode_connect_sign );
-                } else {
-                    $valid_code = $this->verify_legacy_authed_request();
                 }
                 if ( true !== $valid_code ) {
                     $auth = false;
@@ -662,32 +660,6 @@ class MainWP_Connect { //phpcs:ignore -- NOSONAR - multi methods.
         return empty( $sign_data ) || ! is_array( $sign_data ); // Process non-array data as a single signature.
     }
 
-    /**
-     * Method verify_legacy_authed_request()
-     *
-     * Verify legacy connect.
-     *
-     * @return string|bool True if valid request.
-     */
-    private function verify_legacy_authed_request() { // phpcs:ignore --NOSONAR - complex.
-
-        // phpcs:disable WordPress.Security.NonceVerification
-        $request_id = isset( $_REQUEST['mainwpsignature'] ) ? rawurldecode( wp_unslash( $_REQUEST['mainwpsignature'] ) ) : ''; //phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized
-        $error_code = '';
-        if ( empty( $request_id ) ) {
-            $error_code = 'AUTH_INVALID_SIGN';
-        } else {
-            $option_request_id = 'mainwp_child_request_id_' . hash( 'sha256', $request_id );
-            if ( ! add_option( $option_request_id, time(), '', false ) ) {
-                $request_time = get_option( $option_request_id );
-                if ( empty( $request_time ) || (int) $request_time < time() - 30 ) { // allow 30 secords for safe.
-                    $error_code = 'AUTH_ERROR2';
-                }
-            }
-        }
-        // phpcs:enable WordPress.Security.NonceVerification
-        return ! empty( $error_code ) ? $error_code : true;
-    }
 
     /**
      * Method handle_signature_error()

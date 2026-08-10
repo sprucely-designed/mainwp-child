@@ -839,35 +839,147 @@ class MainWP_Child_Updraft_Plus_Backups { //phpcs:ignore -- NOSONAR - multi meth
     }
 
     /**
-     * Connect UpdraftPlus Premium addons.
+     * Connect TeamUpdraft account.
      *
-     * @return array|string[] $out return response array. Success or nopremium.
-     *
-     * @uses MainWP_Child_Updraft_Plus_Backups::update_wpmu_options()
+     * @return array
      */
-    public function addons_connect() {
-        if ( ! defined( 'UDADDONS2_SLUG' ) ) {
-            if ( is_file( UPDRAFTPLUS_DIR . '/udaddons/updraftplus-addons.php' ) ) {
-                require_once UPDRAFTPLUS_DIR . '/udaddons/updraftplus-addons.php'; // NOSONAR - WP compatible.
-            }
-            if ( ! defined( 'UDADDONS2_SLUG' ) ) {
-                return array( 'error' => 'NO_PREMIUM' );
-            }
+    public function addons_connect() { // phpcs:ignore -- NOSONAR - complex.
+
+        // Load UpdraftPlus Premium addons.
+        if ( ! $this->load_updraftplus_addons() ) {
+            return array(
+                'error' => 'NO_PREMIUM',
+            );
         }
 
-        $addons_options = isset( $_POST['addons_options'] ) ? json_decode( base64_decode( wp_unslash( $_POST['addons_options'] ) ), true ) : array(); // phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions -- base64_encode function is used for http encode compatible..
-        if ( ! is_array( $addons_options ) ) {
-            $addons_options = array();
+        $addons_options = $this->get_addons_options();
+
+        // Validate required credentials.
+        if ( empty( $addons_options['email'] ) || empty( $addons_options['password'] ) ) {
+            return array(
+                'error'   => 'invalid_credentials',
+                'status'  => 'connection_failed',
+                'message' => esc_html__(
+                    'A TeamUpdraft email address and password are required.',
+                    'mainwp-child'
+                ),
+            );
         }
 
-        $updated = $this->update_wpmu_options( $addons_options );
-
-        $out = array();
-        if ( $updated ) {
-            $out['result'] = 'success';
+        // Save credentials.
+        if ( ! $this->update_wpmu_options( $addons_options ) ) {
+            return array(
+                'error'   => 'credentials_not_saved',
+                'status'  => 'connection_failed',
+                'message' => esc_html__(
+                    'The TeamUpdraft credentials could not be saved on this site.',
+                    'mainwp-child'
+                ),
+            );
         }
 
-        return $out;
+        // Verify the account connection.
+        return $this->verify_updraftplus_connection();
+    }
+
+    /**
+     * Load UpdraftPlus Premium addons.
+     *
+     * @return bool
+     */
+    private function load_updraftplus_addons() {
+
+        if ( defined( 'UDADDONS2_SLUG' ) ) {
+            return true;
+        }
+
+        $addons_file = UPDRAFTPLUS_DIR . '/udaddons/updraftplus-addons.php';
+
+        if ( is_file( $addons_file ) ) {
+            require_once $addons_file; // NOSONAR - WP compatible.
+        }
+
+        return defined( 'UDADDONS2_SLUG' );
+    }
+
+    /**
+     * Get TeamUpdraft credentials from the request.
+     *
+     * @return array
+     */
+    private function get_addons_options() {
+
+        if ( empty( $_POST['addons_options'] ) ) {  // phpcs:ignore WordPress.Security.NonceVerification.Missing -- NOSONAR
+            return array();
+        }
+
+        $encoded_options = wp_unslash( $_POST['addons_options'] ); // phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized, WordPress.Security.NonceVerification.Missing -- NOSONAR
+        $decoded_options = base64_decode( $encoded_options, true ); // phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions -- Base64 is used for HTTP encoding compatibility.
+
+        if ( false === $decoded_options ) {
+            return array();
+        }
+
+        $addons_options = json_decode( $decoded_options, true );
+        return is_array( $addons_options ) ? $addons_options : array();
+    }
+
+    /**
+     * Verify the UpdraftPlus account connection.
+     *
+     * @return array
+     */
+    private function verify_updraftplus_connection() {  // phpcs:ignore -- NOSONAR - complex.
+
+        // UpdraftPlus Premium addons instance.
+        global $updraftplus_addons2;
+
+        if ( ! is_object( $updraftplus_addons2 ) || ! is_callable( array( $updraftplus_addons2, 'connection_status' ) ) ) {
+            return array(
+                'error'   => 'connection_status_unavailable',
+                'status'  => 'connected_unverified',
+                'message' => esc_html__(
+                    'The TeamUpdraft credentials were saved, but UpdraftPlus could not verify the account connection on this site.',
+                    'mainwp-child'
+                ),
+            );
+        }
+
+        $connection_status = $updraftplus_addons2->connection_status();
+
+        if ( is_wp_error( $connection_status ) ) {
+            return array(
+                'error'   => 'connection_failed',
+                'status'  => 'connection_failed',
+                'message' => implode(
+                    ' ',
+                    array_map(
+                        'wp_strip_all_tags',
+                        $connection_status->get_error_messages()
+                    )
+                ),
+            );
+        }
+
+        if ( true !== $connection_status ) {
+            return array(
+                'error'   => 'connection_failed',
+                'status'  => 'connection_failed',
+                'message' => esc_html__(
+                    'UpdraftPlus could not verify the TeamUpdraft account connection.',
+                    'mainwp-child'
+                ),
+            );
+        }
+
+        return array(
+            'result'  => 'success',
+            'status'  => 'connected',
+            'message' => esc_html__(
+                'The TeamUpdraft account was verified. Premium purchase assignment and activation still need to be completed or verified on this site.',
+                'mainwp-child'
+            ),
+        );
     }
 
     /**
@@ -891,11 +1003,30 @@ class MainWP_Child_Updraft_Plus_Backups { //phpcs:ignore -- NOSONAR - multi meth
             $options = array();
         }
 
-        $options['email']    = isset( $value['email'] ) ? $value['email'] : '';
-        $options['password'] = isset( $value['password'] ) ? $value['password'] : '';
+        $email              = isset( $value['email'] ) ? $value['email'] : '';
+        $password           = isset( $value['password'] ) ? $value['password'] : '';
+        $credentials_changed = ! isset( $options['email'], $options['password'] )
+            || $options['email'] !== $email
+            || $options['password'] !== $password;
 
-        $options = $this->options_validate( $options );
+        $options['email']    = $email;
+        $options['password'] = $password;
+
+        // Validate the options if the credentials have changed.
+        if ( $credentials_changed ) {
+            $options = $this->options_validate( $options );
+        }
+
         $this->addons2_update_option( UDADDONS2_SLUG . '_options', $options );
+        // Return TRUE to indicate that the options were updated successfully.
+        $stored_options = $this->addons2_get_option( UDADDONS2_SLUG . '_options' );
+        if ( ! is_array( $stored_options )
+            || ! isset( $stored_options['email'], $stored_options['password'] )
+            || $stored_options['email'] !== $email
+            || $stored_options['password'] !== $password
+        ) {
+            return false;
+        }
 
         return true;
     }

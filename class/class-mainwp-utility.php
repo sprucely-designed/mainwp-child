@@ -765,7 +765,8 @@ class MainWP_Utility { //phpcs:ignore -- NOSONAR - multi methods.
         $request_args = array(
             'redirection' => 5,
             'decompress'  => false,
-            'timeout'     => 'premium_update' === $perform ? 600 : 60, // Allow more time for Premium plugin update operations.
+            'blocking'    => false,
+            'timeout'     => 5,
             'cookies'     => array(
                 new \WP_Http_Cookie(
                     array(
@@ -788,7 +789,7 @@ class MainWP_Utility { //phpcs:ignore -- NOSONAR - multi methods.
         add_filter( 'http_request_args', array( MainWP_Helper::get_class_name(), 'reject_unsafe_urls_child' ), 99, 2 );
         try {
             // Execute Remote GET.
-            $response = wp_remote_get( $full_url, $request_args );
+            wp_remote_get( $full_url, $request_args );
         } finally {
             remove_filter(
                 'http_request_args',
@@ -798,33 +799,11 @@ class MainWP_Utility { //phpcs:ignore -- NOSONAR - multi methods.
             );
         }
 
-        if ( is_wp_error( $response ) ) {
-            return array( 'error' => $response->get_error_message() );
-        }
-
-        $http_code = wp_remote_retrieve_response_code( $response );
-
-        $html = wp_remote_retrieve_body( $response );
-
-        $content = '';
-        if ( preg_match( '#<mainwp>(.*?)</mainwp>#s', $html, $matches ) ) {
-            $content = $matches[1];
-        }
-
-        $data = ! empty( $content ) ? json_decode( base64_decode( $content ), true ) : ''; // phpcs:ignore -- NOSONAR -compatible.
-
-        if ( is_array( $data ) ) {
-            return $data;
-        }
-
-        if ( 'detect_update' === $perform && 200 === (int) $http_code ) {
-            return array(
-                'success' => 1,
-            );
-        }
-
         return array(
-            'http_code' => $http_code,
+            'status'       => 'started',
+            'perform'      => $perform,
+            'message'      => esc_html__( 'Premium action requested. Please wait a moment and sync the data again later.', 'mainwp-child' ),
+            'message_code' => 'PREMIUM_ACTION_REQUESTED',
         );
     }
 

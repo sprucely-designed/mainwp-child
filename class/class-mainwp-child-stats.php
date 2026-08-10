@@ -436,6 +436,12 @@ class MainWP_Child_Stats { //phpcs:ignore -- NOSONAR - multi methods.
             $information['password_policy_options'] = MainWP_Child_Password_Policy::instance()->get_policy_options();
         }
 
+        $saved_premium_updates = get_option( 'mainwp_child_premium_updates_result' );
+        if ( ! empty( $saved_premium_updates ) && is_array( $saved_premium_updates ) ) {
+            $information['premium_updates_results'] = $saved_premium_updates;
+            delete_option( 'mainwp_child_premium_updates_result' );
+        }
+
         if ( $exit_done ) {
             MainWP_Helper::write( $information );
         }

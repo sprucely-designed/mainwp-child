@@ -175,6 +175,23 @@ class MainWP_Child_Updates { //phpcs:ignore -- NOSONAR - multi methods.
             $this->update_premiums_to_do( $information, $premiumUpgrader, $mwp_premium_updates_to_do, $mwp_premium_updates_to_do_slugs );
         }
 
+        if ( ! empty( $_POST['perform_premium_action'] ) && in_array( $_POST['type'], array( 'plugin', 'theme' ) ) ) {
+            $saved_info = get_option( 'mainwp_child_premium_updates_result' );
+            if ( ! is_array( $saved_info ) ) {
+                $saved_info = array();
+            }
+            $type = sanitize_text_field( wp_unslash( $_POST['type'] ) );
+            if ( ! isset( $saved_info[ $type ] ) ) {
+                $saved_info[ $type ] = array();
+            }
+            if ( isset( $information['other_data'] ) ) {
+                $information['other_data']['duration'] = MainWP_Helper::get_runtime();
+                $information['other_data']['created']  = time();
+            }
+            $saved_info[ $type ][ microtime( true ) ] = $information;
+            update_option( 'mainwp_child_premium_updates_result', $saved_info );
+        }
+
         /**
          * WP-Rocket auto cache purge.
          *
@@ -1204,8 +1221,12 @@ class MainWP_Child_Updates { //phpcs:ignore -- NOSONAR - multi methods.
                 }
 
                 if ( ! empty( $type ) ) {
-                    $_POST['type'] = $type;
-                    $_POST['list'] = $list;
+                    $_POST['type']                   = $type;
+                    $_POST['list']                   = $list;
+                    $_POST['send_exit']              = false;
+                    $_POST['perform_premium_action'] = 'premium_update';
+
+                    MainWP_Helper::start_runtime();
 
                     $function = 'upgradeplugintheme'; // to call function upgrade_plugin_theme().
                     if ( MainWP_Child_Callable::get_instance()->is_callable_function( $function ) ) {

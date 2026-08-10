@@ -765,7 +765,7 @@ class MainWP_Utility { //phpcs:ignore -- NOSONAR - multi methods.
         $request_args = array(
             'redirection' => 5,
             'decompress'  => false,
-            'timeout'     => 600,
+            'timeout'     => 'premium_update' === $perform ? 600 : 60, // Allow more time for Premium plugin update operations.
             'cookies'     => array(
                 new \WP_Http_Cookie(
                     array(
@@ -785,10 +785,18 @@ class MainWP_Utility { //phpcs:ignore -- NOSONAR - multi methods.
         // Build Final Target URL.
         $full_url = add_query_arg( $get_args, admin_url( '/' . $path ) );
 
-        add_filter( 'http_request_args', array( MainWP_Helper::get_class_name(), 'reject_unsafe_urls' ), 99, 2 );
-
-        // Execute Remote GET.
-        $response = wp_remote_get( $full_url, $request_args );
+        add_filter( 'http_request_args', array( MainWP_Helper::get_class_name(), 'reject_unsafe_urls_child' ), 99, 2 );
+        try {
+            // Execute Remote GET.
+            $response = wp_remote_get( $full_url, $request_args );
+        } finally {
+            remove_filter(
+                'http_request_args',
+                array( MainWP_Helper::get_class_name(), 'reject_unsafe_urls_child' ),
+                99,
+                2
+            );
+        }
 
         if ( is_wp_error( $response ) ) {
             return array( 'error' => $response->get_error_message() );
@@ -806,8 +814,6 @@ class MainWP_Utility { //phpcs:ignore -- NOSONAR - multi methods.
         $data = ! empty( $content ) ? json_decode( base64_decode( $content ), true ) : ''; // phpcs:ignore -- NOSONAR -compatible.
 
         if ( is_array( $data ) ) {
-            $data['success']   = 1;
-            $data['http_code'] = $http_code;
             return $data;
         }
 

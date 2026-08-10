@@ -21,7 +21,7 @@ if ( ! defined( 'ABSPATH' ) ) {
  */
 class MainWP_Child_DB {
 
-    // phpcs:disable WordPress.DB.RestrictedFunctions, WordPress.DB.PreparedSQL.NotPrepared -- unprepared SQL ok, accessing the database directly to custom database functions.
+    // phpcs:disable WordPress.DB.RestrictedFunctions, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.DirectDatabaseQuery.DirectQuery -- unprepared SQL ok, accessing the database directly to custom database functions.
 
     /**
      * Support old & new versions of WordPress (3.9+).
@@ -255,13 +255,28 @@ class MainWP_Child_DB {
         return $size;
     }
 
+    /**
+     * Maybe clean up request ID options.
+     *
+     * Performs the cleanup at most once every hour to avoid scanning
+     * the options table on every authentication request.
+     *
+     * @return void
+     */
+    private static function maybe_cleanup_advanced_request_ids() {
+        $last_cleanup = (int) get_option( 'mainwp_child_advanced_request_ids_last_cleanup', 0 );
+        if ( time() - $last_cleanup > HOUR_IN_SECONDS ) {
+            static::cleanup_advanced_request_ids();
+            update_option( 'mainwp_child_advanced_request_ids_last_cleanup', time(), false );
+        }
+    }
 
     /**
-     * Method cleanup_request_ids()
+     * Method cleanup_advanced_request_ids()
      *
      * Daily checks to clear the dashboard request ids.
      */
-    public static function cleanup_request_ids() {
+    public static function cleanup_advanced_request_ids() {
 
         global $wpdb;
 
@@ -273,13 +288,127 @@ class MainWP_Child_DB {
                 FROM {$wpdb->options}
                 WHERE option_name LIKE %s
                 AND CAST(option_value AS UNSIGNED) < %d",
-                $wpdb->esc_like( 'mainwp_child_request_id_' ) . '%',
+                $wpdb->esc_like( 'mainwp_child_advanced_request_id_' ) . '%',
                 $threshold
             )
         );
 
         foreach ( $options as $option_name ) {
             delete_option( $option_name );
+        }
+    }
+
+    /**
+     * Maybe clean up legacy request ID options.
+     *
+     * Performs the cleanup at most once every 24 hours to avoid scanning
+     * the options table on every authentication request.
+     *
+     * @return void
+     */
+    public static function maybe_cleanup_request_ids() {
+
+        static::maybe_cleanup_advanced_request_ids();
+
+        $option_name  = 'mainwp_child_request_ids_cleanup';
+        $last_cleanup = (int) get_option( $option_name, 0 );
+
+        if ( $last_cleanup > time() - DAY_IN_SECONDS ) {
+            return;
+        }
+
+        update_option( $option_name, time(), false );
+
+        static::cleanup_request_ids();
+    }
+
+    /**
+     * Clean up legacy request ID options.
+     *
+     * Removes expired 12-month request IDs and randomly removes excess
+     * request IDs when the retention pools exceed their limits:
+     *
+     * - Level 1: Maximum 200 records.
+     * - Level 2: Maximum 100 records.
+     * - Level 3: Removed when the 12-month retention period expires.
+     *
+     * @return void
+     */
+    private static function cleanup_request_ids() { // phpcs:ignore -- NOSONAR -complex
+
+        global $wpdb;
+
+        $prefix = 'mainwp_child_request_id_';
+        $now    = time();
+
+        $options = $wpdb->get_results(
+            $wpdb->prepare(
+                "SELECT option_name, option_value
+            FROM {$wpdb->options}
+            WHERE option_name LIKE %s",
+                $wpdb->esc_like( $prefix ) . '%'
+            )
+        );
+
+        if ( empty( $options ) ) {
+            return;
+        }
+
+        $level_1 = array();
+        $level_2 = array();
+
+        foreach ( $options as $option ) {
+
+            $value = maybe_unserialize( $option->option_value );
+
+            if ( ! is_array( $value ) ) {
+                continue;
+            }
+
+            $level   = isset( $value['level'] ) ? (int) $value['level'] : 0;
+            $expires = isset( $value['expires'] ) ? (int) $value['expires'] : 0;
+
+            /*
+             * Level 3:
+             * Delete after 12 months.
+             */
+            if ( 3 === $level ) {
+                if ( $expires > 0 && $expires <= $now ) {
+                    delete_option( $option->option_name );
+                }
+
+                continue;
+            }
+
+            if ( 1 === $level ) {
+                $level_1[] = $option->option_name;
+            } elseif ( 2 === $level ) {
+                $level_2[] = $option->option_name;
+            }
+        }
+
+        /*
+        * Level 1: maximum 200.
+        */
+        if ( count( $level_1 ) > 200 ) {
+
+            shuffle( $level_1 );
+
+            foreach ( array_slice( $level_1, 200 ) as $option_name ) {
+                delete_option( $option_name );
+            }
+        }
+
+        /*
+        * Level 2: maximum 100.
+        */
+        if ( count( $level_2 ) > 100 ) {
+
+            shuffle( $level_2 );
+
+            foreach ( array_slice( $level_2, 100 ) as $option_name ) {
+                delete_option( $option_name );
+            }
         }
     }
 }

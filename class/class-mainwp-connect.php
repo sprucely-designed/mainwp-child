@@ -536,11 +536,25 @@ class MainWP_Connect { //phpcs:ignore -- NOSONAR - multi methods.
      * @param  string $signature MainWP Dashboard signature.
      * @param  string $func      Function to run.
      * @param  string $nonce     Security nonce.
-     * @param  string $connect_sign Connect sign json string encoded.
+     * @param  array  $others Other data.
      *
      * @return int|bool $auth  Returns 1 if authenticated, false if authentication fails.
      */
-    public function auth( $signature, $func, $nonce, $connect_sign = '' ) { // phpcs:ignore -- NOSONAR -complex.
+    public function auth( $signature, $func, $nonce, $others = array() ) { // phpcs:ignore -- NOSONAR -complex.
+
+        if ( ! is_array( $others ) ) {
+            $others = array();
+        }
+
+        $connect_sign        = isset( $others['connect_sign'] ) ? $others['connect_sign'] : '';
+        $mainwpsignature_adv = isset( $others['mainwpsignature_adv'] ) ? $others['mainwpsignature_adv'] : '';
+
+        $decode_connect_sign = ! empty( $connect_sign ) && is_string( $connect_sign ) ? json_decode( $connect_sign, true ) : ''; // If it is not a valid JSON-encoded array, it is a legacy signature.
+
+        if ( $this->is_advanced_signature( $decode_connect_sign ) ) {
+            $signature = $mainwpsignature_adv;
+        }
+
         // phpcs:disable WordPress.Security.NonceVerification
         if ( empty( $signature ) || ! isset( $func ) || ! get_option( 'mainwp_child_pubkey' ) ) {
             $auth = false;
@@ -550,14 +564,11 @@ class MainWP_Connect { //phpcs:ignore -- NOSONAR - multi methods.
                 $algo = sanitize_text_field( wp_unslash( $_REQUEST['sign_algo'] ) );
             }
 
-            $decode_connect_sign = ! empty( $connect_sign ) ? json_decode( $connect_sign, true ) : ''; // If it is not a valid JSON-encoded array, it is a legacy signature.
-
-            if ( $this->is_legacy_signature( $decode_connect_sign ) ) {
+            if ( ! $this->is_advanced_signature( $decode_connect_sign ) ) {
                 $data = $func . $nonce; // Legacy signature data.
-            } elseif ( true !== $this->valid_signature_fields( $decode_connect_sign ) ) {
+            } elseif ( true !== $this->has_required_signature_fields( $decode_connect_sign, $func ) ) {
                 $auth = false;
-                static::handle_signature_error( 'AUTH_INVALID_FIELDS', true, true ); // Exit with an error response.
-                MainWP_Helper::instance()->error( esc_html__( 'Invalid request!', 'mainwp-child' ) ); // for sure.
+                throw static::create_signature_exception( 'AUTH_INVALID_FIELDS' );
             } else {
                 // request params are valid.
                 $data = $connect_sign;
@@ -568,12 +579,14 @@ class MainWP_Connect { //phpcs:ignore -- NOSONAR - multi methods.
                 $auth = false;
             } elseif ( null === static::$signature_checked ) {  // The signature is verified only once per request.
                 $valid_code = true;
-                if ( ! $this->is_legacy_signature( $decode_connect_sign ) ) {
-                    $valid_code = $this->verify_authed_request( $decode_connect_sign );
+                if ( $this->is_advanced_signature( $decode_connect_sign ) ) {
+                    $valid_code = $this->verify_advanced_authed_request( $decode_connect_sign );
+                } else {
+                    $valid_code = $this->verify_authed_request();
                 }
                 if ( true !== $valid_code ) {
                     $auth = false;
-                    static::handle_signature_error( $valid_code );
+                    throw static::create_signature_exception( $valid_code );
                 }
                 static::$signature_checked = true;
             }
@@ -584,18 +597,26 @@ class MainWP_Connect { //phpcs:ignore -- NOSONAR - multi methods.
 
 
     /**
-     * Method valid_signature_fields()
+     * Method has_required_signature_fields()
      *
-     * @param array $sign_data Signature data sign.
+     * @param array  $sign_data Signature data sign.
+     * @param string $func Function callable.
      *
      * @return bool True if valid signature fields.
      */
-    private function valid_signature_fields( $sign_data ) {
+    private function has_required_signature_fields( $sign_data, $func ) {
         if ( ! is_array( $sign_data ) ) {
             return false;
         }
-        foreach ( array( 'request_id', 'base_function', 'user', 'nonce', 'expires' ) as $field ) {
-            if ( empty( $sign_data[ $field ] ) ) {
+
+        $valid_fields = array( 'request_id', 'base_function', 'user', 'nonce', 'expires' );
+
+        if ( 'process_premium_updates' === $func ) {
+            $valid_fields = array_merge( $valid_fields, array( 'premium_perform', 'premium_type', 'list' ) );
+        }
+
+        foreach ( $valid_fields as $field ) {
+            if ( ! isset( $sign_data[ $field ] ) ) {
                 return false;
             }
         }
@@ -604,7 +625,7 @@ class MainWP_Connect { //phpcs:ignore -- NOSONAR - multi methods.
     }
 
     /**
-     * Method verify_authed_request()
+     * Method verify_advanced_authed_request()
      *
      * Verify connect.
      *
@@ -612,16 +633,16 @@ class MainWP_Connect { //phpcs:ignore -- NOSONAR - multi methods.
      *
      * @return string|bool True if valid request.
      */
-    private function verify_authed_request( $sign_data ) { // phpcs:ignore --NOSONAR - complex.
+    private function verify_advanced_authed_request( $sign_data ) { // phpcs:ignore --NOSONAR - complex.
 
-        if ( ! $this->valid_signature_fields( $sign_data ) ) {
+        if ( ! $this->has_required_signature_fields( $sign_data ) ) {
             return 'AUTH_INVALID_FIELDS';
         }
 
         // phpcs:disable WordPress.Security.NonceVerification
         $request_id       = ! empty( $sign_data['request_id'] ) ? sanitize_text_field( wp_unslash( $sign_data['request_id'] ) ) : '';
         $request_function = ! empty( $_REQUEST['function'] ) ? sanitize_text_field( wp_unslash( $_REQUEST['function'] ) ) : '';
-        $request_nonce    = ! empty( $_REQUEST['nonce'] ) ? sanitize_text_field( wp_unslash( $_REQUEST['nonce'] ) ) : '';
+        $request_nonce    = isset( $_REQUEST['nonce'] ) ? sanitize_text_field( wp_unslash( $_REQUEST['nonce'] ) ) : '';
         $request_user     = ! empty( $_REQUEST['user'] ) ? sanitize_text_field( wp_unslash( $_REQUEST['user'] ) ) : '';
         $sign_user        = ! empty( $sign_data['user'] ) ? sanitize_text_field( wp_unslash( $sign_data['user'] ) ) : '';
         $request_alt_user = ! empty( $_REQUEST['alt_user'] ) ? sanitize_text_field( rawurldecode( wp_unslash( $_REQUEST['alt_user'] ) ) ) : ''; //phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized
@@ -634,12 +655,12 @@ class MainWP_Connect { //phpcs:ignore -- NOSONAR - multi methods.
 
         $error_code = '';
 
-        if ( ( ! empty( $request_alt_user ) && $request_alt_user !== $sign_alt_user ) || $request_function !== $sign_data['base_function'] || $request_nonce !== (string) $sign_data['nonce'] || $request_user !== $sign_user ) {
+        if ( ( ( ! empty( $request_alt_user ) || ! empty( $sign_alt_user ) ) && $request_alt_user !== $sign_alt_user ) || $request_function !== $sign_data['base_function'] || $request_nonce !== (string) $sign_data['nonce'] || $request_user !== $sign_user ) {
             $error_code = 'AUTH_INVALID_SIGN';
         } elseif ( time() > (int) $sign_data['expires'] ) {
             $error_code = 'AUTH_ERROR1';
         } else {
-            $option_request_id = 'mainwp_child_request_id_' . hash( 'sha256', $request_id );
+            $option_request_id = 'mainwp_child_advanced_request_id_' . hash( 'sha256', $request_id );
             if ( ! add_option( $option_request_id, time(), '', false ) ) {
                 $error_code = 'AUTH_ERROR2';
             }
@@ -650,29 +671,155 @@ class MainWP_Connect { //phpcs:ignore -- NOSONAR - multi methods.
 
 
     /**
-     * Method is_legacy_signature()
+     * Method is_advanced_signature()
      *
      * @param mixed $sign_data Signature data sign.
      *
      * @return bool True if singl legacy signature data.
      */
-    private function is_legacy_signature( $sign_data ) {
-        return empty( $sign_data ) || ! is_array( $sign_data ); // Process non-array data as a single signature.
+    private function is_advanced_signature( $sign_data ) {
+        return ! empty( $sign_data ) && is_array( $sign_data ); // Process non-array data as a single signature.
     }
 
 
     /**
-     * Method handle_signature_error()
+     * Method verify_authed_request()
+     *
+     * @return string|bool True if valid request.
+     */
+    private function verify_authed_request() { // phpcs:ignore --NOSONAR - complex.
+
+            // phpcs:disable WordPress.Security.NonceVerification
+            $request_id = rawurldecode( isset( $_REQUEST['mainwpsignature'] ) ? wp_unslash( $_REQUEST['mainwpsignature'] ) : '' ); // phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized
+            // phpcs:enable WordPress.Security.NonceVerification
+
+            $now = time();
+
+            /*
+            * Retention periods.
+            */
+            $retention_3_days    = 3 * DAY_IN_SECONDS;
+            $retention_3_months  = 90 * DAY_IN_SECONDS;
+            $retention_12_months = 365 * DAY_IN_SECONDS;
+
+            $option_request_id = 'mainwp_child_request_id_' . hash( 'sha256', $request_id );
+
+            /*
+            * New request ID.
+            *
+            * Level 1:
+            * Keep for 3 days.
+            */
+            $new_request_data = array(
+                'level'     => 1,
+                'created'   => $now,
+                'last_seen' => $now,
+                'expires'   => $now + $retention_3_days,
+            );
+
+            if ( add_option( $option_request_id, $new_request_data, '', false ) ) {
+                return true;
+            }
+
+            /*
+            * Request ID already exists.
+            */
+            $stored = get_option( $option_request_id );
+
+            if ( ! is_array( $stored ) ) {
+                $stored = $new_request_data;
+            }
+
+            $level     = isset( $stored['level'] ) ? (int) $stored['level'] : 1;
+            $last_seen = isset( $stored['last_seen'] ) ? (int) $stored['last_seen'] : 0;
+            $expires   = isset( $stored['expires'] ) ? (int) $stored['expires'] : 0;
+
+            /*
+            * If the retention period has expired, remove the old request ID
+            * and treat this request as a completely new request.
+            */
+            if ( $expires <= $now ) {
+
+                delete_option( $option_request_id );
+
+                add_option(
+                    $option_request_id,
+                    $new_request_data,
+                    '',
+                    false
+                );
+
+                return true;
+            }
+
+            /*
+            * Check the 30-second replay window BEFORE updating last_seen.
+            */
+            $within_replay_window = $last_seen > 0 && $last_seen >= ( $now - 30 );
+
+            /*
+            * Existing request ID:
+            *
+            * Level 1 -> Level 2.
+            * Level 2 -> Level 3.
+            * Level 3 -> remains Level 3.
+            */
+            if ( 1 === $level ) {
+                /*
+                * This request ID has been seen again.
+                * Increase retention from 3 days to 3 months.
+                */
+                $level   = 2;
+                $expires = $now + $retention_3_months;
+
+            } elseif ( 2 === $level ) {
+                /*
+                * This request ID has been seen again.
+                * Increase retention from 3 months to 12 months.
+                */
+                $level   = 3;
+                $expires = $now + $retention_12_months;
+
+            } elseif ( 3 === $level ) {
+                /*
+                * Already at 12-month retention.
+                *
+                * Do NOT extend the expiration time.
+                */
+                $level = 3;
+            }
+
+            /*
+            * Update request information.
+            */
+            $stored['level']     = $level;
+            $stored['last_seen'] = $now;
+            $stored['expires']   = $expires;
+
+            update_option( $option_request_id, $stored, false );
+
+            /*
+            * Same request ID within 30 seconds -> allow.
+            * Same request ID after 30 seconds -> reject.
+            */
+            if ( ! $within_replay_window ) {
+                return 'AUTH_ERROR2';
+            }
+
+            return true;
+    }
+
+
+    /**
+     * Method create_signature_exception()
      *
      * Verify connect.
      *
      * @param string $error_code Error code.
-     * @param bool   $exit_error Wether exit error.
-     * @param bool   $check_login_required Wether check login requires request.
      *
-     * @return void
+     * @return MainWP_Exception Error.
      */
-    public static function handle_signature_error( $error_code, $exit_error = true, $check_login_required = true ) {
+    public static function create_signature_exception( $error_code ) {
         $err_msg = '';
         switch ( $error_code ) {
             case 'AUTH_INVALID_FIELDS':
@@ -689,21 +836,10 @@ class MainWP_Connect { //phpcs:ignore -- NOSONAR - multi methods.
                 break;
             default:
                 $err_msg = __( 'Bad signature data. Please try again.', 'mainwp-child' );
-                // Nothing.
                 break;
 
         }
-
-        if ( $exit_error ) {
-            if ( $check_login_required && isset( $_REQUEST['login_required'] ) && '1' === $_REQUEST['login_required'] ) { // phpcs:ignore -- NOSONAR -ok.
-                status_header( 403 );
-                exit( esc_html( $err_msg ) );
-            } else {
-                MainWP_Helper::instance()->error( esc_html( $err_msg ), $error_code );
-            }
-        } else {
-            return $err_msg;
-        }
+        return new MainWP_Exception( $err_msg, '', $error_code );
     }
 
     /**
@@ -876,10 +1012,19 @@ class MainWP_Connect { //phpcs:ignore -- NOSONAR - multi methods.
         $function = ! empty( $_POST['function'] ) ? sanitize_text_field( wp_unslash( $_POST['function'] ) ) : rawurldecode( $where ); //phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized
         $nonce    = isset( $_REQUEST['nonce'] ) ? sanitize_text_field( wp_unslash( $_REQUEST['nonce'] ) ) : '';
 
-        $connect_sign = isset( $_REQUEST['data_signature'] ) ? wp_unslash( $_REQUEST['data_signature'] ) : null; //phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized
+        $connect_sign        = isset( $_REQUEST['data_signature'] ) ? wp_unslash( $_REQUEST['data_signature'] ) : null; //phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized
+        $mainwpsignature_adv = isset( $_REQUEST['mainwpsignature_adv'] ) ? wp_unslash( $_REQUEST['mainwpsignature_adv'] ) : ''; //phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized
 
         try {
-            $auth = $this->auth( $signature, $function, $nonce, $connect_sign );
+            $auth = $this->auth(
+                $signature,
+                $function,
+                $nonce,
+                array(
+                    'connect_sign'        => $connect_sign,
+                    'mainwpsignature_adv' => $mainwpsignature_adv,
+                )
+            );
         } catch ( MainWP_Exception $ex ) {
             $auth = false;
         }
@@ -1132,14 +1277,25 @@ class MainWP_Connect { //phpcs:ignore -- NOSONAR - multi methods.
         $mainwpsignature = isset( $_POST['mainwpsignature'] ) ? rawurldecode( wp_unslash( $_POST['mainwpsignature'] ) ) : ''; //phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized
         $function        = ! empty( $_POST['function'] ) ? sanitize_text_field( wp_unslash( $_POST['function'] ) ) : rawurldecode( $where );
         $nonce           = MainWP_System::instance()->validate_params( 'nonce' );
-        $connect_sign    = isset( $_POST['data_signature'] ) ? wp_unslash( $_POST['data_signature'] ) : null; //phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized
+
+        $connect_sign        = isset( $_POST['data_signature'] ) ? rawurldecode( wp_unslash( $_POST['data_signature'] ) ) : null; //phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized
+        $mainwpsignature_adv = isset( $_POST['mainwpsignature_adv'] ) ? rawurldecode( wp_unslash( $_POST['mainwpsignature_adv'] ) ) : ''; //phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized
 
         try {
-            $auth = $this->auth( $mainwpsignature, $function, $nonce, $connect_sign );
+            $auth = $this->auth(
+                $mainwpsignature,
+                $function,
+                $nonce,
+                array(
+                    'connect_sign'        => $connect_sign,
+                    'mainwpsignature_adv' => $mainwpsignature_adv,
+                )
+            );
         } catch ( MainWP_Exception $ex ) {
             $error = $ex->getMessage();
             if ( ! empty( $error ) && is_string( $error ) ) {
-                MainWP_Helper::instance()->error( esc_html( $error ) );
+                $code = $ex->get_message_error_code();
+                MainWP_Helper::instance()->error( esc_html( $error ), ! empty( $code ) ? $code : null );
             }
             $auth = false;
         }

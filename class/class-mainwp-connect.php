@@ -580,13 +580,13 @@ class MainWP_Connect { //phpcs:ignore -- NOSONAR - multi methods.
             } elseif ( null === static::$signature_checked ) {  // The signature is verified only once per request.
                 $valid_code = true;
                 if ( $this->is_advanced_signature( $decode_connect_sign ) ) {
-                    $valid_code = $this->verify_advanced_authed_request( $decode_connect_sign );
+                    $valid_code = $this->verify_advanced_authed_request( $decode_connect_sign, $func );
                 } else {
                     $valid_code = $this->verify_authed_request();
                 }
                 if ( true !== $valid_code ) {
                     $auth = false;
-                    throw static::create_signature_exception( $valid_code );
+                    throw static::create_signature_exception( esc_html( $valid_code ) );
                 }
                 static::$signature_checked = true;
             }
@@ -632,10 +632,11 @@ class MainWP_Connect { //phpcs:ignore -- NOSONAR - multi methods.
      * @param array $sign_data Signature data sign.
      *
      * @return string|bool True if valid request.
+     * @return string $func Function call.
      */
-    private function verify_advanced_authed_request( $sign_data ) { // phpcs:ignore --NOSONAR - complex.
+    private function verify_advanced_authed_request( $sign_data, $func ) { // phpcs:ignore --NOSONAR - complex.
 
-        if ( ! $this->has_required_signature_fields( $sign_data ) ) {
+        if ( ! $this->has_required_signature_fields( $sign_data, $func ) ) {
             return 'AUTH_INVALID_FIELDS';
         }
 

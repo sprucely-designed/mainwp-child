@@ -765,8 +765,7 @@ class MainWP_Utility { //phpcs:ignore -- NOSONAR - multi methods.
         $request_args = array(
             'redirection' => 5,
             'decompress'  => false,
-            'blocking'    => false,
-            'timeout'     => 5,
+            'timeout'     => 60,
             'cookies'     => array(
                 new \WP_Http_Cookie(
                     array(
@@ -783,13 +782,18 @@ class MainWP_Utility { //phpcs:ignore -- NOSONAR - multi methods.
             ),
         );
 
+        if ( 'premium_update' === $perform ) {
+            $request_args ['blocking'] = false;
+            $request_args ['timeout']  = 5;
+        }
+
         // Build Final Target URL.
         $full_url = add_query_arg( $get_args, admin_url( '/' . $path ) );
 
         add_filter( 'http_request_args', array( MainWP_Helper::get_class_name(), 'reject_unsafe_urls_child' ), 99, 2 );
         try {
             // Execute Remote GET.
-            wp_remote_get( $full_url, $request_args );
+            $response = wp_remote_get( $full_url, $request_args );
         } finally {
             remove_filter(
                 'http_request_args',
@@ -799,11 +803,38 @@ class MainWP_Utility { //phpcs:ignore -- NOSONAR - multi methods.
             );
         }
 
+        if ( 'premium_update' === $perform ) {
+
+            $upgrades_started = array();
+
+            if ( ! empty( $get_args['list'] ) ) {
+                foreach ( explode( ',', $get_args['list'] ) as $slug ) {
+                    $slug = trim( $slug );
+
+                    if ( '' !== $slug ) {
+                        $upgrades_started[ $slug ] = true;
+                    }
+                }
+            }
+
+            return array(
+                'status'           => 'started',
+                'upgrades_started' => $upgrades_started,
+                'message'          => esc_html__( 'Premium action requested. Please wait a moment and sync the data again later.', 'mainwp-child' ),
+                'message_code'     => 'PREMIUM_ACTION_REQUESTED',
+            );
+        }
+
+        $http_code = wp_remote_retrieve_response_code( $response );
+
+        if ( 200 === (int) $http_code ) {
+            return array(
+                'success' => 1,
+            );
+        }
+
         return array(
-            'status'       => 'started',
-            'perform'      => $perform,
-            'message'      => esc_html__( 'Premium action requested. Please wait a moment and sync the data again later.', 'mainwp-child' ),
-            'message_code' => 'PREMIUM_ACTION_REQUESTED',
+            'http_code' => $http_code,
         );
     }
 

@@ -936,7 +936,6 @@ class MainWP_Child_Updraft_Plus_Backups { //phpcs:ignore -- NOSONAR - multi meth
 
         if ( ! is_object( $updraftplus_addons2 ) || ! is_callable( array( $updraftplus_addons2, 'connection_status' ) ) ) {
             return array(
-                'error'   => 'connection_status_unavailable',
                 'status'  => 'connected_unverified',
                 'message' => esc_html__(
                     'The TeamUpdraft credentials were saved, but UpdraftPlus could not verify the account connection on this site.',
@@ -945,7 +944,19 @@ class MainWP_Child_Updraft_Plus_Backups { //phpcs:ignore -- NOSONAR - multi meth
             );
         }
 
-        $connection_status = $updraftplus_addons2->connection_status();
+        // Check if the connection status has already been refreshed in this request.
+        $had_refresh         = array_key_exists( 'udm_refresh', $_GET );
+        $previous_refresh    = $had_refresh ? $_GET['udm_refresh'] : null;
+        $_GET['udm_refresh'] = 1; // phpcs:ignore WordPress.Security.NonceVerification.Recommended
+        try {
+            $connection_status = $updraftplus_addons2->connection_status();
+        } finally {
+            if ( $had_refresh ) {
+                $_GET['udm_refresh'] = $previous_refresh; // phpcs:ignore WordPress.Security.NonceVerification.Recommended
+            } else {
+                unset( $_GET['udm_refresh'] ); // phpcs:ignore WordPress.Security.NonceVerification.Recommended
+            }
+        }
 
         if ( is_wp_error( $connection_status ) ) {
             return array(
@@ -972,14 +983,136 @@ class MainWP_Child_Updraft_Plus_Backups { //phpcs:ignore -- NOSONAR - multi meth
             );
         }
 
+        return $this->get_premium_activation_status();
+    }
+
+    /**
+     * Determine the Premium purchase state from the data returned by
+     * UpdraftPlus's fresh account connection check.
+     *
+     * @return array
+     */
+    private function get_premium_activation_status() {  // phpcs:ignore -- NOSONAR - complex.
+        global $updraftplus_addons2;
+
+        $site_id          = $updraftplus_addons2->siteid();
+        $has_unclaimed    = false;
+        $is_assigned      = false;
+        $assigned_keys    = array();
+
+        if ( isset( $updraftplus_addons2->user_addons ) && is_array( $updraftplus_addons2->user_addons ) ) {
+            foreach ( $updraftplus_addons2->user_addons as $addon ) {
+                if ( ! isset( $addon['status'], $addon['site'] ) || 'active' !== $addon['status'] ) {
+                    continue;
+                }
+
+                if ( 'unclaimed' === $addon['site'] || 'unlimited' === $addon['site'] ) {
+                    $has_unclaimed = true;
+                } elseif ( $addon['site'] === $site_id ) {
+                    $is_assigned = true;
+                    if ( isset( $addon['key'] ) ) {
+                        $assigned_keys[ $addon['key'] ] = true;
+                    }
+                }
+            }
+        }
+
+        if ( $has_unclaimed ) {
+            return array(
+                'result'  => 'success',
+                'status'  => 'connected_unclaimed',
+                'message' => esc_html__(
+                    'The TeamUpdraft account is connected, but a Premium purchase is not assigned to this site. Open UpdraftPlus on this site and claim or assign the purchase.',
+                    'mainwp-child'
+                ),
+            );
+        }
+
+        if ( $is_assigned ) {
+            $updates_available = get_site_transient( 'update_plugins' );
+            $plugin_file       = isset( $updraftplus_addons2->plug_updatechecker->pluginFile )
+                ? $updraftplus_addons2->plug_updatechecker->pluginFile
+                : '';
+
+            if ( $plugin_file && is_object( $updates_available ) && isset( $updates_available->response[ $plugin_file ] ) ) {
+                return array(
+                    'result'  => 'success',
+                    'status'  => 'assigned_update_required',
+                    'message' => esc_html__(
+                        'The Premium purchase is assigned to this site, but UpdraftPlus must be updated to activate it.',
+                        'mainwp-child'
+                    ),
+                );
+            }
+
+            // Check if the assigned Premium add-ons are installed and active.
+            $available_addons = is_callable( array( $updraftplus_addons2, 'get_available_addons' ) )
+                ? $updraftplus_addons2->get_available_addons()
+                : false;
+            if ( ! is_array( $available_addons ) || ! $this->are_assigned_addons_installed( $available_addons, $assigned_keys ) ) {
+                return array(
+                    'result'  => 'success',
+                    'status'  => 'assigned_activation_required',
+                    'message' => esc_html__(
+                        'The Premium purchase is assigned to this site, but Premium add-ons are not active. Open UpdraftPlus on this site and follow the update or activation link.',
+                        'mainwp-child'
+                    ),
+                );
+            }
+
+            return array(
+                'result'  => 'success',
+                'status'  => 'fully_active',
+                'message' => esc_html__(
+                    'The TeamUpdraft account is connected and the Premium purchase is assigned to this site.',
+                    'mainwp-child'
+                ),
+            );
+        }
+
         return array(
             'result'  => 'success',
-            'status'  => 'connected',
+            'status'  => 'connected_unclaimed',
             'message' => esc_html__(
-                'The TeamUpdraft account was verified. Premium purchase assignment and activation still need to be completed or verified on this site.',
+                'The TeamUpdraft account is connected, but no active Premium purchase is assigned to this site. Open UpdraftPlus on this site to claim or assign a purchase.',
                 'mainwp-child'
             ),
         );
+    }
+
+    /**
+     * Check whether the installed Premium add-ons satisfy the assigned purchase.
+     *
+     * @param array $available_addons Add-ons returned by UpdraftPlus.
+     * @param array $assigned_keys    Add-on keys assigned to this site.
+     * @return bool
+     */
+    private function are_assigned_addons_installed( $available_addons, $assigned_keys ) { // phpcs:ignore -- NOSONAR - complex.
+        $has_all_addons = isset( $assigned_keys['all'] );
+
+        foreach ( $assigned_keys as $key => $assigned ) {
+            if ( 'all' === $key ) {
+                continue;
+            }
+
+            if ( ! isset( $available_addons[ $key ] ) || ! is_array( $available_addons[ $key ] ) || empty( $available_addons[ $key ]['installed'] ) ) {
+                return false;
+            }
+        }
+
+        if ( $has_all_addons ) {
+            foreach ( $available_addons as $key => $addon ) {
+                if ( 'all' === $key || ! is_array( $addon ) ) {
+                    continue;
+                }
+
+                if ( empty( $addon['installed'] ) ) {
+                    return false;
+                }
+            }
+        }
+
+        return true;
     }
 
     /**

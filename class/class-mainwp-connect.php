@@ -612,7 +612,10 @@ class MainWP_Connect { //phpcs:ignore -- NOSONAR - multi methods.
         $valid_fields = array( 'request_id', 'base_function', 'user', 'nonce', 'expires' );
 
         if ( 'process_premium_updates' === $func ) {
-            $valid_fields = array_merge( $valid_fields, array( 'premium_perform', 'premium_type', 'list' ) );
+            $valid_fields = array_merge( $valid_fields, array( 'premium_perform', 'premium_type' ) );
+            if ( isset( $sign_data['premium_perform'] ) && 'premium_update' === $sign_data['premium_perform'] ) {
+                $valid_fields[] = 'list';
+            }
         }
 
         foreach ( $valid_fields as $field ) {
@@ -652,7 +655,6 @@ class MainWP_Connect { //phpcs:ignore -- NOSONAR - multi methods.
         if ( empty( $request_function ) && ! empty( $sign_data['where'] ) ) {
             $request_function = ! empty( $_REQUEST[ $sign_data['where'] ] ) ? sanitize_text_field( wp_unslash( $_REQUEST[ $sign_data['where'] ] ) ) : '';
         }
-        // phpcs:enable WordPress.Security.NonceVerification
 
         $error_code = '';
 
@@ -666,6 +668,21 @@ class MainWP_Connect { //phpcs:ignore -- NOSONAR - multi methods.
                 $error_code = 'AUTH_ERROR2';
             }
         }
+
+        if ( empty( $error_code ) ) {
+            $others = array(
+                'premium_perform',
+                'premium_type',
+                'list',
+            );
+            foreach ( $others as $field ) {
+                if ( isset( $sign_data[ $field ] ) && ( ! isset( $_REQUEST[ $field ] ) || $_REQUEST[ $field ] !== $sign_data[ $field ] ) ) {
+                    $error_code = 'AUTH_INVALID_SIGN';
+                    break;
+                }
+            }
+        }
+        // phpcs:enable WordPress.Security.NonceVerification
 
         return ! empty( $error_code ) ? $error_code : true;
     }
@@ -756,7 +773,9 @@ class MainWP_Connect { //phpcs:ignore -- NOSONAR - multi methods.
             /*
             * Check the 30-second replay window BEFORE updating last_seen.
             */
-            $within_replay_window = $last_seen > 0 && $last_seen >= ( $now - 30 );
+            $within_replay_window = 1 === $level
+            && $last_seen >= ( $now - 30 )
+            && $last_seen <= $now;
 
             /*
             * Existing request ID:

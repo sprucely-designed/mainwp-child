@@ -1188,6 +1188,7 @@ class MainWP_Child_Callable { //phpcs:ignore -- NOSONAR - multi methods.
         }
         if ( empty( $response ) || ( ! empty( $response['error'] ) && empty( $response['error_code'] ) ) || empty( $response['status'] ) ) {
             $response['error_code'] = 'PREMIUM_ACTION_ERROR';
+            $response['error']      = esc_html__( 'An error occurred while processing the premium updates. Please try again later.', 'mainwp-child' );
         }
         MainWP_Helper::write( $response );
     }

@@ -175,7 +175,7 @@ class MainWP_Child_Updates { //phpcs:ignore -- NOSONAR - multi methods.
             $this->update_premiums_to_do( $information, $premiumUpgrader, $mwp_premium_updates_to_do, $mwp_premium_updates_to_do_slugs );
         }
 
-        if ( ! empty( $_POST['perform_premium_action'] ) && in_array( $_POST['type'], array( 'plugin', 'theme' ) ) ) {
+        if ( ! empty( $_POST['perform_premium_action'] ) && 'premium_update' === $_POST['perform_premium_action'] && in_array( $_POST['type'], array( 'plugin', 'theme' ), true ) ) {
             $saved_info = get_option( 'mainwp_child_premium_updates_result' );
             if ( ! is_array( $saved_info ) ) {
                 $saved_info = array();
@@ -184,12 +184,28 @@ class MainWP_Child_Updates { //phpcs:ignore -- NOSONAR - multi methods.
             if ( ! isset( $saved_info[ $type ] ) ) {
                 $saved_info[ $type ] = array();
             }
-            if ( isset( $information['other_data'] ) ) {
-                $information['other_data']['duration'] = MainWP_Helper::get_runtime();
-                $information['other_data']['created']  = time();
+
+            if ( ! empty( $information['other_data'] ) ) {
+                $data         = $information['other_data']['updated_data'] ?? array();
+                $updated_data = array();
+                if ( ! empty( $data ) ) {
+                    foreach ( $data as $slug  => $info ) {
+                        if ( ! empty( $info['version'] ) && ! empty( $info['old_version'] ) && $info['old_version'] === $info['version'] ) {
+                            continue;
+                        }
+                        $updated_data[ $slug ] = $info;
+                    }
+                }
+                if ( ! empty( $updated_data ) ) {
+                    $other_data                               = array(
+                        'updated_data' => $updated_data,
+                        'duration'     => MainWP_Helper::get_runtime(),
+                        'created'      => time(),
+                    );
+                    $saved_info[ $type ][ microtime( true ) ] = array( 'other_data' => $other_data );
+                    update_option( 'mainwp_child_premium_updates_result', $saved_info );
+                }
             }
-            $saved_info[ $type ][ microtime( true ) ] = $information;
-            update_option( 'mainwp_child_premium_updates_result', $saved_info );
         }
 
         /**
@@ -273,7 +289,6 @@ class MainWP_Child_Updates { //phpcs:ignore -- NOSONAR - multi methods.
 
         $information['plugin_updates'] = get_plugin_updates();
 
-        $plugins = isset( $_POST['list'] ) ? explode( ',', urldecode( wp_unslash( $_POST['list'] ) ) ) : array(); //phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized
         // phpcs:enable WordPress.WP.AlternativeFunctions
 
         $premiumPlugins = array();
@@ -1230,7 +1245,10 @@ class MainWP_Child_Updates { //phpcs:ignore -- NOSONAR - multi methods.
 
                     $function = 'upgradeplugintheme'; // to call function upgrade_plugin_theme().
                     if ( MainWP_Child_Callable::get_instance()->is_callable_function( $function ) ) {
+                        ob_start();
                         MainWP_Child_Callable::get_instance()->call_function( $function );
+                        $debug = ob_get_clean();
+                        MainWP_Helper::log_debug( 'perform_premium_action :: ' . $debug );
                     }
                 }
             }
@@ -1270,6 +1288,7 @@ class MainWP_Child_Updates { //phpcs:ignore -- NOSONAR - multi methods.
                     }
                 }
             }
+
             if ( ! empty( $request_action ) ) {
                 $get_args['_mainwp_premium_update_request']    = $request_action;
                 $get_args['_mainwp_premium_update_nonce_key']  = intval( time() );

@@ -805,23 +805,26 @@ class MainWP_Utility { //phpcs:ignore -- NOSONAR - multi methods.
 
         if ( 'premium_update' === $perform ) {
 
+            $dispatch_success = ! is_wp_error( $response );
+
             $upgrades_started = array();
 
             if ( ! empty( $get_args['list'] ) ) {
                 foreach ( explode( ',', $get_args['list'] ) as $slug ) {
                     $slug = trim( $slug );
-
                     if ( '' !== $slug ) {
-                        $upgrades_started[ $slug ] = true;
+                        $upgrades_started[ $slug ] = $dispatch_success;
                     }
                 }
             }
 
             return array(
-                'status'           => 'started',
+                'status'           => $dispatch_success ? 'started' : 'failed',
                 'upgrades_started' => $upgrades_started,
-                'message'          => esc_html__( 'Premium action requested. Please wait a moment and sync the data again later.', 'mainwp-child' ),
-                'message_code'     => 'PREMIUM_ACTION_REQUESTED',
+                'message'          => $dispatch_success
+                    ? esc_html__( 'Premium action requested. Please wait a moment and sync the data again later.', 'mainwp-child' )
+                    : esc_html__( 'Premium action request failed. Please try again later.', 'mainwp-child' ),
+                'message_code'     => $dispatch_success ? 'PREMIUM_ACTION_REQUESTED' : 'PREMIUM_ACTION_FAILED',
             );
         }
 

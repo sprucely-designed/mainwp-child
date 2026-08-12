@@ -35,6 +35,10 @@ if ( ! defined( 'ABSPATH' ) ) {
 class MainWP_Child_Updraft_Plus_Backups { //phpcs:ignore -- NOSONAR - multi methods.
 
     /**
+     * UpdraftPlus plugin slug.
+     */
+    private const PLUGIN_UPDRAFTPLUS_SLUG = 'updraftplus/updraftplus.php';
+    /**
      * Public static variable to hold the single instance of MainWP_Child_Updraft_Plus_Backups.
      *
      * @var mixed Default null
@@ -64,7 +68,7 @@ class MainWP_Child_Updraft_Plus_Backups { //phpcs:ignore -- NOSONAR - multi meth
      */
     public function __construct() {
         require_once ABSPATH . 'wp-admin/includes/plugin.php'; // NOSONAR - WP compatible.
-        if ( is_plugin_active( 'updraftplus/updraftplus.php' ) && defined( 'UPDRAFTPLUS_DIR' ) ) {
+        if ( is_plugin_active( self::PLUGIN_UPDRAFTPLUS_SLUG ) && defined( 'UPDRAFTPLUS_DIR' ) ) {
             $this->is_plugin_installed = true;
         }
 
@@ -73,7 +77,34 @@ class MainWP_Child_Updraft_Plus_Backups { //phpcs:ignore -- NOSONAR - multi meth
         }
 
         add_filter( 'mainwp_site_sync_others_data', array( $this, 'sync_others_data' ), 10, 2 );
-        add_filter( 'updraftplus_save_last_backup', array( __CLASS__, 'hook_updraft_plus_save_last_backup' ) );
+
+        // Reports owns the UpdraftPlus backup cursor when its callback is available.
+        if ( false === has_filter( 'updraftplus_save_last_backup', array( 'WP_MainWP_Stream\MainWP_Child_Report_Helper', 'hook_updraftplus_save_last_backup' ) ) ) {
+            add_filter( 'updraftplus_save_last_backup', array( __CLASS__, 'hook_updraft_plus_save_last_backup' ) );
+        }
+    }
+
+    /**
+     * Prevent the WordPress.org UpdraftPlus package from replacing Premium.
+     *
+     * @param mixed $transient Plugin update transient.
+     *
+     * @return mixed Filtered plugin update transient.
+     */
+    public function protect_premium_update( $transient ) {
+
+        if ( ! is_object( $transient ) || empty( $transient->response[ self::PLUGIN_UPDRAFTPLUS_SLUG ] ) || ! is_dir( UPDRAFTPLUS_DIR . '/udaddons' ) ) {
+            return $transient;
+        }
+
+        $update  = $transient->response[ self::PLUGIN_UPDRAFTPLUS_SLUG ];
+        $package = isset( $update->package ) ? (string) $update->package : '';
+
+        if ( false !== strpos( $package, 'downloads.wordpress.org/' ) || false !== strpos( $package, 'api.wordpress.org/' ) ) {
+            unset( $transient->response[ self::PLUGIN_UPDRAFTPLUS_SLUG ] );
+        }
+
+        return $transient;
     }
 
     /**
@@ -995,10 +1026,10 @@ class MainWP_Child_Updraft_Plus_Backups { //phpcs:ignore -- NOSONAR - multi meth
     private function get_premium_activation_status() {  // phpcs:ignore -- NOSONAR - complex.
         global $updraftplus_addons2;
 
-        $site_id          = $updraftplus_addons2->siteid();
-        $has_unclaimed    = false;
-        $is_assigned      = false;
-        $assigned_keys    = array();
+        $site_id       = $updraftplus_addons2->siteid();
+        $has_unclaimed = false;
+        $is_assigned   = false;
+        $assigned_keys = array();
 
         if ( isset( $updraftplus_addons2->user_addons ) && is_array( $updraftplus_addons2->user_addons ) ) {
             foreach ( $updraftplus_addons2->user_addons as $addon ) {
@@ -1017,39 +1048,28 @@ class MainWP_Child_Updraft_Plus_Backups { //phpcs:ignore -- NOSONAR - multi meth
             }
         }
 
-        if ( $has_unclaimed ) {
-            return array(
-                'result'  => 'success',
-                'status'  => 'connected_unclaimed',
-                'message' => esc_html__(
-                    'The TeamUpdraft account is connected, but a Premium purchase is not assigned to this site. Open UpdraftPlus on this site and claim or assign the purchase.',
-                    'mainwp-child'
-                ),
-            );
-        }
-
         if ( $is_assigned ) {
-            $updates_available = get_site_transient( 'update_plugins' );
-            $plugin_file       = isset( $updraftplus_addons2->plug_updatechecker->pluginFile )
-                ? $updraftplus_addons2->plug_updatechecker->pluginFile
-                : '';
-
-            if ( $plugin_file && is_object( $updates_available ) && isset( $updates_available->response[ $plugin_file ] ) ) {
-                return array(
-                    'result'  => 'success',
-                    'status'  => 'assigned_update_required',
-                    'message' => esc_html__(
-                        'The Premium purchase is assigned to this site, but UpdraftPlus must be updated to activate it.',
-                        'mainwp-child'
-                    ),
-                );
-            }
-
             // Check if the assigned Premium add-ons are installed and active.
             $available_addons = is_callable( array( $updraftplus_addons2, 'get_available_addons' ) )
                 ? $updraftplus_addons2->get_available_addons()
                 : false;
             if ( ! is_array( $available_addons ) || ! $this->are_assigned_addons_installed( $available_addons, $assigned_keys ) ) {
+                $updates_available = get_site_transient( 'update_plugins' );
+                $plugin_file       = isset( $updraftplus_addons2->plug_updatechecker->pluginFile )
+                    ? $updraftplus_addons2->plug_updatechecker->pluginFile
+                    : '';
+
+                if ( $plugin_file && is_object( $updates_available ) && isset( $updates_available->response[ $plugin_file ] ) ) {
+                    return array(
+                        'result'  => 'success',
+                        'status'  => 'assigned_update_required',
+                        'message' => esc_html__(
+                            'The Premium purchase is assigned to this site, but UpdraftPlus must be updated to activate it.',
+                            'mainwp-child'
+                        ),
+                    );
+                }
+
                 return array(
                     'result'  => 'success',
                     'status'  => 'assigned_activation_required',
@@ -1065,6 +1085,17 @@ class MainWP_Child_Updraft_Plus_Backups { //phpcs:ignore -- NOSONAR - multi meth
                 'status'  => 'fully_active',
                 'message' => esc_html__(
                     'The TeamUpdraft account is connected and the Premium purchase is assigned to this site.',
+                    'mainwp-child'
+                ),
+            );
+        }
+
+        if ( $has_unclaimed ) {
+            return array(
+                'result'  => 'success',
+                'status'  => 'connected_unclaimed',
+                'message' => esc_html__(
+                    'The TeamUpdraft account is connected, but a Premium purchase is not assigned to this site. Open UpdraftPlus on this site and claim or assign the purchase.',
                     'mainwp-child'
                 ),
             );
@@ -1136,8 +1167,8 @@ class MainWP_Child_Updraft_Plus_Backups { //phpcs:ignore -- NOSONAR - multi meth
             $options = array();
         }
 
-        $email              = isset( $value['email'] ) ? $value['email'] : '';
-        $password           = isset( $value['password'] ) ? $value['password'] : '';
+        $email               = isset( $value['email'] ) ? $value['email'] : '';
+        $password            = isset( $value['password'] ) ? $value['password'] : '';
         $credentials_changed = ! isset( $options['email'], $options['password'] )
             || $options['email'] !== $email
             || $options['password'] !== $password;
@@ -4393,6 +4424,11 @@ ENDHERE;
             return;
         }
 
+        // Premium and Basic use the same plugin slug.
+        if ( is_dir( UPDRAFTPLUS_DIR . '/udaddons' ) && false === has_filter( 'site_transient_update_plugins', array( $this, 'protect_premium_update' ) ) ) {
+            add_filter( 'site_transient_update_plugins', array( $this, 'protect_premium_update' ), 20 );
+        }
+
         if ( get_option( 'mainwp_updraftplus_hide_plugin' ) === 'hide' ) {
             add_filter( 'all_plugins', array( $this, 'all_plugins' ) );
             add_action( 'admin_menu', array( $this, 'remove_menu' ) );
@@ -4491,12 +4527,12 @@ ENDHERE;
     /**
      * Hide UpdraftPlus notices.
      *
-     * @param string $slugs Plugin slugs.
+     * @param array $slugs Plugin slugs.
      *
      * @return string $slugs Plugin slugs.
      */
     public function hide_update_notice( $slugs ) {
-        $slugs[] = 'updraftplus/updraftplus.php';
+        $slugs[] = self::PLUGIN_UPDRAFTPLUS_SLUG;
         return $slugs;
     }
 
@@ -4517,8 +4553,8 @@ ENDHERE;
             return $value;
         }
 
-        if ( isset( $value->response['updraftplus/updraftplus.php'] ) ) {
-            unset( $value->response['updraftplus/updraftplus.php'] );
+        if ( isset( $value->response[ self::PLUGIN_UPDRAFTPLUS_SLUG ] ) ) {
+            unset( $value->response[ self::PLUGIN_UPDRAFTPLUS_SLUG ] );
         }
 
         return $value;

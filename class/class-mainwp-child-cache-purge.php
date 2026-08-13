@@ -326,6 +326,10 @@ class MainWP_Child_Cache_Purge { //phpcs:ignore -- NOSONAR - multi methods.
                         break;
                 }
             } catch ( MainWP_Exception $e ) {
+                // Provider detail stays off the wire; keep it locally reachable for debugging.
+                if ( defined( 'WP_DEBUG' ) && WP_DEBUG ) {
+                    error_log( 'MainWP Child cache purge: ' . $e->getMessage() ); // phpcs:ignore -- debug mode only.
+                }
                 $information = $this->purge_result( 'Cache purge attempt failed.', 'ERROR', 'attempt_failed' );
             }
 
@@ -1058,8 +1062,12 @@ class MainWP_Child_Cache_Purge { //phpcs:ignore -- NOSONAR - multi methods.
 
         $body   = wp_remote_retrieve_body( $response );
         $result = is_string( $body ) ? json_decode( $body, true ) : false;
+        // An unreadable body (gateway error page, empty response, proxy interception) carries no provider outcome to check.
+        if ( ! is_array( $result ) ) {
+            return $this->purge_result( 'Cloudflare => Purge Cache response was not a recognized API response.', 'ERROR', 'attempt_failed' );
+        }
         // Check if success.
-        if ( ! is_array( $result ) || empty( $result['success'] ) ) {
+        if ( empty( $result['success'] ) ) {
             $errors = isset( $result['errors'] ) ? wp_json_encode( $result['errors'], JSON_UNESCAPED_SLASHES ) : 'Unknown error';
             if ( ! is_string( $errors ) ) {
                 $errors = 'Unknown error';

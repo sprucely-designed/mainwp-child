@@ -190,6 +190,24 @@ class Test_Cache_Purge_Results extends WP_UnitTestCase {
 	}
 
 	/**
+	 * A composed result carries a basis at both the top level and the Cloudflare layer.
+	 */
+	public function test_composed_result_carries_a_basis_at_both_layers() {
+		update_option( 'mainwp_child_auto_purge_cache', 1 );
+		update_option( 'mainwp_cache_control_cache_solution', 'Plugin Not Found' );
+		update_option( 'mainwp_child_cloud_flair_enabled', '1' );
+
+		MainWP_Child_Cache_Purge::instance()->auto_purge_cache();
+		$result = $this->recorded_result();
+
+		$this->assertSame( 'SUCCESS', $result['action'] );
+		$this->assert_basis( $result, 'provider_missing' );
+		$this->assertArrayHasKey( 'cloudflare', $result );
+		$this->assertSame( 'ERROR', $result['cloudflare']['action'] );
+		$this->assert_basis( $result['cloudflare'], 'preflight_failed' );
+	}
+
+	/**
 	 * An unmatched detected solution produces a shaped provider-missing error.
 	 */
 	public function test_dispatch_default_is_shaped_provider_missing_error() {
@@ -311,8 +329,45 @@ class Test_Cache_Purge_Results extends WP_UnitTestCase {
 		$this->assert_basis( $success, 'provider_confirmed' );
 		$this->assertSame( 'ERROR', $failure['action'] );
 		$this->assert_basis( $failure, 'provider_confirmed' );
-		$this->assertLessThanOrEqual( 512 + 80, strlen( $failure['result'] ) );
+		$message_prefix = 'Cloudflare => There was an issue purging the cache. ';
+		$this->assertStringStartsWith( $message_prefix, $failure['result'] );
+		$this->assertLessThanOrEqual( 512 + strlen( $message_prefix ), strlen( $failure['result'] ) );
 		$this->assertStringNotContainsString( $long_error, $failure['result'] );
+	}
+
+	/**
+	 * A purge response that is not a readable API response reports no provider outcome.
+	 */
+	public function test_cloudflare_unreadable_purge_response_is_attempt_failure() {
+		$purger = $this->cloudflare_purger();
+		update_option( 'mainwp_cloudflair_email', 'admin@example.test' );
+		update_option( 'mainwp_child_cloudflair_key', MainWP_Child_Keys_Manager::instance()->encrypt_string( 'api-key' ) );
+
+		$responses = array(
+			array(
+				'headers'  => array(),
+				'body'     => wp_json_encode( array( 'result' => array( array( 'id' => 'zone-1' ) ) ) ),
+				'response' => array( 'code' => 200 ),
+				'cookies'  => array(),
+			),
+			array(
+				'headers'  => array(),
+				'body'     => '<html>Bad Gateway</html>',
+				'response' => array( 'code' => 502 ),
+				'cookies'  => array(),
+			),
+		);
+		$stub      = static function () use ( &$responses ) {
+			return array_shift( $responses );
+		};
+		add_filter( 'pre_http_request', $stub, 10, 3 );
+
+		$result = $purger->cloudflair_auto_purge_cache();
+
+		remove_filter( 'pre_http_request', $stub, 10 );
+		$this->assertSame( 'ERROR', $result['action'] );
+		$this->assert_basis( $result, 'attempt_failed' );
+		$this->assertStringNotContainsString( 'Bad Gateway', $result['result'] );
 	}
 
 	/**
@@ -399,17 +454,24 @@ class Test_Cache_Purge_Results extends WP_UnitTestCase {
 	public function test_every_purge_result_call_has_an_explicit_supported_basis() {
 		$source = file_get_contents( dirname( __DIR__ ) . '/class/class-mainwp-child-cache-purge.php' ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_get_contents_file_get_contents -- fixed local test source.
 		$this->assertIsString( $source );
-		$tokens = token_get_all( $source );
-		$calls  = 0;
+		$tokens       = token_get_all( $source );
+		$calls        = 0;
+		$occurrences  = 0;
+		$declarations = 0;
 
 		foreach ( $tokens as $index => $token ) {
 			if ( ! is_array( $token ) || T_STRING !== $token[0] || 'purge_result' !== $token[1] ) {
 				continue;
 			}
+			++$occurrences;
 
 			$previous = $index - 1;
 			while ( $previous >= 0 && is_array( $tokens[ $previous ] ) && T_WHITESPACE === $tokens[ $previous ][0] ) {
 				--$previous;
+			}
+			if ( $previous >= 0 && is_array( $tokens[ $previous ] ) && T_FUNCTION === $tokens[ $previous ][0] ) {
+				++$declarations;
+				continue;
 			}
 			if ( $previous < 0 || ! is_array( $tokens[ $previous ] ) || T_OBJECT_OPERATOR !== $tokens[ $previous ][0] ) {
 				continue;
@@ -451,6 +513,16 @@ class Test_Cache_Purge_Results extends WP_UnitTestCase {
 			++$calls;
 		}
 
-		$this->assertGreaterThan( 40, $calls );
+		$this->assertSame( 1, $declarations, 'purge_result() must be declared exactly once in the production file.' );
+		$this->assertSame(
+			$occurrences - $declarations,
+			$calls,
+			'Every purge_result() occurrence other than its declaration must be scanned as a call site; a differently shaped call (self::, static::, a callable string) would otherwise skip the basis check.'
+		);
+		$this->assertSame(
+			60,
+			$calls,
+			'The purge_result() call-site count changed. Update this number deliberately after confirming every new call site passes an explicit basis.'
+		);
 	}
 }

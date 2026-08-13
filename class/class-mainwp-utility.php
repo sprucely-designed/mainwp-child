@@ -734,7 +734,7 @@ class MainWP_Utility { //phpcs:ignore -- NOSONAR - multi methods.
      *     @type string $content Raw HTML or JSON body returned by the target URL.
      * }
      */
-    public function simulate_admin_visit( $target_path, $get_args, $perform ) {
+    public function simulate_admin_visit( $target_path, $get_args, $perform ) { // phpcs:ignore -- NOSONAR - complex.
 
         // Authorization check.
         if ( ! current_user_can( 'manage_options' ) ) {

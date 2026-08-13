@@ -186,25 +186,11 @@ class MainWP_Child_Updates { //phpcs:ignore -- NOSONAR - multi methods.
             }
 
             if ( ! empty( $information['other_data'] ) ) {
-                $data         = $information['other_data']['updated_data'] ?? array();
-                $updated_data = array();
-                if ( ! empty( $data ) ) {
-                    foreach ( $data as $slug  => $info ) {
-                        if ( ! empty( $info['version'] ) && ! empty( $info['old_version'] ) && $info['old_version'] === $info['version'] ) {
-                            continue;
-                        }
-                        $updated_data[ $slug ] = $info;
-                    }
-                }
-                if ( ! empty( $updated_data ) ) {
-                    $other_data                               = array(
-                        'updated_data' => $updated_data,
-                        'duration'     => MainWP_Helper::get_runtime(),
-                        'created'      => time(),
-                    );
-                    $saved_info[ $type ][ microtime( true ) ] = array( 'other_data' => $other_data );
-                    update_option( 'mainwp_child_premium_updates_result', $saved_info );
-                }
+                $other_data                               = $information['other_data'];
+                $other_data['duration']                   = MainWP_Helper::get_runtime();
+                $other_data['created']                    = time();
+                $saved_info[ $type ][ microtime( true ) ] = array( 'other_data' => $other_data );
+                update_option( 'mainwp_child_premium_updates_result', $saved_info );
             }
         }
 

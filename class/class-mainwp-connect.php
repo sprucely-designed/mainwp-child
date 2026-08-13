@@ -707,126 +707,28 @@ class MainWP_Connect { //phpcs:ignore -- NOSONAR - multi methods.
      */
     private function verify_authed_request() { // phpcs:ignore --NOSONAR - complex.
 
-            // phpcs:disable WordPress.Security.NonceVerification
-            $request_id = rawurldecode( isset( $_REQUEST['mainwpsignature'] ) ? wp_unslash( $_REQUEST['mainwpsignature'] ) : '' ); // phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized
-            // phpcs:enable WordPress.Security.NonceVerification
+        // phpcs:disable WordPress.Security.NonceVerification
+        $request_id = rawurldecode( isset( $_REQUEST['mainwpsignature'] ) ? wp_unslash( $_REQUEST['mainwpsignature'] ) : '' ); // phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized
+        // phpcs:enable WordPress.Security.NonceVerification
 
-            $now = time();
+        $now = time();
 
-            /*
-            * Retention periods.
-            */
-            $retention_3_days    = 3 * DAY_IN_SECONDS;
-            $retention_3_months  = 90 * DAY_IN_SECONDS;
-            $retention_12_months = 365 * DAY_IN_SECONDS;
+        $hash_request_id = hash( 'sha256', $request_id );
 
-            $option_request_id = 'mainwp_child_request_id_' . hash( 'sha256', $request_id );
+        $option_request_id  = 'mainwp_child_request_id_' . $hash_request_id;
+        $blocked_request_id = 'mainwp_child_blocked_request_id_' . $hash_request_id;
 
-            /*
-            * New request ID.
-            *
-            * Level 1:
-            * Keep for 3 days.
-            */
-            $new_request_data = array(
-                'level'     => 1,
-                'created'   => $now,
-                'last_seen' => $now,
-                'expires'   => $now + $retention_3_days,
-            );
+        $blocked = get_option( $blocked_request_id, false );
 
-            if ( add_option( $option_request_id, $new_request_data, '', false ) ) {
-                return true;
-            }
-
-            /*
-            * Request ID already exists.
-            */
-            $stored = get_option( $option_request_id );
-
-            if ( ! is_array( $stored ) ) {
-                $stored = $new_request_data;
-            }
-
-            $level     = isset( $stored['level'] ) ? (int) $stored['level'] : 1;
-            $last_seen = isset( $stored['last_seen'] ) ? (int) $stored['last_seen'] : 0;
-            $expires   = isset( $stored['expires'] ) ? (int) $stored['expires'] : 0;
-
-            /*
-            * If the retention period has expired, remove the old request ID
-            * and treat this request as a completely new request.
-            */
-            if ( $expires <= $now ) {
-
-                delete_option( $option_request_id );
-
-                add_option(
-                    $option_request_id,
-                    $new_request_data,
-                    '',
-                    false
-                );
-
-                return true;
-            }
-
-            /*
-            * Check the 30-second replay window BEFORE updating last_seen.
-            */
-            $within_replay_window = 1 === $level
-            && $last_seen >= ( $now - 30 )
-            && $last_seen <= $now;
-
-            /*
-            * Existing request ID:
-            *
-            * Level 1 -> Level 2.
-            * Level 2 -> Level 3.
-            * Level 3 -> remains Level 3.
-            */
-            if ( 1 === $level ) {
-                /*
-                * This request ID has been seen again.
-                * Increase retention from 3 days to 3 months.
-                */
-                $level   = 2;
-                $expires = $now + $retention_3_months;
-
-            } elseif ( 2 === $level ) {
-                /*
-                * This request ID has been seen again.
-                * Increase retention from 3 months to 12 months.
-                */
-                $level   = 3;
-                $expires = $now + $retention_12_months;
-
-            } elseif ( 3 === $level ) {
-                /*
-                * Already at 12-month retention.
-                *
-                * Do NOT extend the expiration time.
-                */
-                $level = 3;
-            }
-
-            /*
-            * Update request information.
-            */
-            $stored['level']     = $level;
-            $stored['last_seen'] = $now;
-            $stored['expires']   = $expires;
-
-            update_option( $option_request_id, $stored, false );
-
-            /*
-            * Same request ID within 30 seconds -> allow.
-            * Same request ID after 30 seconds -> reject.
-            */
-            if ( ! $within_replay_window ) {
-                return 'AUTH_ERROR2';
-            }
-
+        if ( add_option( $option_request_id, $now, '', false ) && false === $blocked ) {
             return true;
+        }
+
+        if ( ! $blocked ) {
+            add_option( $blocked_request_id, $now, '', false ); // ban request.
+        }
+
+        return 'AUTH_ERROR2';
     }
 
 

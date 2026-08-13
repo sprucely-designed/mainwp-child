@@ -323,92 +323,50 @@ class MainWP_Child_DB {
     }
 
     /**
-     * Clean up legacy request ID options.
+     * Cleanup expired request IDs.
      *
-     * Removes expired 12-month request IDs and randomly removes excess
-     * request IDs when the retention pools exceed their limits:
+     * Keeps up to 200 request IDs that are older than 3 days.
+     * Blocked request IDs are never removed.
      *
-     * - Level 1: Maximum 200 records.
-     * - Level 2: Maximum 100 records.
-     * - Level 3: Removed when the 12-month retention period expires.
-     *
-     * @return void
+     * @return int Number of request IDs removed.
      */
-    private static function cleanup_request_ids() { // phpcs:ignore -- NOSONAR -complex
-
+    private function cleanup_request_ids() {
         global $wpdb;
 
-        $prefix = 'mainwp_child_request_id_';
-        $now    = time();
+        // Security comes first. Do not remove mainwp_child_blocked_request_id_ options.
+        // If the database grows too large, address the storage issue separately.
+        $option_prefix = 'mainwp_child_request_id_';
+        $cutoff_time   = time() - ( 3 * DAY_IN_SECONDS );
 
-        $options = $wpdb->get_results(
+        $option_names = $wpdb->get_col(
             $wpdb->prepare(
-                "SELECT option_name, option_value
-            FROM {$wpdb->options}
-            WHERE option_name LIKE %s",
-                $wpdb->esc_like( $prefix ) . '%'
+                "SELECT option_name
+			FROM {$wpdb->options}
+			WHERE option_name LIKE %s
+			AND CAST(option_value AS UNSIGNED) < %d",
+                $wpdb->esc_like( $option_prefix ) . '%',
+                $cutoff_time
             )
         );
 
-        if ( empty( $options ) ) {
-            return;
+        if ( count( $option_names ) <= 200 ) {
+            return 0;
         }
 
-        $level_1 = array();
-        $level_2 = array();
+        // Randomize the expired request IDs.
+        shuffle( $option_names );
 
-        foreach ( $options as $option ) {
+        // Keep 200 records and remove the rest.
+        $option_names = array_slice( $option_names, 200 );
 
-            $value = maybe_unserialize( $option->option_value );
+        $deleted = 0;
 
-            if ( ! is_array( $value ) ) {
-                continue;
-            }
-
-            $level   = isset( $value['level'] ) ? (int) $value['level'] : 0;
-            $expires = isset( $value['expires'] ) ? (int) $value['expires'] : 0;
-
-            /*
-             * Level 3:
-             * Delete after 12 months.
-             */
-            if ( 3 === $level ) {
-                if ( $expires > 0 && $expires <= $now ) {
-                    delete_option( $option->option_name );
-                }
-
-                continue;
-            }
-
-            if ( 1 === $level ) {
-                $level_1[] = $option->option_name;
-            } elseif ( 2 === $level ) {
-                $level_2[] = $option->option_name;
+        foreach ( $option_names as $option_name ) {
+            if ( delete_option( $option_name ) ) {
+                ++$deleted;
             }
         }
 
-        /*
-        * Level 1: maximum 200.
-        */
-        if ( count( $level_1 ) > 200 ) {
-
-            shuffle( $level_1 );
-
-            foreach ( array_slice( $level_1, 200 ) as $option_name ) {
-                delete_option( $option_name );
-            }
-        }
-
-        /*
-        * Level 2: maximum 100.
-        */
-        if ( count( $level_2 ) > 100 ) {
-
-            shuffle( $level_2 );
-
-            foreach ( array_slice( $level_2, 100 ) as $option_name ) {
-                delete_option( $option_name );
-            }
-        }
+        return $deleted;
     }
 }

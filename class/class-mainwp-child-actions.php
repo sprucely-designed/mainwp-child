@@ -176,7 +176,7 @@ class MainWP_Child_Actions { //phpcs:ignore -- NOSONAR - multi method.
         }
 
         // Also triggered from the Dashboard.
-        if ( mainwp_child_is_dashboard_premium_update_request() ) {  // phpcs:ignore -- NOSONAR -ok.
+        if ( mainwp_child_is_dashboard_premium_update_request() ) {
             return;
         }
 

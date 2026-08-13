@@ -720,15 +720,29 @@ class MainWP_Connect { //phpcs:ignore -- NOSONAR - multi methods.
 
         $blocked = get_option( $blocked_request_id, false );
 
-        if ( add_option( $option_request_id, $now, '', false ) && false === $blocked ) {
+        // A blocked request ID must never be accepted again.
+        if ( false !== $blocked ) {
+            return 'AUTH_ERROR2';
+        }
+
+        $request_time = get_option( $option_request_id, false );
+
+        // First request: save the request ID and allow it.
+        if ( false === $request_time && add_option( $option_request_id, $now, '', false ) ) {
             return true;
         }
 
-        if ( ! $blocked ) {
-            add_option( $blocked_request_id, $now, '', false ); // ban request.
+        $valid = false;
+        // Allow one replay within 20 seconds, then permanently block
+        // the request ID so it cannot be replayed again.
+        if ( false !== $request_time && ( $now - (int) $request_time ) <= 20 ) {
+            $valid = true;
         }
 
-        return 'AUTH_ERROR2';
+        // Permanently block the request ID after this replay attempt.
+        add_option( $blocked_request_id, $now, '', false );
+
+        return $valid ? true : 'AUTH_ERROR2';
     }
 
 

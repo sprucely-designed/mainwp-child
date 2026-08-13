@@ -82,6 +82,11 @@ class MainWP_Child_Updraft_Plus_Backups { //phpcs:ignore -- NOSONAR - multi meth
         if ( false === has_filter( 'updraftplus_save_last_backup', array( 'WP_MainWP_Stream\MainWP_Child_Report_Helper', 'hook_updraftplus_save_last_backup' ) ) ) {
             add_filter( 'updraftplus_save_last_backup', array( __CLASS__, 'hook_updraft_plus_save_last_backup' ) );
         }
+
+        // Register the Premium package guard as soon as this class file is loaded.
+        add_filter( 'pre_site_transient_update_plugins', array( $this, 'protect_premium_update' ), 99 );
+        add_filter( 'site_transient_update_plugins', array( $this, 'protect_premium_update' ), 99 );
+        add_filter( 'upgrader_pre_download', array( $this, 'protect_premium_package' ), 99, 4 );
     }
 
     /**
@@ -91,20 +96,85 @@ class MainWP_Child_Updraft_Plus_Backups { //phpcs:ignore -- NOSONAR - multi meth
      *
      * @return mixed Filtered plugin update transient.
      */
-    public function protect_premium_update( $transient ) {
+    public static function protect_premium_update( $transient ) {
 
-        if ( ! is_object( $transient ) || empty( $transient->response[ self::PLUGIN_UPDRAFTPLUS_SLUG ] ) || ! is_dir( UPDRAFTPLUS_DIR . '/udaddons' ) ) {
+        if ( ! is_object( $transient ) || empty( $transient->response[ self::PLUGIN_UPDRAFTPLUS_SLUG ] ) || ! self::has_premium_addons() ) {
             return $transient;
         }
 
         $update  = $transient->response[ self::PLUGIN_UPDRAFTPLUS_SLUG ];
-        $package = isset( $update->package ) ? (string) $update->package : '';
+        $package = isset( $update->package ) ? $update->package : '';
 
-        if ( false !== strpos( $package, 'downloads.wordpress.org/' ) || false !== strpos( $package, 'api.wordpress.org/' ) ) {
+        if ( self::is_wordpress_org_package( $package ) ) {
             unset( $transient->response[ self::PLUGIN_UPDRAFTPLUS_SLUG ] );
         }
 
         return $transient;
+    }
+
+    /**
+     * Prevent Plugin Upgrader from downloading the WordPress.org package over Premium.
+     *
+     * @param mixed  $reply    Download result or null.
+     * @param string $package  Package URL.
+     * @param object $upgrader Upgrader instance.
+     * @param array  $hook_extra Extra arguments passed to the upgrader.
+     *
+     * @return mixed Download result or WP_Error when the package is unsafe.
+     */
+    public static function protect_premium_package( $reply, $package, $upgrader, $hook_extra = array() ) { // phpcs:ignore -- NOSONAR - complex.
+        if ( ! self::has_premium_addons() || ! self::is_wordpress_org_package( $package ) || ! self::is_updraftplus_upgrade_item( $upgrader, $hook_extra ) ) {
+            return $reply;
+        }
+
+        return new \WP_Error(
+            'mainwp_updraftplus_premium_package_blocked',
+            __( 'The WordPress.org UpdraftPlus package was blocked because a Premium installation is present.', 'mainwp-child' )
+        );
+    }
+
+    /**
+     * Whether the installed UpdraftPlus copy contains Premium add-ons.
+     *
+     * @return bool
+     */
+    private static function has_premium_addons() {
+        return defined( 'UPDRAFTPLUS_DIR' ) && is_dir( UPDRAFTPLUS_DIR . '/udaddons' );
+    }
+
+    /**
+     * Whether the upgrader is downloading the UpdraftPlus plugin package.
+     *
+     * @param object $upgrader   Upgrader instance.
+     * @param array  $hook_extra Extra arguments passed to the upgrader.
+     *
+     * @return bool
+     */
+    private static function is_updraftplus_upgrade_item( $upgrader, $hook_extra = array() ) {
+        if ( is_array( $hook_extra ) && isset( $hook_extra['plugin'] ) ) {
+            return self::PLUGIN_UPDRAFTPLUS_SLUG === $hook_extra['plugin'];
+        }
+
+        if ( is_object( $upgrader ) && isset( $upgrader->skin ) && isset( $upgrader->skin->plugin ) ) {
+            return self::PLUGIN_UPDRAFTPLUS_SLUG === $upgrader->skin->plugin;
+        }
+
+        return false;
+    }
+
+    /**
+     * Whether a package URL is hosted by WordPress.org.
+     *
+     * @param string $package Package URL.
+     *
+     * @return bool
+     */
+    private static function is_wordpress_org_package( $package ) {
+        if ( ! is_string( $package ) ) {
+            return false;
+        }
+
+        return false !== strpos( $package, 'downloads.wordpress.org/' ) || false !== strpos( $package, 'api.wordpress.org/' );
     }
 
     /**
@@ -879,7 +949,12 @@ class MainWP_Child_Updraft_Plus_Backups { //phpcs:ignore -- NOSONAR - multi meth
         // Load UpdraftPlus Premium addons.
         if ( ! $this->load_updraftplus_addons() ) {
             return array(
-                'error' => 'NO_PREMIUM',
+                'error'   => 'NO_PREMIUM',
+                'status'  => 'connection_failed',
+                'message' => esc_html__(
+                    'UpdraftPlus Premium is not installed on this site, so the TeamUpdraft purchase cannot be claimed or activated.',
+                    'mainwp-child'
+                ),
             );
         }
 
@@ -909,8 +984,198 @@ class MainWP_Child_Updraft_Plus_Backups { //phpcs:ignore -- NOSONAR - multi meth
             );
         }
 
-        // Verify the account connection.
-        return $this->verify_updraftplus_connection();
+        // Verify the connection and the resulting Premium state.
+        $this->clear_updraftplus_addons_connection_cache( $addons_options['email'] );
+        $connection = $this->verify_updraftplus_connection();
+        if ( ! empty( $connection['error'] ) || 'fully_active' === ( $connection['status'] ?? '' ) ) {
+            return $connection;
+        }
+
+        if ( in_array( $connection['status'] ?? '', array( 'connected_unclaimed', 'assigned_activation_required', 'assigned_update_required' ), true ) ) {
+            // Claim and install the Premium addons.
+            $claim_result = $this->claim_and_install_premium_addons( $addons_options, 'connected_unclaimed' === $connection['status'] );
+            if ( is_wp_error( $claim_result ) ) {
+                return array(
+                    'error'   => 'premium_activation_failed',
+                    'status'  => 'activation_failed',
+                    'message' => $claim_result->get_error_message(),
+                );
+            }
+
+            // Verify the account and the resulting Premium state after the claim.
+            $this->clear_updraftplus_addons_connection_cache( $addons_options['email'] );
+            return $this->verify_updraftplus_connection();
+        }
+
+        return $connection;
+    }
+
+    /**
+     * Authenticate and claim Premium through UpdraftPlus's supported AJAX flow.
+     *
+     * @param array $addons_options TeamUpdraft credentials.
+     * @param bool  $claim          Whether the purchase needs to be claimed first.
+     *
+     * @return array|\WP_Error UpdraftPlus response or an error.
+     */
+    private function claim_and_install_premium_addons( $addons_options, $claim = true ) {  // phpcs:ignore -- NOSONAR - complex.
+        if ( $claim ) {
+            $login_response = $this->request_updraftplus_ajax(
+                array(
+                    'action'   => 'udmupdater_ajax',
+                    'slug'     => 'updraftplus',
+                    'nonce'    => $this->create_updraftplus_nonce( 'udmupdater-ajax-nonce' ),
+                    'email'    => $addons_options['email'],
+                    'password' => $addons_options['password'],
+                )
+            );
+
+            if ( is_wp_error( $login_response ) ) {
+                return $login_response;
+            }
+
+            if ( empty( $login_response['code'] ) || 'OK' !== $login_response['code'] ) {
+                return new \WP_Error(
+                    'premium_claim_failed',
+                    esc_html__( 'UpdraftPlus could not claim the Premium purchase for this site.', 'mainwp-child' )
+                );
+            }
+        }
+
+        $install_response = $this->request_updraftplus_ajax(
+            array(
+                'action' => 'udaddons_claimaddon',
+                'nonce'  => $this->create_updraftplus_nonce( 'udmanager-nonce' ),
+                'key'    => 'all',
+            )
+        );
+
+        if ( is_wp_error( $install_response ) ) {
+            return $install_response;
+        }
+
+        if ( empty( $install_response['code'] ) || 'OK' !== $install_response['code'] ) {
+            return new \WP_Error(
+                'premium_install_failed',
+                esc_html__( 'UpdraftPlus claimed the Premium purchase, but could not install or activate the Premium files.', 'mainwp-child' )
+            );
+        }
+
+        return $install_response;
+    }
+
+    /**
+     * Send an authenticated request to UpdraftPlus's admin AJAX endpoint.
+     *
+     * @param array $body POST fields.
+     *
+     * @return array|\WP_Error Decoded response or an error.
+     */
+    private function request_updraftplus_ajax( $body ) {  // phpcs:ignore -- NOSONAR - complex.
+        $current_user = wp_get_current_user();
+        if ( ! $current_user || empty( $current_user->ID ) ) {
+            return new \WP_Error( 'premium_activation_unauthorized', esc_html__( 'A logged-in administrator is required to activate UpdraftPlus Premium.', 'mainwp-child' ) );
+        }
+
+        $expiration = time() + HOUR_IN_SECONDS;
+        $token      = $this->ensure_updraftplus_loopback_session_token( $current_user, $expiration );
+
+        $secure     = is_ssl();
+        $scheme     = $secure ? 'secure_auth' : 'auth';
+
+        $response = wp_remote_post(
+            admin_url( 'admin-ajax.php' ),
+            array(
+                'timeout' => 30,
+                'body'    => $body,
+                'cookies' => array(
+                    new \WP_Http_Cookie(
+                        array(
+                            'name'  => $secure ? SECURE_AUTH_COOKIE : AUTH_COOKIE,
+                            'value' => wp_generate_auth_cookie( $current_user->ID, $expiration, $scheme, $token ),
+                        )
+                    ),
+                    new \WP_Http_Cookie(
+                        array(
+                            'name'  => LOGGED_IN_COOKIE,
+                            'value' => wp_generate_auth_cookie( $current_user->ID, $expiration, 'logged_in', $token ),
+                        )
+                    ),
+                ),
+            )
+        );
+
+        if ( is_wp_error( $response ) ) {
+            return new \WP_Error( 'premium_activation_request_failed', $response->get_error_message() );
+        }
+
+        $decoded = json_decode( wp_remote_retrieve_body( $response ), true );
+        if ( ! is_array( $decoded ) ) {
+            return new \WP_Error( 'premium_activation_invalid_response', esc_html__( 'UpdraftPlus returned an invalid Premium activation response.', 'mainwp-child' ) );
+        }
+
+        return $decoded;
+    }
+
+    /**
+     * Create an UpdraftPlus AJAX nonce for the session used by the loopback request.
+     *
+     * @param string $action Nonce action.
+     *
+     * @return string Nonce value.
+     */
+    private function create_updraftplus_nonce( $action ) {
+        $current_user = wp_get_current_user();
+        if ( $current_user && ! empty( $current_user->ID ) ) {
+            $this->ensure_updraftplus_loopback_session_token( $current_user, time() + HOUR_IN_SECONDS );
+        }
+
+        return wp_create_nonce( $action );
+    }
+
+    /**
+     * Ensure nonce generation and loopback cookies use the same session token.
+     *
+     * @param \WP_User $current_user Current user.
+     * @param int      $expiration   Session expiration timestamp.
+     *
+     * @return string Session token.
+     */
+    private function ensure_updraftplus_loopback_session_token( $current_user, $expiration ) {
+        $token = wp_get_session_token();
+
+        if ( empty( $token ) ) {
+            if ( ! class_exists( '\WP_Session_Tokens' ) ) {
+                require_once ABSPATH . WPINC . '/class-wp-session-tokens.php'; // NOSONAR - WP compatible.
+            }
+            if ( ! class_exists( '\WP_User_Meta_Session_Tokens' ) ) {
+                require_once ABSPATH . WPINC . '/class-wp-user-meta-session-tokens.php'; // NOSONAR - WP compatible.
+            }
+
+            $token                       = \WP_Session_Tokens::get_instance( $current_user->ID )->create( $expiration );
+            $_COOKIE[ LOGGED_IN_COOKIE ] = wp_generate_auth_cookie( $current_user->ID, $expiration, 'logged_in', $token );
+        }
+
+        return $token;
+    }
+
+    /**
+     * Clear UpdraftPlus's cached TeamUpdraft account connection state.
+     *
+     * @param string $email TeamUpdraft account email.
+     * @return void
+     */
+    private function clear_updraftplus_addons_connection_cache( $email = '' ) {
+        if ( empty( $email ) ) {
+            $options = $this->addons2_get_option( UDADDONS2_SLUG . '_options' );
+            $email   = is_array( $options ) && isset( $options['email'] ) ? $options['email'] : '';
+        }
+
+        if ( empty( $email ) ) {
+            return;
+        }
+
+        delete_site_transient( 'udaddons_connect_' . substr( md5( $email ), 0, 23 ) );
     }
 
     /**
@@ -1119,6 +1384,10 @@ class MainWP_Child_Updraft_Plus_Backups { //phpcs:ignore -- NOSONAR - multi meth
      * @return bool
      */
     private function are_assigned_addons_installed( $available_addons, $assigned_keys ) { // phpcs:ignore -- NOSONAR - complex.
+        if ( empty( $assigned_keys ) ) {
+            return false;
+        }
+
         $has_all_addons = isset( $assigned_keys['all'] );
 
         foreach ( $assigned_keys as $key => $assigned ) {
@@ -4425,10 +4694,6 @@ ENDHERE;
         }
 
         // Premium and Basic use the same plugin slug.
-        if ( is_dir( UPDRAFTPLUS_DIR . '/udaddons' ) && false === has_filter( 'site_transient_update_plugins', array( $this, 'protect_premium_update' ) ) ) {
-            add_filter( 'site_transient_update_plugins', array( $this, 'protect_premium_update' ), 20 );
-        }
-
         if ( get_option( 'mainwp_updraftplus_hide_plugin' ) === 'hide' ) {
             add_filter( 'all_plugins', array( $this, 'all_plugins' ) );
             add_action( 'admin_menu', array( $this, 'remove_menu' ) );

@@ -247,19 +247,19 @@ class MainWP_Child_WooCommerce_Status {
         $outofstock_count = absint( $wpdb->get_var( "SELECT COUNT( DISTINCT posts.ID ) {$query_from};" ) );  //phpcs:ignore -- safe query.
 
         $data = array(
-            'sales'             => $sales,
-            'formated_sales'    => wc_price( $sales ),
-            'sales_report_mode' => 'legacy',
-            'top_seller'        => $top_seller,
-            'onhold'            => $on_hold_count,
-            'awaiting'          => $processing_count,
-            'stock'             => $stock,
-            'nostock'           => $nostock,
-            'lowstock'          => $lowinstock_count,
-            'outstock'          => $outofstock_count,
+            'sales'          => $sales,
+            'formated_sales' => wc_price( $sales ),
+            'top_seller'     => $top_seller,
+            'onhold'         => $on_hold_count,
+            'awaiting'       => $processing_count,
+            'stock'          => $stock,
+            'nostock'        => $nostock,
+            'lowstock'       => $lowinstock_count,
+            'outstock'       => $outofstock_count,
         );
 
         if ( $include_last_7_days_sales ) {
+            $data['sales_report_mode'] = 'legacy';
             $data = $this->add_last_7_days_sales( $data, false );
         }
 
@@ -431,7 +431,7 @@ class MainWP_Child_WooCommerce_Status {
         $start_date = strtotime( $start_date );
         $end_date   = strtotime( $end_date );
 
-        $information = $this->get_woocom_data( $start_date, $end_date );
+        $information = $this->get_woocom_data( $start_date, $end_date, $include_last_7_days_sales );
 
         if ( $include_last_7_days_sales && is_array( $information ) && isset( $information['data'] ) && is_array( $information['data'] ) ) {
             $information['data'] = $this->add_last_7_days_sales( $information['data'] );
@@ -657,13 +657,14 @@ class MainWP_Child_WooCommerce_Status {
      *
      * @param string $start_date Start Date.
      * @param string $end_date End Date.
+     * @param bool   $include_report_mode Whether to include the sales report mode.
      *
      * @return array $information Woocommerce data grabed.
      */
-    public function get_woocom_reports( $start_date, $end_date ) {
+    public function get_woocom_reports( $start_date, $end_date, $include_report_mode = false ) {
 
         if ( class_exists( '\Automattic\WooCommerce\Admin\Features\Features' ) && \Automattic\WooCommerce\Admin\Features\Features::is_enabled( 'analytics' ) ) {
-            return $this->get_woocom_analytics( $start_date, $end_date );
+            return $this->get_woocom_analytics( $start_date, $end_date, $include_report_mode );
         }
 
         $on_hold_count = 0;
@@ -684,16 +685,21 @@ class MainWP_Child_WooCommerce_Status {
         $report     = new \Automattic\WooCommerce\Admin\API\Reports\Stock\Stats\Query();
         $stock_data = $report->get_data();
 
-        return array(
-            'sales'             => $total_sales,
-            'formated_sales'    => wc_price( $total_sales ),
-            'sales_report_mode' => 'legacy',
-            'top_seller'        => ! empty( $top_seller ) ? (object) $top_seller : false,
-            'onhold'            => $on_hold_count,
-            'awaiting'          => $processing_count,
-            'lowstock'          => is_array( $stock_data ) && isset( $stock_data['lowstock'] ) ? intval( $stock_data['lowstock'] ) : 0,
-            'outstock'          => is_array( $stock_data ) && isset( $stock_data['outofstock'] ) ? intval( $stock_data['outofstock'] ) : 0,
+        $data = array(
+            'sales'          => $total_sales,
+            'formated_sales' => wc_price( $total_sales ),
+            'top_seller'     => ! empty( $top_seller ) ? (object) $top_seller : false,
+            'onhold'         => $on_hold_count,
+            'awaiting'       => $processing_count,
+            'lowstock'       => is_array( $stock_data ) && isset( $stock_data['lowstock'] ) ? intval( $stock_data['lowstock'] ) : 0,
+            'outstock'       => is_array( $stock_data ) && isset( $stock_data['outofstock'] ) ? intval( $stock_data['outofstock'] ) : 0,
         );
+
+        if ( $include_report_mode ) {
+            $data['sales_report_mode'] = 'legacy';
+        }
+
+        return $data;
     }
 
     /**
@@ -701,15 +707,16 @@ class MainWP_Child_WooCommerce_Status {
      *
      * @param string $start_date Start Date.
      * @param string $end_date End Date.
+     * @param bool   $include_report_mode Whether to include the sales report mode.
      *
      * @return array $information Woocommerce data grabed.
      */
-    public function get_woocom_data( $start_date, $end_date ) {
+    public function get_woocom_data( $start_date, $end_date, $include_report_mode = false ) {
 
         if ( class_exists( '\Automattic\WooCommerce\Admin\API\Reports\Orders\Stats\Query' ) ) {
-            $data = $this->get_woocom_reports( $start_date, $end_date );
+            $data = $this->get_woocom_reports( $start_date, $end_date, $include_report_mode );
         } else {
-            $data = $this->get_woocom_reports_old( $start_date, $end_date );
+            $data = $this->get_woocom_reports_old( $start_date, $end_date, $include_report_mode );
         }
 
         $information['data']           = $data;
@@ -723,10 +730,11 @@ class MainWP_Child_WooCommerce_Status {
      *
      * @param string $start_date Start Date.
      * @param string $end_date End Date.
+     * @param bool   $include_report_mode Whether to include the sales report mode.
      *
      * @return array $information Woocommerce data grabed.
      */
-    public function get_woocom_reports_old( $start_date, $end_date ) {
+    public function get_woocom_reports_old( $start_date, $end_date, $include_report_mode = false ) {
 
         /**
          * Object, providing access to the WordPress database.
@@ -802,17 +810,20 @@ class MainWP_Child_WooCommerce_Status {
         $outofstock_count = absint( $wpdb->get_var( "SELECT COUNT( DISTINCT posts.ID ) {$query_from};" ) ); //phpcs:ignore -- safe query.
 
         $data = array(
-            'sales'             => $sales,
-            'formated_sales'    => wc_price( $sales ),
-            'sales_report_mode' => 'legacy',
-            'top_seller'        => $top_seller,
-            'onhold'            => $on_hold_count,
-            'awaiting'          => $processing_count,
-            'stock'             => $stock,
-            'nostock'           => $nostock,
-            'lowstock'          => $lowinstock_count,
-            'outstock'          => $outofstock_count,
+            'sales'          => $sales,
+            'formated_sales' => wc_price( $sales ),
+            'top_seller'     => $top_seller,
+            'onhold'         => $on_hold_count,
+            'awaiting'       => $processing_count,
+            'stock'          => $stock,
+            'nostock'        => $nostock,
+            'lowstock'       => $lowinstock_count,
+            'outstock'       => $outofstock_count,
         );
+
+        if ( $include_report_mode ) {
+            $data['sales_report_mode'] = 'legacy';
+        }
 
         $data = apply_filters( 'mainwp_child_woocom_get_data', $data );
         return $data;
@@ -959,10 +970,11 @@ class MainWP_Child_WooCommerce_Status {
      *
      * @param string $start_date Start Date.
      * @param string $end_date End Date.
+     * @param bool   $include_report_mode Whether to include the sales report mode.
      *
      * @return array $information Woocommerce data grabed.
      */
-    public function get_woocom_analytics( $start_date, $end_date ) {
+    public function get_woocom_analytics( $start_date, $end_date, $include_report_mode = false ) {
         $on_hold_count = 0;
         if ( function_exists( 'wc_orders_count' ) ) {
             $status_counts = array_map( 'wc_orders_count', array( 'on-hold' ) );
@@ -981,16 +993,21 @@ class MainWP_Child_WooCommerce_Status {
         $report     = new \Automattic\WooCommerce\Admin\API\Reports\Stock\Stats\Query();
         $stock_data = $report->get_data();
 
-        return array(
-            'sales'             => $total_sales,
-            'formated_sales'    => wc_price( $total_sales ),
-            'sales_report_mode' => 'analytics',
-            'top_seller'        => ! empty( $top_seller ) ? (object) $top_seller : false,
-            'onhold'            => $on_hold_count,
-            'awaiting'          => $processing_count,
-            'lowstock'          => is_array( $stock_data ) && isset( $stock_data['lowstock'] ) ? intval( $stock_data['lowstock'] ) : 0,
-            'outstock'          => is_array( $stock_data ) && isset( $stock_data['outofstock'] ) ? intval( $stock_data['outofstock'] ) : 0,
+        $data = array(
+            'sales'          => $total_sales,
+            'formated_sales' => wc_price( $total_sales ),
+            'top_seller'     => ! empty( $top_seller ) ? (object) $top_seller : false,
+            'onhold'         => $on_hold_count,
+            'awaiting'       => $processing_count,
+            'lowstock'       => is_array( $stock_data ) && isset( $stock_data['lowstock'] ) ? intval( $stock_data['lowstock'] ) : 0,
+            'outstock'       => is_array( $stock_data ) && isset( $stock_data['outofstock'] ) ? intval( $stock_data['outofstock'] ) : 0,
         );
+
+        if ( $include_report_mode ) {
+            $data['sales_report_mode'] = 'analytics';
+        }
+
+        return $data;
     }
 
     /**

@@ -86,7 +86,8 @@ class MainWP_Child_WooCommerce_Status {
         if ( ! empty( $mwp_action ) ) {
             switch ( $mwp_action ) {
                 case 'sync_data':
-                    $information = ! $is_ver220 ? $this->sync_data() : $this->sync_data_two();
+                    $include_weekly_sales = '1' === MainWP_System::instance()->validate_params( 'include_last_7_days_sales', '0' );
+                    $information          = ! $is_ver220 ? $this->sync_data( $include_weekly_sales ) : $this->sync_data_two( $include_weekly_sales );
                     break;
                 case 'report_data':
                     $information = ! $is_ver220 ? $this->report_data() : $this->report_data_two();
@@ -118,9 +119,14 @@ class MainWP_Child_WooCommerce_Status {
     /**
      * Sync Woocommerce data.
      *
+     * @param bool $include_last_7_days_sales Whether to include sales from the last seven days.
+     *
      * @return array $information Woocommerce data grabed.
+     *
+     * @SuppressWarnings(PHPMD.ExcessiveMethodLength)
+     * @SuppressWarnings(PHPMD.LongVariable)
      */
-    public function sync_data() {
+    public function sync_data( $include_last_7_days_sales = false ) {
 
         /**
          * Object, providing access to the WordPress database.
@@ -251,6 +257,11 @@ class MainWP_Child_WooCommerce_Status {
             'lowstock'       => $lowinstock_count,
             'outstock'       => $outofstock_count,
         );
+
+        if ( $include_last_7_days_sales ) {
+            $data['sales_report_mode'] = 'legacy';
+            $data = $this->add_last_7_days_sales( $data, false );
+        }
 
         $data = apply_filters( 'mainwp_child_woocom_sync_data', $data );
 
@@ -408,15 +419,138 @@ class MainWP_Child_WooCommerce_Status {
 
     /**
      * Sync Woocommerce data for current month.
+     *
+     * @param bool $include_last_7_days_sales Whether to include sales from the last seven days.
+     *
+     * @SuppressWarnings(PHPMD.LongVariable)
      */
-    public function sync_data_two() {
+    public function sync_data_two( $include_last_7_days_sales = false ) {
         $start_date = date( 'Y-m-01 00:00:00', time() ); // phpcs:ignore -- local time.
         $end_date   = date( 'Y-m-d H:i:s', time() ); // phpcs:ignore -- local time.
 
         $start_date = strtotime( $start_date );
         $end_date   = strtotime( $end_date );
 
-        return $this->get_woocom_data( $start_date, $end_date );
+        $information = $this->get_woocom_data( $start_date, $end_date, $include_last_7_days_sales );
+
+        if ( $include_last_7_days_sales && is_array( $information ) && isset( $information['data'] ) && is_array( $information['data'] ) ) {
+            $information['data'] = $this->add_last_7_days_sales( $information['data'] );
+        }
+
+        return $information;
+    }
+
+    /**
+     * Add sales from the last seven days to WooCommerce status data.
+     *
+     * @param array $data WooCommerce status data.
+     * @param bool  $is_ver220 Whether WooCommerce 2.2 or newer is active.
+     *
+     * @return array WooCommerce status data.
+     */
+    private function add_last_7_days_sales( $data, $is_ver220 = true ) {
+        $end_date   = current_datetime();
+        $start_date = $end_date->modify( '-6 days' )->setTime( 0, 0, 0 );
+
+        $report_mode = isset( $data['sales_report_mode'] ) && 'analytics' === $data['sales_report_mode'] ? 'analytics' : 'legacy';
+
+        if ( $is_ver220 && 'analytics' === $report_mode ) {
+            $last_7_days_sales = $this->get_analytics_total_sales( $start_date, $end_date );
+        } elseif ( $is_ver220 ) {
+            $last_7_days_sales = $this->get_last_7_days_sales( $start_date, $end_date );
+        } else {
+            $last_7_days_sales = $this->get_pre_220_total_sales( $start_date->format( 'Y-m-d H:i:s' ), $end_date->format( 'Y-m-d H:i:s' ) );
+        }
+
+        $last_7_days_sales                  = (float) $last_7_days_sales;
+        $data['sales_last_7_days']          = $last_7_days_sales;
+        $data['formated_sales_last_7_days'] = wc_price( $last_7_days_sales );
+        $data['sales_last_7_days_start']    = $start_date->format( 'Y-m-d' );
+        $data['sales_last_7_days_end']      = $end_date->format( 'Y-m-d' );
+
+        return $data;
+    }
+
+    /**
+     * Get sales from the last seven days using the WooCommerce sales report.
+     *
+     * @param \DateTimeInterface $start_date Start of the seven-day range in the WordPress timezone.
+     * @param \DateTimeInterface $end_date Current time in the WordPress timezone.
+     *
+     * @return float Sales from the last seven days.
+     */
+    private function get_last_7_days_sales( $start_date, $end_date ) {
+        return $this->get_total_sales( $start_date->getTimestamp(), $end_date->getTimestamp(), true );
+    }
+
+    /**
+     * Get Analytics sales for a date range in the WordPress timezone.
+     *
+     * @param \DateTimeInterface $start_date Start of the range in the WordPress timezone.
+     * @param \DateTimeInterface $end_date End of the range in the WordPress timezone.
+     *
+     * @return float Sales total.
+     */
+    private function get_analytics_total_sales( $start_date, $end_date ) {
+        $args = array(
+            'before'   => $end_date->format( 'Y-m-d H:i:s' ),
+            'after'    => $start_date->format( 'Y-m-d H:i:s' ),
+            'fields'   => array( 'total_sales' ),
+            'per_page' => 1000,
+        );
+
+        $report       = new \Automattic\WooCommerce\Admin\API\Reports\Revenue\Query( $args );
+        $revenue_data = $report->get_data();
+
+        return is_object( $revenue_data ) && ! empty( $revenue_data->totals->total_sales ) ? (float) $revenue_data->totals->total_sales : 0;
+    }
+
+    /**
+     * Get sales for WooCommerce versions older than 2.2.
+     *
+     * @param string $start_date Start date in the WordPress timezone.
+     * @param string $end_date End date in the WordPress timezone.
+     *
+     * @return float Sales total.
+     */
+    private function get_pre_220_total_sales( $start_date, $end_date ) {
+        global $wpdb;
+
+        $allowed_statuses  = array( 'completed', 'processing', 'on-hold', 'refunded', 'cancelled', 'failed', 'pending' );
+        $filtered_statuses = apply_filters( 'woocommerce_reports_order_statuses', array( 'completed', 'processing', 'on-hold' ) );
+        $safe_statuses     = array_intersect( $filtered_statuses, $allowed_statuses );
+
+        if ( empty( $safe_statuses ) ) {
+            $safe_statuses = array( 'completed' );
+        }
+
+        $placeholders = implode( ',', array_fill( 0, count( $safe_statuses ), '%s' ) );
+        $cache_key    = 'wc_sales_' . md5( implode( '_', $safe_statuses ) . '_' . $start_date . '_' . $end_date ); //phpcs:ignore -- NOSONAR -- safe for key.
+        $sales        = wp_cache_get( $cache_key, 'mainwp_woocommerce' );
+
+        if ( false === $sales ) {
+            $sales = $wpdb->get_var( //phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+                $wpdb->prepare(
+                    "SELECT SUM( postmeta.meta_value ) FROM {$wpdb->posts} as posts
+                    LEFT JOIN {$wpdb->term_relationships} AS rel ON posts.ID=rel.object_ID
+                    LEFT JOIN {$wpdb->term_taxonomy} AS tax USING( term_taxonomy_id )
+                    LEFT JOIN {$wpdb->terms} AS term USING( term_id )
+                    LEFT JOIN {$wpdb->postmeta} AS postmeta ON posts.ID = postmeta.post_id
+                    WHERE posts.post_type = 'shop_order'
+                    AND posts.post_status = 'publish'
+                    AND tax.taxonomy = 'shop_order_status'
+                    AND term.slug IN ( {$placeholders} )
+                    AND postmeta.meta_key = '_order_total'
+                    AND posts.post_date >= %s
+                    AND posts.post_date <= %s",
+                    array_merge( $safe_statuses, array( $start_date, $end_date ) )
+                )
+            );
+
+            wp_cache_set( $cache_key, $sales, 'mainwp_woocommerce', HOUR_IN_SECONDS );
+        }
+
+        return (float) $sales;
     }
 
     /**
@@ -523,13 +657,14 @@ class MainWP_Child_WooCommerce_Status {
      *
      * @param string $start_date Start Date.
      * @param string $end_date End Date.
+     * @param bool   $include_report_mode Whether to include the sales report mode.
      *
      * @return array $information Woocommerce data grabed.
      */
-    public function get_woocom_reports( $start_date, $end_date ) {
+    public function get_woocom_reports( $start_date, $end_date, $include_report_mode = false ) {
 
         if ( class_exists( '\Automattic\WooCommerce\Admin\Features\Features' ) && \Automattic\WooCommerce\Admin\Features\Features::is_enabled( 'analytics' ) ) {
-            return $this->get_woocom_analytics( $start_date, $end_date );
+            return $this->get_woocom_analytics( $start_date, $end_date, $include_report_mode );
         }
 
         $on_hold_count = 0;
@@ -550,7 +685,7 @@ class MainWP_Child_WooCommerce_Status {
         $report     = new \Automattic\WooCommerce\Admin\API\Reports\Stock\Stats\Query();
         $stock_data = $report->get_data();
 
-        return array(
+        $data = array(
             'sales'          => $total_sales,
             'formated_sales' => wc_price( $total_sales ),
             'top_seller'     => ! empty( $top_seller ) ? (object) $top_seller : false,
@@ -559,6 +694,12 @@ class MainWP_Child_WooCommerce_Status {
             'lowstock'       => is_array( $stock_data ) && isset( $stock_data['lowstock'] ) ? intval( $stock_data['lowstock'] ) : 0,
             'outstock'       => is_array( $stock_data ) && isset( $stock_data['outofstock'] ) ? intval( $stock_data['outofstock'] ) : 0,
         );
+
+        if ( $include_report_mode ) {
+            $data['sales_report_mode'] = 'legacy';
+        }
+
+        return $data;
     }
 
     /**
@@ -566,15 +707,16 @@ class MainWP_Child_WooCommerce_Status {
      *
      * @param string $start_date Start Date.
      * @param string $end_date End Date.
+     * @param bool   $include_report_mode Whether to include the sales report mode.
      *
      * @return array $information Woocommerce data grabed.
      */
-    public function get_woocom_data( $start_date, $end_date ) {
+    public function get_woocom_data( $start_date, $end_date, $include_report_mode = false ) {
 
         if ( class_exists( '\Automattic\WooCommerce\Admin\API\Reports\Orders\Stats\Query' ) ) {
-            $data = $this->get_woocom_reports( $start_date, $end_date );
+            $data = $this->get_woocom_reports( $start_date, $end_date, $include_report_mode );
         } else {
-            $data = $this->get_woocom_reports_old( $start_date, $end_date );
+            $data = $this->get_woocom_reports_old( $start_date, $end_date, $include_report_mode );
         }
 
         $information['data']           = $data;
@@ -588,10 +730,11 @@ class MainWP_Child_WooCommerce_Status {
      *
      * @param string $start_date Start Date.
      * @param string $end_date End Date.
+     * @param bool   $include_report_mode Whether to include the sales report mode.
      *
      * @return array $information Woocommerce data grabed.
      */
-    public function get_woocom_reports_old( $start_date, $end_date ) {
+    public function get_woocom_reports_old( $start_date, $end_date, $include_report_mode = false ) {
 
         /**
          * Object, providing access to the WordPress database.
@@ -677,6 +820,10 @@ class MainWP_Child_WooCommerce_Status {
             'lowstock'       => $lowinstock_count,
             'outstock'       => $outofstock_count,
         );
+
+        if ( $include_report_mode ) {
+            $data['sales_report_mode'] = 'legacy';
+        }
 
         $data = apply_filters( 'mainwp_child_woocom_get_data', $data );
         return $data;
@@ -785,18 +932,27 @@ class MainWP_Child_WooCommerce_Status {
      *
      * @param string $start_date Start Date.
      * @param string $end_date End Date.
+     * @param bool   $use_wordpress_timezone Whether to format the range in the WordPress timezone.
      *
      * @return int $total_sales Total sales.
+     *
+     * @SuppressWarnings(PHPMD.LongVariable)
+     * @SuppressWarnings(PHPMD.Superglobals)
      */
-    public function get_total_sales( $start_date, $end_date ) {
+    public function get_total_sales( $start_date, $end_date, $use_wordpress_timezone = false ) {
 
         include_once WC()->plugin_path() . '/includes/admin/reports/class-wc-admin-report.php'; // NOSONAR -- WP compatible.
         include_once WC()->plugin_path() . '/includes/admin/reports/class-wc-report-sales-by-date.php'; // NOSONAR -- WP compatible.
 
         $total_sales = 0;
 
-        $_GET['start_date'] = gmdate( 'Y-m-d H:i:s', $start_date );
-        $_GET['end_date']   = gmdate( 'Y-m-d H:i:s', $end_date );
+        if ( $use_wordpress_timezone ) {
+            $_GET['start_date'] = wp_date( 'Y-m-d H:i:s', $start_date );
+            $_GET['end_date']   = wp_date( 'Y-m-d H:i:s', $end_date );
+        } else {
+            $_GET['start_date'] = gmdate( 'Y-m-d H:i:s', $start_date );
+            $_GET['end_date']   = gmdate( 'Y-m-d H:i:s', $end_date );
+        }
 
         $report = new \WC_Report_Sales_By_Date();
         $report->calculate_current_range( 'custom' );
@@ -814,10 +970,11 @@ class MainWP_Child_WooCommerce_Status {
      *
      * @param string $start_date Start Date.
      * @param string $end_date End Date.
+     * @param bool   $include_report_mode Whether to include the sales report mode.
      *
      * @return array $information Woocommerce data grabed.
      */
-    public function get_woocom_analytics( $start_date, $end_date ) {
+    public function get_woocom_analytics( $start_date, $end_date, $include_report_mode = false ) {
         $on_hold_count = 0;
         if ( function_exists( 'wc_orders_count' ) ) {
             $status_counts = array_map( 'wc_orders_count', array( 'on-hold' ) );
@@ -836,7 +993,7 @@ class MainWP_Child_WooCommerce_Status {
         $report     = new \Automattic\WooCommerce\Admin\API\Reports\Stock\Stats\Query();
         $stock_data = $report->get_data();
 
-        return array(
+        $data = array(
             'sales'          => $total_sales,
             'formated_sales' => wc_price( $total_sales ),
             'top_seller'     => ! empty( $top_seller ) ? (object) $top_seller : false,
@@ -845,8 +1002,13 @@ class MainWP_Child_WooCommerce_Status {
             'lowstock'       => is_array( $stock_data ) && isset( $stock_data['lowstock'] ) ? intval( $stock_data['lowstock'] ) : 0,
             'outstock'       => is_array( $stock_data ) && isset( $stock_data['outofstock'] ) ? intval( $stock_data['outofstock'] ) : 0,
         );
-    }
 
+        if ( $include_report_mode ) {
+            $data['sales_report_mode'] = 'analytics';
+        }
+
+        return $data;
+    }
 
     /**
      * Get sales data.

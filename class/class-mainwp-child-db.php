@@ -330,7 +330,7 @@ class MainWP_Child_DB {
      *
      * @return int Number of request IDs removed.
      */
-    private function cleanup_request_ids() {
+    private static function cleanup_request_ids() {
         global $wpdb;
 
         // Security comes first. Do not remove mainwp_child_blocked_request_id_ options.

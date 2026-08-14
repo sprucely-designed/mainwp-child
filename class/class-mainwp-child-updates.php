@@ -1117,6 +1117,10 @@ class MainWP_Child_Updates { //phpcs:ignore -- NOSONAR - multi methods.
             return;
         }
 
+        if ( 'update_plugin' === $premium_action || 'plugin' === $legacy_type ) {
+            MainWP_Child_Updraft_Plus_Backups::register_premium_update_guards();
+        }
+
         // Legacy process compatibility.
         // phpcs:disable WordPress.Security.NonceVerification
         if ( 'detect_plugin' === $premium_action || 'detect_plugin' === $legacy_action ) {

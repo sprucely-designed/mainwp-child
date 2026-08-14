@@ -83,10 +83,26 @@ class MainWP_Child_Updraft_Plus_Backups { //phpcs:ignore -- NOSONAR - multi meth
             add_filter( 'updraftplus_save_last_backup', array( __CLASS__, 'hook_updraft_plus_save_last_backup' ) );
         }
 
-        // Register the Premium package guard as soon as this class file is loaded.
-        add_filter( 'pre_site_transient_update_plugins', array( $this, 'protect_premium_update' ), 99 );
-        add_filter( 'site_transient_update_plugins', array( $this, 'protect_premium_update' ), 99 );
-        add_filter( 'upgrader_pre_download', array( $this, 'protect_premium_package' ), 99, 4 );
+        self::register_premium_update_guards();
+    }
+
+    /**
+     * Register the UpdraftPlus Premium package guards.
+     *
+     * @return void
+     */
+    public static function register_premium_update_guards() {
+        static $registered = false;
+
+        if ( $registered ) {
+            return;
+        }
+
+        add_filter( 'pre_site_transient_update_plugins', array( __CLASS__, 'protect_premium_update' ), 99 );
+        add_filter( 'site_transient_update_plugins', array( __CLASS__, 'protect_premium_update' ), 99 );
+        add_filter( 'upgrader_pre_download', array( __CLASS__, 'protect_premium_package' ), 99, 4 );
+
+        $registered = true;
     }
 
     /**
@@ -1011,7 +1027,7 @@ class MainWP_Child_Updraft_Plus_Backups { //phpcs:ignore -- NOSONAR - multi meth
     }
 
     /**
-     * Authenticate and claim Premium through UpdraftPlus's supported AJAX flow.
+     * Claim and install Premium through UpdraftPlus's supported AJAX flow.
      *
      * @param array $addons_options TeamUpdraft credentials.
      * @param bool  $claim          Whether the purchase needs to be claimed first.
@@ -1019,29 +1035,6 @@ class MainWP_Child_Updraft_Plus_Backups { //phpcs:ignore -- NOSONAR - multi meth
      * @return array|\WP_Error UpdraftPlus response or an error.
      */
     private function claim_and_install_premium_addons( $addons_options, $claim = true ) {  // phpcs:ignore -- NOSONAR - complex.
-        if ( $claim ) {
-            $login_response = $this->request_updraftplus_ajax(
-                array(
-                    'action'   => 'udmupdater_ajax',
-                    'slug'     => 'updraftplus',
-                    'nonce'    => $this->create_updraftplus_nonce( 'udmupdater-ajax-nonce' ),
-                    'email'    => $addons_options['email'],
-                    'password' => $addons_options['password'],
-                )
-            );
-
-            if ( is_wp_error( $login_response ) ) {
-                return $login_response;
-            }
-
-            if ( empty( $login_response['code'] ) || 'OK' !== $login_response['code'] ) {
-                return new \WP_Error(
-                    'premium_claim_failed',
-                    esc_html__( 'UpdraftPlus could not claim the Premium purchase for this site.', 'mainwp-child' )
-                );
-            }
-        }
-
         $install_response = $this->request_updraftplus_ajax(
             array(
                 'action' => 'udaddons_claimaddon',
@@ -1056,8 +1049,10 @@ class MainWP_Child_Updraft_Plus_Backups { //phpcs:ignore -- NOSONAR - multi meth
 
         if ( empty( $install_response['code'] ) || 'OK' !== $install_response['code'] ) {
             return new \WP_Error(
-                'premium_install_failed',
-                esc_html__( 'UpdraftPlus claimed the Premium purchase, but could not install or activate the Premium files.', 'mainwp-child' )
+                $claim ? 'premium_claim_failed' : 'premium_install_failed',
+                $claim
+                    ? esc_html__( 'UpdraftPlus could not claim and install the Premium purchase for this site.', 'mainwp-child' )
+                    : esc_html__( 'UpdraftPlus could not install or activate the assigned Premium files.', 'mainwp-child' )
             );
         }
 
@@ -1176,6 +1171,17 @@ class MainWP_Child_Updraft_Plus_Backups { //phpcs:ignore -- NOSONAR - multi meth
         }
 
         delete_site_transient( 'udaddons_connect_' . substr( md5( $email ), 0, 23 ) );
+        delete_site_transient( 'upaddons_remote' );
+
+        global $updraftplus_addons2;
+
+        if ( is_object( $updraftplus_addons2 ) ) {
+            foreach ( array( 'user_addons', 'available_addons', 'remote_addons' ) as $property ) {
+                if ( property_exists( $updraftplus_addons2, $property ) ) {
+                    $updraftplus_addons2->$property = null;
+                }
+            }
+        }
     }
 
     /**
@@ -4881,3 +4887,5 @@ ENDHERE;
         }
     }
 }
+
+MainWP_Child_Updraft_Plus_Backups::register_premium_update_guards();

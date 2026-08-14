@@ -155,7 +155,23 @@ class MainWP_Child_Updraft_Plus_Backups { //phpcs:ignore -- NOSONAR - multi meth
      * @return bool
      */
     private static function has_premium_addons() {
-        return defined( 'UPDRAFTPLUS_DIR' ) && is_dir( UPDRAFTPLUS_DIR . '/udaddons' );
+        $updraftplus_dirs = array();
+
+        if ( defined( 'UPDRAFTPLUS_DIR' ) ) {
+            $updraftplus_dirs[] = UPDRAFTPLUS_DIR;
+        }
+
+        if ( defined( 'WP_PLUGIN_DIR' ) ) {
+            $updraftplus_dirs[] = WP_PLUGIN_DIR . '/' . dirname( self::PLUGIN_UPDRAFTPLUS_SLUG );
+        }
+
+        foreach ( array_unique( $updraftplus_dirs ) as $updraftplus_dir ) {
+            if ( is_dir( trailingslashit( $updraftplus_dir ) . 'udaddons' ) ) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /**

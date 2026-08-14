@@ -582,7 +582,7 @@ class MainWP_Connect { //phpcs:ignore -- NOSONAR - multi methods.
                 if ( $this->is_advanced_signature( $decode_connect_sign ) ) {
                     $valid_code = $this->verify_advanced_authed_request( $decode_connect_sign, $func );
                     if ( true === $valid_code && isset( $_REQUEST['mainwpsignature'] ) ) {
-                        $request_id = rawurldecode( isset( $_REQUEST['mainwpsignature'] ) ); // phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized
+                        $request_id = rawurldecode( $_REQUEST['mainwpsignature'] ); // phpcs:ignore --NOSONAR - WordPress.Security.ValidatedSanitizedInput.InputNotSanitized
                         if ( strlen( $request_id ) > 50 ) { // base64 encoded string - Looks like a valid base signature was sent as well, so block it to prevent potential misuse.
                             add_option( 'mainwp_child_blocked_request_id_' . hash( 'sha256', $request_id ), time(), '', false );
                         }

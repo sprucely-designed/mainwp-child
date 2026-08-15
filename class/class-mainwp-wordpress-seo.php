@@ -85,16 +85,340 @@ class MainWP_WordPress_SEO {
      * @uses MainWP_WordPress_SEO::import_settings() Import the Yoast SEO plugin settings.
      */
     public function action() {
+        $mwp_action = MainWP_System::instance()->validate_params( 'action' );
+        if ( in_array( $mwp_action, array( 'describe_v2', 'read_safe_v1' ), true ) ) {
+            MainWP_Helper::write( $this->abilities_v2( $mwp_action, $this->abilities_v2_request() ) );
+            return;
+        }
+
         if ( ! class_exists( '\WPSEO_Admin' ) ) {
             $information['error'] = 'NO_WPSEO';
             MainWP_Helper::write( $information );
         }
         $information = array();
-        $mwp_action  = MainWP_System::instance()->validate_params( 'action' );
         if ( 'import_settings' === $mwp_action ) {
             $this->import_settings();
         }
         MainWP_Helper::write( $information );
+    }
+
+    /**
+     * Execute the closed read-only WordPress SEO protocol.
+     *
+     * @param string $operation Protocol operation.
+     * @param mixed  $request   Request payload.
+     * @return array
+     */
+    public function abilities_v2( $operation, $request ) {
+        if ( 'describe_v2' === $operation ) {
+            if ( ! is_array( $request ) || ! $this->abilities_v2_exact_keys( $request, array( 'contract_version' ) ) || '2' !== $request['contract_version'] ) {
+                return $this->abilities_v2_error( $operation, 'invalid_request' );
+            }
+            return $this->abilities_v2_describe();
+        }
+
+        if ( 'read_safe_v1' !== $operation || ! $this->abilities_v2_valid_read_request( $request ) ) {
+            return $this->abilities_v2_error( $operation, 'invalid_request' );
+        }
+
+        $runtime = $this->abilities_v2_runtime();
+        if ( ! $this->abilities_v2_valid_runtime( $runtime ) ) {
+            return $this->abilities_v2_error( $operation, 'provider_schema_invalid' );
+        }
+        if ( 'active' !== $runtime['plugin_state'] ) {
+            return $this->abilities_v2_error( $operation, 'provider_unavailable' );
+        }
+        if ( ! $this->abilities_v2_supported_version( $runtime['version'] ) ) {
+            return $this->abilities_v2_error( $operation, 'unsupported_version' );
+        }
+
+        $settings = $this->abilities_v2_normalize_settings( $runtime['options'] );
+        if ( ! is_array( $settings ) ) {
+            return $this->abilities_v2_error( $operation, 'unsafe_configuration' );
+        }
+
+        return array(
+            'contract_version'  => '2',
+            'operation'         => 'read_safe_v1',
+            'ok'                => true,
+            'request_ref'       => $request['request_ref'],
+            'site_generation'   => $request['site_generation'],
+            'version'           => $runtime['version'],
+            'schema'            => 'yoast-safe-v1',
+            'settings'          => $settings,
+            'config_generation' => hash( 'sha256', wp_json_encode( $settings ) ),
+        );
+    }
+
+    /**
+     * Get the local Yoast runtime without invoking provider or mutation code.
+     *
+     * @return array
+     */
+    protected function abilities_v2_runtime() {
+        if ( ! defined( 'WPSEO_VERSION' ) || ! class_exists( '\WPSEO_Admin' ) ) {
+            return array(
+                'plugin_state' => 'missing',
+                'version'      => null,
+                'options'      => null,
+            );
+        }
+
+        return array(
+            'plugin_state' => 'active',
+            'version'      => (string) WPSEO_VERSION,
+            'options'      => array(
+                'wpseo_titles' => get_option( 'wpseo_titles', null ),
+                'wpseo'        => get_option( 'wpseo', null ),
+            ),
+        );
+    }
+
+    /**
+     * Build the protocol capability description.
+     *
+     * @return array
+     */
+    private function abilities_v2_describe() {
+        $runtime       = $this->abilities_v2_runtime();
+        $valid_runtime = $this->abilities_v2_valid_runtime( $runtime );
+        $active        = $valid_runtime && 'active' === $runtime['plugin_state'];
+        $supported     = $active && $this->abilities_v2_supported_version( $runtime['version'] );
+
+        return array(
+            'contract_version'   => '2',
+            'operation'          => 'describe_v2',
+            'ok'                 => $valid_runtime,
+            'plugin_state'       => $valid_runtime ? $runtime['plugin_state'] : 'unknown',
+            'version'            => $active ? $runtime['version'] : null,
+            'compatibility'      => $supported ? 'supported' : ( $active ? 'unsupported' : 'unavailable' ),
+            'schema'             => $supported ? 'yoast-safe-v1' : null,
+            'operations'         => $supported ? array( 'read_safe_v1' ) : array(),
+            'mutation_supported' => false,
+        );
+    }
+
+    /**
+     * Normalize the exact site-neutral subset.
+     *
+     * @param mixed $options Yoast options.
+     * @return array|null
+     */
+    private function abilities_v2_normalize_settings( $options ) { // phpcs:ignore -- NOSONAR - explicit closed adapter.
+        if ( ! is_array( $options ) || ! $this->abilities_v2_exact_keys( $options, array( 'wpseo_titles', 'wpseo' ) ) || ! is_array( $options['wpseo_titles'] ) || ! is_array( $options['wpseo'] ) ) {
+            return null;
+        }
+
+        $titles     = $options['wpseo_titles'];
+        $general    = $options['wpseo'];
+        $post_types = array();
+        foreach ( array( 'post', 'page' ) as $slug ) {
+            $record = $this->abilities_v2_search_record( $titles, $slug, 'post_type' );
+            if ( ! is_array( $record ) ) {
+                return null;
+            }
+            $post_types[] = $record;
+        }
+
+        $taxonomies = array();
+        foreach ( array( 'category', 'post_tag' ) as $slug ) {
+            $record = $this->abilities_v2_search_record( $titles, $slug, 'taxonomy' );
+            if ( ! is_array( $record ) ) {
+                return null;
+            }
+            $taxonomies[] = $record;
+        }
+
+        $author_noindex = $this->abilities_v2_boolean( $titles, 'noindex-author-wpseo' );
+        $date_noindex   = $this->abilities_v2_boolean( $titles, 'noindex-archive-wpseo' );
+        $sitemaps       = $this->abilities_v2_boolean( $general, 'enable_xml_sitemap' );
+        if ( null === $author_noindex || null === $date_noindex || null === $sitemaps ) {
+            return null;
+        }
+
+        return array(
+            'post_types' => $post_types,
+            'taxonomies' => $taxonomies,
+            'archives'   => array(
+                'author_index' => ! $author_noindex,
+                'date_index'   => ! $date_noindex,
+            ),
+            'sitemaps'   => array(
+                'enabled' => $sitemaps,
+            ),
+        );
+    }
+
+    /**
+     * Normalize one post-type or taxonomy record.
+     *
+     * @param array  $titles Option array.
+     * @param string $slug   Record slug.
+     * @param string $kind   Record kind.
+     * @return array|null
+     */
+    private function abilities_v2_search_record( $titles, $slug, $kind ) {
+        $prefix      = 'taxonomy' === $kind ? 'tax-' : '';
+        $noindex_key = 'noindex-' . $prefix . $slug;
+        $title_key   = 'title-' . $prefix . $slug;
+        $desc_key    = 'metadesc-' . $prefix . $slug;
+        $noindex     = $this->abilities_v2_boolean( $titles, $noindex_key );
+        if ( null === $noindex || ! array_key_exists( $title_key, $titles ) || ! array_key_exists( $desc_key, $titles ) ) {
+            return null;
+        }
+
+        $title = $this->abilities_v2_template( $titles[ $title_key ], 200 );
+        $desc  = $this->abilities_v2_template( $titles[ $desc_key ], 500 );
+        if ( false === $title || false === $desc ) {
+            return null;
+        }
+
+        return array(
+            'slug'                 => $slug,
+            'index'                => ! $noindex,
+            'title_template'       => $title,
+            'description_template' => $desc,
+        );
+    }
+
+    /**
+     * Validate and normalize a safe template string.
+     *
+     * @param mixed $value  Value.
+     * @param int   $length Maximum length.
+     * @return string|null|false
+     */
+    private function abilities_v2_template( $value, $length ) {
+        if ( null === $value || '' === $value ) {
+            return null;
+        }
+        if ( ! is_string( $value ) || $length < strlen( $value ) || wp_check_invalid_utf8( $value, true ) !== $value || 1 === preg_match( '/[\x00-\x1F\x7F]/', $value ) || 1 === preg_match( '#https?://#i', $value ) ) {
+            return false;
+        }
+        if ( preg_match_all( '/%%([a-z_]+)%%/', $value, $matches ) ) {
+            foreach ( $matches[1] as $placeholder ) {
+                if ( ! in_array( $placeholder, array( 'title', 'sitename', 'sep', 'excerpt', 'category', 'tag' ), true ) ) {
+                    return false;
+                }
+            }
+        }
+        $without_placeholders = preg_replace( '/%%[a-z_]+%%/', '', $value );
+        return false !== $without_placeholders && false === strpos( $without_placeholders, '%%' ) ? $value : false;
+    }
+
+    /**
+     * Read a strict stored boolean.
+     *
+     * @param array  $options Options.
+     * @param string $key     Key.
+     * @return bool|null
+     */
+    private function abilities_v2_boolean( $options, $key ) {
+        if ( ! array_key_exists( $key, $options ) ) {
+            return null;
+        }
+        if ( true === $options[ $key ] || 1 === $options[ $key ] || '1' === $options[ $key ] ) {
+            return true;
+        }
+        if ( false === $options[ $key ] || 0 === $options[ $key ] || '0' === $options[ $key ] ) {
+            return false;
+        }
+        return null;
+    }
+
+    /**
+     * Validate the read request.
+     *
+     * @param mixed $request Request.
+     * @return bool
+     */
+    private function abilities_v2_valid_read_request( $request ) {
+        return is_array( $request )
+            && $this->abilities_v2_exact_keys( $request, array( 'contract_version', 'request_ref', 'site_generation' ) )
+            && '2' === $request['contract_version']
+            && is_string( $request['request_ref'] )
+            && 1 === preg_match( '/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/D', $request['request_ref'] )
+            && is_string( $request['site_generation'] )
+            && 1 === preg_match( '/^[a-f0-9]{64}$/D', $request['site_generation'] );
+    }
+
+    /**
+     * Validate runtime data.
+     *
+     * @param mixed $runtime Runtime.
+     * @return bool
+     */
+    private function abilities_v2_valid_runtime( $runtime ) {
+        return is_array( $runtime )
+            && $this->abilities_v2_exact_keys( $runtime, array( 'plugin_state', 'version', 'options' ) )
+            && in_array( $runtime['plugin_state'], array( 'active', 'missing' ), true )
+            && ( ( 'active' === $runtime['plugin_state'] && is_string( $runtime['version'] ) && is_array( $runtime['options'] ) )
+                || ( 'missing' === $runtime['plugin_state'] && null === $runtime['version'] && null === $runtime['options'] ) );
+    }
+
+    /**
+     * Check the explicitly tested Yoast major-version range.
+     *
+     * @param mixed $version Version.
+     * @return bool
+     */
+    private function abilities_v2_supported_version( $version ) {
+        return is_string( $version )
+            && 1 === preg_match( '/^25\.5(?:\.[0-9]+)?$/D', $version );
+    }
+
+    /**
+     * Read a bounded JSON request from the authenticated callable.
+     *
+     * @return array|null
+     */
+    private function abilities_v2_request() {
+        // phpcs:disable WordPress.Security.NonceVerification -- MainWP signature authentication occurs before callable dispatch.
+        if ( ! isset( $_POST['request'] ) || ! is_string( $_POST['request'] ) ) {
+            return null;
+        }
+        $raw = wp_unslash( $_POST['request'] ); // phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized -- Strict JSON schema validation follows.
+        // phpcs:enable WordPress.Security.NonceVerification
+        if ( 262144 < strlen( $raw ) ) {
+            return null;
+        }
+        $request = json_decode( $raw, true );
+        return is_array( $request ) ? $request : null;
+    }
+
+    /**
+     * Build a stable redacted protocol error.
+     *
+     * @param string $operation Operation.
+     * @param string $code      Error code.
+     * @return array
+     */
+    private function abilities_v2_error( $operation, $code ) {
+        return array(
+            'contract_version' => '2',
+            'operation'        => is_string( $operation ) && 64 >= strlen( $operation ) ? $operation : 'unknown',
+            'ok'               => false,
+            'code'             => $code,
+        );
+    }
+
+    /**
+     * Validate an exact key set without requiring object order.
+     *
+     * @param mixed $value Value.
+     * @param array $keys  Keys.
+     * @return bool
+     */
+    private function abilities_v2_exact_keys( $value, $keys ) {
+        if ( ! is_array( $value ) || count( $value ) !== count( $keys ) ) {
+            return false;
+        }
+        foreach ( $keys as $key ) {
+            if ( ! array_key_exists( $key, $value ) ) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /**

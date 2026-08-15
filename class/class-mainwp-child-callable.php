@@ -53,6 +53,9 @@ class MainWP_Child_Callable { //phpcs:ignore -- NOSONAR - multi methods.
         'securityUnFix'            => 'do_security_un_fix',
         'post_action'              => 'post_action',
         'get_all_posts'            => 'get_all_posts',
+        'get_all_posts_v2'         => 'get_all_posts_v2',
+        'post_dripper_capabilities_v2' => 'post_dripper_capabilities_v2',
+        'post_plus_capabilities_v2' => 'post_plus_capabilities_v2',
         'comment_action'           => 'comment_action',
         'comment_bulk_action'      => 'comment_bulk_action',
         'get_all_comments'         => 'get_all_comments',
@@ -61,6 +64,8 @@ class MainWP_Child_Callable { //phpcs:ignore -- NOSONAR - multi methods.
         'get_all_plugins'          => 'get_all_plugins',
         'plugin_action'            => 'plugin_action',
         'get_all_pages'            => 'get_all_pages',
+        'termageddon_page_v2_get'  => 'termageddon_page_v2_get',
+        'termageddon_page_v2_delete' => 'termageddon_page_v2_delete',
         'get_all_users'            => 'get_all_users',
         'user_action'              => 'user_action',
         'search_users'             => 'search_users',
@@ -68,6 +73,10 @@ class MainWP_Child_Callable { //phpcs:ignore -- NOSONAR - multi methods.
         'branding_child_plugin'    => 'branding_child_plugin',
         'code_snippet'             => 'code_snippet',
         'uploader_action'          => 'uploader_action',
+        'early_access_release_v2'  => 'early_access_release_v2',
+        'favorites_package_state_v2' => 'favorites_package_state_v2',
+        'favorites_install_verified_v2' => 'favorites_install_verified_v2',
+        'virusdie_sync_install_v1' => 'virusdie_sync_install_v1',
         'wordpress_seo'            => 'wordpress_seo',
         'client_report'            => 'client_report',
         'createBackupPoll'         => 'backup_poll',
@@ -406,6 +415,60 @@ class MainWP_Child_Callable { //phpcs:ignore -- NOSONAR - multi methods.
     }
 
     /**
+     * Fire the typed paginated post extraction callable.
+     */
+    public function get_all_posts_v2() {
+        // phpcs:ignore WordPress.Security.NonceVerification.Missing -- Authenticated MainWP callable.
+        if ( ! isset( $_POST['request'] ) || ! is_string( $_POST['request'] ) ) {
+            MainWP_Helper::write( MainWP_Child_Posts::get_instance()->get_all_posts_v2( null ) );
+        }
+
+        // phpcs:ignore WordPress.Security.NonceVerification.Missing,WordPress.Security.ValidatedSanitizedInput.InputNotSanitized -- Closed JSON is validated by the handler.
+        $raw = wp_unslash( $_POST['request'] );
+        if ( '' === $raw || 65536 < strlen( $raw ) ) {
+            MainWP_Helper::write( MainWP_Child_Posts::get_instance()->get_all_posts_v2( null ) );
+        }
+
+        MainWP_Helper::write( MainWP_Child_Posts::get_instance()->get_all_posts_v2( json_decode( $raw, true ) ) );
+    }
+
+    /**
+     * Fire the Post Dripper capability negotiation callable.
+     */
+    public function post_dripper_capabilities_v2() {
+        // phpcs:ignore WordPress.Security.NonceVerification.Missing -- Authenticated MainWP callable.
+        if ( ! isset( $_POST['request'] ) || ! is_string( $_POST['request'] ) ) {
+            MainWP_Helper::write( MainWP_Child_Posts::get_instance()->post_dripper_capabilities_v2( null ) );
+        }
+
+        // phpcs:ignore WordPress.Security.NonceVerification.Missing,WordPress.Security.ValidatedSanitizedInput.InputNotSanitized -- Closed JSON is validated by the handler.
+        $raw = wp_unslash( $_POST['request'] );
+        if ( '' === $raw || 4096 < strlen( $raw ) ) {
+            MainWP_Helper::write( MainWP_Child_Posts::get_instance()->post_dripper_capabilities_v2( null ) );
+        }
+
+        MainWP_Helper::write( MainWP_Child_Posts::get_instance()->post_dripper_capabilities_v2( json_decode( $raw, true ) ) );
+    }
+
+    /**
+     * Fire the Post Plus capability negotiation callable.
+     */
+    public function post_plus_capabilities_v2() {
+        // phpcs:ignore WordPress.Security.NonceVerification.Missing -- Authenticated MainWP callable.
+        if ( ! isset( $_POST['request'] ) || ! is_string( $_POST['request'] ) ) {
+            MainWP_Helper::write( MainWP_Child_Posts::get_instance()->post_plus_capabilities_v2( null ) );
+        }
+
+        // phpcs:ignore WordPress.Security.NonceVerification.Missing,WordPress.Security.ValidatedSanitizedInput.InputNotSanitized -- Closed JSON is validated by the handler.
+        $raw = wp_unslash( $_POST['request'] );
+        if ( '' === $raw || 4096 < strlen( $raw ) ) {
+            MainWP_Helper::write( MainWP_Child_Posts::get_instance()->post_plus_capabilities_v2( null ) );
+        }
+
+        MainWP_Helper::write( MainWP_Child_Posts::get_instance()->post_plus_capabilities_v2( json_decode( $raw, true ) ) );
+    }
+
+    /**
      * Method get_all_pages()
      *
      * Fire off the get_all_pages() function.
@@ -414,6 +477,20 @@ class MainWP_Child_Callable { //phpcs:ignore -- NOSONAR - multi methods.
      */
     public function get_all_pages() {
         MainWP_Child_Posts::get_instance()->get_all_pages();
+    }
+
+    /**
+     * Read one exact marker-bound Termageddon page.
+     */
+    public function termageddon_page_v2_get() {
+        ( new MainWP_Child_Termageddon() )->handle_get();
+    }
+
+    /**
+     * Delete one exact marker-bound Termageddon page.
+     */
+    public function termageddon_page_v2_delete() {
+        ( new MainWP_Child_Termageddon() )->handle_delete();
     }
 
     /**
@@ -778,6 +855,36 @@ class MainWP_Child_Callable { //phpcs:ignore -- NOSONAR - multi methods.
      */
     public function uploader_action() {
         MainWP_Child_Misc::get_instance()->uploader_action();
+    }
+
+    /**
+     * Negotiate the narrow Early Access release protocol.
+     */
+    public function early_access_release_v2() {
+        ( new MainWP_Child_Early_Access_Release() )->action();
+    }
+
+    /**
+     * Read one exact favorite package state.
+     */
+    public function favorites_package_state_v2() {
+        ( new MainWP_Child_Favorites() )->handle_package_state();
+    }
+
+    /**
+     * Negotiate the verified favorite installer protocol.
+     */
+    public function favorites_install_verified_v2() {
+        ( new MainWP_Child_Favorites() )->handle_install();
+    }
+
+    /**
+     * Dispatch the narrow Virusdie signed-installer protocol.
+     *
+     * @return void
+     */
+    public function virusdie_sync_install_v1() {
+        MainWP_Child_Misc::get_instance()->virusdie_sync_install_v1();
     }
 
     /**

@@ -190,6 +190,9 @@ class MainWP_Child_Timecapsule { //phpcs:ignore -- NOSONAR - multi methods.
                 case 'set_showhide':
                     $information = $this->set_showhide();
                     break;
+                case 'abilities_v2':
+                    $information = $this->abilities_v2_action();
+                    break;
                 case 'get_root_files':
                     $this->get_root_files();
                     break;
@@ -315,6 +318,222 @@ class MainWP_Child_Timecapsule { //phpcs:ignore -- NOSONAR - multi methods.
             }
         }
         MainWP_Helper::write( $information );
+    }
+
+    /**
+     * Decode one additive Time Capsule abilities-v2 request.
+     *
+     * @return array Closed protocol response.
+     */
+    private function abilities_v2_action() {
+        // phpcs:ignore WordPress.Security.NonceVerification.Missing -- Authenticated MainWP Child callable.
+        if ( ! isset( $_POST['request'] ) || ! is_string( $_POST['request'] ) ) {
+            return $this->abilities_v2_error( 'unknown' );
+        }
+
+        // phpcs:ignore WordPress.Security.NonceVerification.Missing,WordPress.Security.ValidatedSanitizedInput.InputNotSanitized -- Closed JSON is validated below.
+        $raw = wp_unslash( $_POST['request'] );
+        if ( '' === $raw || 65536 < strlen( $raw ) ) {
+            return $this->abilities_v2_error( 'unknown' );
+        }
+
+        return $this->abilities_v2( json_decode( $raw, true ) );
+    }
+
+    /**
+     * Process one side-effect-free Time Capsule abilities-v2 read.
+     *
+     * The legacy progress method can spawn cron and clear provider flags, so
+     * it is intentionally not reused by this read boundary.
+     *
+     * @param mixed $request Decoded request.
+     * @return array Closed protocol response.
+     */
+    public function abilities_v2( $request ) {
+        $operation = is_array( $request ) && isset( $request['operation'] ) && is_string( $request['operation'] ) ? $request['operation'] : 'unknown';
+        if ( ! is_array( $request ) || ! $this->abilities_v2_exact_keys( $request, array( 'protocol', 'operation', 'payload' ) ) || '2' !== $request['protocol'] || ! is_array( $request['payload'] ) || array() !== $request['payload'] ) {
+            return $this->abilities_v2_error( $operation );
+        }
+
+        if ( 'capabilities' === $operation ) {
+            return array(
+                'protocol'           => '2',
+                'operation'          => 'capabilities',
+                'ok'                 => true,
+                'operations'         => array( 'site', 'policy' ),
+                'mutation_supported' => false,
+            );
+        }
+
+        $config = $this->abilities_v2_config();
+        if ( ! is_object( $config ) || ! method_exists( $config, 'get_option' ) ) {
+            return $this->abilities_v2_error( $operation, 'provider_unavailable' );
+        }
+
+        if ( 'site' === $operation ) {
+            return $this->abilities_v2_site( $config );
+        }
+        if ( 'policy' === $operation ) {
+            return $this->abilities_v2_policy( $config );
+        }
+
+        return $this->abilities_v2_error( $operation, 'unsupported_operation' );
+    }
+
+    /**
+     * Return the current provider configuration reader.
+     *
+     * @return object|null Provider configuration.
+     */
+    protected function abilities_v2_config() {
+        return class_exists( '\\WPTC_Factory' ) ? \WPTC_Factory::get( 'config' ) : null;
+    }
+
+    /**
+     * Project one redacted site observation.
+     *
+     * @param object $config Provider configuration.
+     * @return array Closed protocol response.
+     */
+    private function abilities_v2_site( $config ) {
+        $connected   = $this->abilities_v2_boolean( $config->get_option( 'is_user_logged_in' ) );
+        $in_progress = $this->abilities_v2_boolean( $config->get_option( 'in_progress' ) );
+        $last_time   = $config->get_option( 'last_backup_time' );
+        if ( null === $connected || null === $in_progress || ( false !== $last_time && null !== $last_time && ! $this->abilities_v2_timestamp( $last_time ) ) ) {
+            return $this->abilities_v2_error( 'site', 'provider_schema_invalid' );
+        }
+
+        $last_attempt = false === $last_time || null === $last_time ? null : gmdate( 'Y-m-d\TH:i:s\Z', (int) $last_time );
+        $observed_at  = time();
+        $binding      = array(
+            'plugin_state'          => $this->is_plugin_installed ? 'ready' : 'missing',
+            'account_state'         => $connected ? 'connected' : 'disconnected',
+            'last_attempt_at'       => $last_attempt,
+            'last_verified_at'      => null,
+            'active_operation_count' => $in_progress ? 1 : 0,
+            'observed_at'           => gmdate( 'Y-m-d\TH:i:s\Z', $observed_at ),
+        );
+
+        return array_merge(
+            array(
+                'protocol'  => '2',
+                'operation' => 'site',
+                'ok'        => true,
+                'complete'  => true,
+            ),
+            $binding,
+            array( 'generation' => hash( 'sha256', wp_json_encode( $binding ) ) )
+        );
+    }
+
+    /**
+     * Project one bounded non-secret policy.
+     *
+     * @param object $config Provider configuration.
+     * @return array Closed protocol response.
+     */
+    private function abilities_v2_policy( $config ) {
+        $schedule  = $config->get_option( 'schedule_time_str' );
+        $retention = $config->get_option( 'revision_limit' );
+        $before    = $config->get_option( 'backup_before_update_setting' );
+        if ( ! is_string( $schedule ) || 1 !== preg_match( '/^(1[0-2]|[1-9]):00 [ap]m$/D', $schedule ) || ! $this->abilities_v2_integer( $retention, 3, 365 ) || ! in_array( $before, array( 'always', 'everytime', true, false ), true ) ) {
+            return $this->abilities_v2_error( 'policy', 'provider_schema_invalid' );
+        }
+
+        $policy = array(
+            'schedule_time'       => $schedule,
+            'retention_days'      => (int) $retention,
+            'backup_before_update' => 'always' === $before || true === $before,
+        );
+
+        return array_merge(
+            array(
+                'protocol'  => '2',
+                'operation' => 'policy',
+                'ok'        => true,
+                'complete'  => true,
+            ),
+            $policy,
+            array( 'policy_generation' => hash( 'sha256', wp_json_encode( $policy ) ) )
+        );
+    }
+
+    /**
+     * Normalize a provider boolean without accepting arbitrary truthy values.
+     *
+     * @param mixed $value Provider value.
+     * @return bool|null Normalized value or null when malformed.
+     */
+    private function abilities_v2_boolean( $value ) {
+        if ( true === $value || 1 === $value || '1' === $value ) {
+            return true;
+        }
+        if ( false === $value || 0 === $value || '0' === $value || null === $value || '' === $value ) {
+            return false;
+        }
+        return null;
+    }
+
+    /**
+     * Validate one bounded provider integer.
+     *
+     * @param mixed $value Provider value.
+     * @param int   $minimum Minimum value.
+     * @param int   $maximum Maximum value.
+     * @return bool Whether the value is valid.
+     */
+    private function abilities_v2_integer( $value, $minimum, $maximum ) {
+        if ( is_string( $value ) && 1 === preg_match( '/^[1-9][0-9]*$/D', $value ) ) {
+            $integer = (int) $value;
+            if ( (string) $integer !== $value ) {
+                return false;
+            }
+            $value = $integer;
+        }
+        return is_int( $value ) && $minimum <= $value && $maximum >= $value;
+    }
+
+    /**
+     * Validate a provider timestamp.
+     *
+     * @param mixed $value Provider value.
+     * @return bool Whether the timestamp is usable.
+     */
+    private function abilities_v2_timestamp( $value ) {
+        return $this->abilities_v2_integer( $value, 1, PHP_INT_MAX );
+    }
+
+    /**
+     * Compare an exact object key set.
+     *
+     * @param mixed $value Value to inspect.
+     * @param array $keys Expected keys.
+     * @return bool Whether the keys match exactly.
+     */
+    private function abilities_v2_exact_keys( $value, $keys ) {
+        if ( ! is_array( $value ) ) {
+            return false;
+        }
+        $actual = array_keys( $value );
+        sort( $actual );
+        sort( $keys );
+        return $actual === $keys;
+    }
+
+    /**
+     * Return a stable non-reflective protocol error.
+     *
+     * @param string $operation Requested operation.
+     * @param string $code Stable error code.
+     * @return array Closed protocol response.
+     */
+    private function abilities_v2_error( $operation, $code = 'invalid_request' ) {
+        return array(
+            'protocol'  => '2',
+            'operation' => is_string( $operation ) && 1 === preg_match( '/^[a-z_]{1,32}$/D', $operation ) ? $operation : 'unknown',
+            'ok'        => false,
+            'code'      => $code,
+        );
     }
 
     /**

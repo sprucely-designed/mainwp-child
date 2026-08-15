@@ -275,6 +275,348 @@ class MainWP_Child_Posts { //phpcs:ignore -- NOSONAR - multi methods.
     }
 
     /**
+     * Return one typed, bounded and cursor-bound post metadata page.
+     *
+     * @param mixed $request Decoded protocol request.
+     * @return array Closed protocol response.
+     */
+    public function get_all_posts_v2( $request ) {
+        $query = $this->normalize_posts_v2_request( $request );
+        if ( false === $query ) {
+            return $this->posts_v2_error( 'invalid_request' );
+        }
+
+        $generation = hash( 'sha256', wp_json_encode( array_diff_key( $query, array( 'cursor' => true, 'offset' => true ) ) ) );
+        $offset     = 0;
+        if ( null !== $query['cursor'] ) {
+            $offset = $this->posts_v2_cursor_offset( $query['cursor'], $generation );
+            if ( false === $offset ) {
+                return $this->posts_v2_error( 'invalid_cursor' );
+            }
+        }
+
+        $arguments = array(
+            'post_type'           => $query['post_types'],
+            'post_status'         => $query['statuses'],
+            'posts_per_page'      => $query['page_size'] + 1,
+            'offset'              => $offset,
+            'orderby'             => 'ID',
+            'order'               => 'ASC',
+            'ignore_sticky_posts' => true,
+            'no_found_rows'       => true,
+        );
+        if ( null !== $query['keyword'] ) {
+            $arguments['s'] = $query['keyword'];
+        }
+        if ( null !== $query['post_id'] ) {
+            $arguments['post__in'] = array( $query['post_id'] );
+        }
+        if ( null !== $query['author_id'] ) {
+            $arguments['author'] = $query['author_id'];
+        }
+        if ( null !== $query['date_from'] || null !== $query['date_to'] ) {
+            $date = array(
+                'inclusive' => true,
+                'column'    => 'post_date_gmt',
+            );
+            if ( null !== $query['date_from'] ) {
+                $date['after'] = $query['date_from'] . ' 00:00:00';
+            }
+            if ( null !== $query['date_to'] ) {
+                $date['before'] = $query['date_to'] . ' 23:59:59';
+            }
+            $arguments['date_query'] = array( $date );
+        }
+
+        $posts = get_posts( $arguments );
+        if ( ! is_array( $posts ) ) {
+            return $this->posts_v2_error( 'query_failed' );
+        }
+        $complete = count( $posts ) <= $query['page_size'];
+        if ( ! $complete ) {
+            array_pop( $posts );
+        }
+
+        $records = array();
+        foreach ( $posts as $post ) {
+            $record = $this->posts_v2_record( $post );
+            if ( false === $record ) {
+                return $this->posts_v2_error( 'record_invalid' );
+            }
+            $records[] = $record;
+        }
+
+        $next_offset = $offset + count( $records );
+        return array(
+            'protocol'         => '2',
+            'operation'        => 'get_all_posts_v2',
+            'ok'               => true,
+            'complete'         => $complete,
+            'records'          => $records,
+            'next_cursor'      => $complete ? null : $this->posts_v2_cursor( $next_offset, $generation ),
+            'query_generation' => $generation,
+        );
+    }
+
+    /**
+     * Negotiate the Post Dripper Child protocol.
+     *
+     * Publishing and receipt status remain unavailable until their durable
+     * idempotency contract is implemented.
+     *
+     * @param mixed $request Decoded protocol request.
+     * @return array Closed protocol response.
+     */
+    public function post_dripper_capabilities_v2( $request ) {
+        if ( ! is_array( $request ) || ! $this->posts_v2_exact_keys( $request, array( 'protocol', 'operation', 'payload' ) ) || '2' !== $request['protocol'] || ! is_string( $request['operation'] ) || ! is_array( $request['payload'] ) ) {
+            return $this->post_dripper_v2_error( 'unknown', 'invalid_request' );
+        }
+
+        $operation = $request['operation'];
+        if ( 'capabilities' === $operation && array() === $request['payload'] ) {
+            return array(
+                'protocol'           => '2',
+                'operation'          => 'capabilities',
+                'ok'                 => true,
+                'operations'         => array(),
+                'mutation_supported' => false,
+            );
+        }
+
+        return $this->post_dripper_v2_error( $operation, 'unsupported_operation' );
+    }
+
+    /**
+     * Negotiate the Post Plus Child protocol.
+     *
+     * Post creation and receipt status remain unavailable until their durable
+     * idempotency contract is implemented.
+     *
+     * @param mixed $request Decoded protocol request.
+     * @return array Closed protocol response.
+     */
+    public function post_plus_capabilities_v2( $request ) {
+        if ( ! is_array( $request ) || ! $this->posts_v2_exact_keys( $request, array( 'protocol', 'operation', 'payload' ) ) || '2' !== $request['protocol'] || ! is_string( $request['operation'] ) || ! is_array( $request['payload'] ) ) {
+            return $this->post_plus_v2_error( 'unknown', 'invalid_request' );
+        }
+
+        $operation = $request['operation'];
+        if ( 'capabilities' === $operation && array() === $request['payload'] ) {
+            return array(
+                'protocol'           => '2',
+                'operation'          => 'capabilities',
+                'ok'                 => true,
+                'operations'         => array(),
+                'mutation_supported' => false,
+            );
+        }
+
+        return $this->post_plus_v2_error( $operation, 'unsupported_operation' );
+    }
+
+    /**
+     * Normalize one closed v2 query.
+     *
+     * @param mixed $request Decoded request.
+     * @return array|false Normalized query or false.
+     */
+    private function normalize_posts_v2_request( $request ) {
+        if ( ! is_array( $request ) || ! $this->posts_v2_exact_keys( $request, array( 'protocol', 'operation', 'query' ) ) || '2' !== $request['protocol'] || 'get_all_posts_v2' !== $request['operation'] || ! is_array( $request['query'] ) || ! $this->posts_v2_exact_keys( $request['query'], array( 'post_types', 'statuses', 'keyword', 'date_from', 'date_to', 'post_id', 'author_id', 'page_size', 'cursor' ) ) ) {
+            return false;
+        }
+
+        $query = $request['query'];
+        if ( ! $this->posts_v2_enum_list( $query['post_types'], array( 'post', 'page' ), 2 ) || ! $this->posts_v2_enum_list( $query['statuses'], array( 'publish', 'private', 'draft', 'pending', 'future', 'trash' ), 6 ) || ! is_int( $query['page_size'] ) || 1 > $query['page_size'] || 100 < $query['page_size'] || ( null !== $query['cursor'] && ( ! is_string( $query['cursor'] ) || 80 < strlen( $query['cursor'] ) ) ) ) {
+            return false;
+        }
+        if ( null !== $query['keyword'] && ( ! is_string( $query['keyword'] ) || 200 < $this->posts_v2_length( $query['keyword'] ) || $query['keyword'] !== wp_check_invalid_utf8( $query['keyword'] ) ) ) {
+            return false;
+        }
+        if ( ! $this->posts_v2_nullable_positive_integer( $query['post_id'] ) || ! $this->posts_v2_nullable_positive_integer( $query['author_id'] ) || ( null !== $query['post_id'] && null !== $query['author_id'] ) ) {
+            return false;
+        }
+        if ( ! $this->posts_v2_date( $query['date_from'] ) || ! $this->posts_v2_date( $query['date_to'] ) ) {
+            return false;
+        }
+        if ( null !== $query['date_from'] && null !== $query['date_to'] ) {
+            $from = strtotime( $query['date_from'] . ' 00:00:00 UTC' );
+            $to   = strtotime( $query['date_to'] . ' 23:59:59 UTC' );
+            if ( false === $from || false === $to || $from > $to || 366 * DAY_IN_SECONDS < $to - $from ) {
+                return false;
+            }
+        }
+
+        sort( $query['post_types'] );
+        sort( $query['statuses'] );
+        return $query;
+    }
+
+    /**
+     * Project one bounded record.
+     *
+     * @param \WP_Post $post Post row.
+     * @return array|false Record or false.
+     */
+    private function posts_v2_record( $post ) {
+        if ( ! $post instanceof \WP_Post || 1 > (int) $post->ID || ! in_array( $post->post_status, array( 'publish', 'private', 'draft', 'pending', 'future', 'trash' ), true ) ) {
+            return false;
+        }
+        $url    = $this->posts_v2_url( get_permalink( $post ) );
+        $title  = $this->posts_v2_string( get_the_title( $post ), 500 );
+        $author = $this->posts_v2_string( get_the_author_meta( 'display_name', $post->post_author ), 200 );
+        $date   = get_post_time( 'Y-m-d\TH:i:s\Z', true, $post );
+        if ( false === $url || false === $title || false === $author || ! is_string( $date ) ) {
+            return false;
+        }
+        return array(
+            'post_id' => (int) $post->ID,
+            'title'   => $title,
+            'url'     => $url,
+            'date'    => $date,
+            'status'  => $post->post_status,
+            'author'  => $author,
+        );
+    }
+
+    /**
+     * Remove userinfo and common secret query fields from a post URL.
+     *
+     * @param mixed $url Candidate URL.
+     * @return string|false Safe URL or false.
+     */
+    private function posts_v2_url( $url ) {
+        if ( ! is_string( $url ) || 2048 < strlen( $url ) ) {
+            return false;
+        }
+        $parts = wp_parse_url( $url );
+        if ( ! is_array( $parts ) || ! isset( $parts['scheme'], $parts['host'] ) || ! in_array( strtolower( $parts['scheme'] ), array( 'http', 'https' ), true ) || isset( $parts['user'] ) || isset( $parts['pass'] ) ) {
+            return false;
+        }
+        return remove_query_arg( array( '_wpnonce', 'nonce', 'token', 'access_token', 'key', 'signature', 'password', 'auth', 'code' ), $url );
+    }
+
+    /**
+     * Build an authenticated opaque page cursor.
+     *
+     * @param int    $offset Next result offset.
+     * @param string $generation Query generation.
+     * @return string Cursor.
+     */
+    private function posts_v2_cursor( $offset, $generation ) {
+        $mac = hash_hmac( 'sha256', $generation . ':' . $offset, wp_salt( 'auth' ), true );
+        return $offset . '.' . rtrim( strtr( base64_encode( $mac ), '+/', '-_' ), '=' );
+    }
+
+    /**
+     * Verify one cursor and return its offset.
+     *
+     * @param string $cursor Cursor.
+     * @param string $generation Query generation.
+     * @return int|false Offset or false.
+     */
+    private function posts_v2_cursor_offset( $cursor, $generation ) {
+        if ( 1 !== preg_match( '/^([1-9][0-9]{0,4})\.([A-Za-z0-9_-]{43})$/D', $cursor, $matches ) ) {
+            return false;
+        }
+        $offset   = (int) $matches[1];
+        $expected = $this->posts_v2_cursor( $offset, $generation );
+        return 10000 >= $offset && hash_equals( $expected, $cursor ) ? $offset : false;
+    }
+
+    /** @return bool */
+    private function posts_v2_enum_list( $values, $allowed, $maximum ) {
+        if ( ! is_array( $values ) || empty( $values ) || $maximum < count( $values ) || count( $values ) !== count( array_unique( $values, SORT_REGULAR ) ) ) {
+            return false;
+        }
+        foreach ( $values as $value ) {
+            if ( ! is_string( $value ) || ! in_array( $value, $allowed, true ) ) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** @return bool */
+    private function posts_v2_nullable_positive_integer( $value ) {
+        return null === $value || ( is_int( $value ) && 1 <= $value );
+    }
+
+    /** @return bool */
+    private function posts_v2_date( $value ) {
+        if ( null === $value ) {
+            return true;
+        }
+        if ( ! is_string( $value ) || 1 !== preg_match( '/^[0-9]{4}-[0-9]{2}-[0-9]{2}$/D', $value ) ) {
+            return false;
+        }
+        $parts = array_map( 'intval', explode( '-', $value ) );
+        return checkdate( $parts[1], $parts[2], $parts[0] );
+    }
+
+    /** @return int */
+    private function posts_v2_length( $value ) {
+        return function_exists( 'mb_strlen' ) ? mb_strlen( $value, 'UTF-8' ) : strlen( $value );
+    }
+
+    /** @return string|false */
+    private function posts_v2_string( $value, $maximum ) {
+        return is_string( $value ) && $value === wp_check_invalid_utf8( $value ) && $maximum >= $this->posts_v2_length( $value ) ? $value : false;
+    }
+
+    /** @return bool */
+    private function posts_v2_exact_keys( $value, $keys ) {
+        if ( ! is_array( $value ) ) {
+            return false;
+        }
+        $actual = array_keys( $value );
+        sort( $actual );
+        sort( $keys );
+        return $actual === $keys;
+    }
+
+    /** @return array */
+    private function posts_v2_error( $code ) {
+        return array(
+            'protocol'  => '2',
+            'operation' => 'get_all_posts_v2',
+            'ok'        => false,
+            'code'      => $code,
+        );
+    }
+
+    /**
+     * Build a closed Post Dripper protocol error.
+     *
+     * @param mixed  $operation Operation name.
+     * @param string $code      Stable error code.
+     * @return array
+     */
+    private function post_dripper_v2_error( $operation, $code ) {
+        return array(
+            'protocol'  => '2',
+            'operation' => is_string( $operation ) && '' !== $operation ? $operation : 'unknown',
+            'ok'        => false,
+            'code'      => $code,
+        );
+    }
+
+    /**
+     * Build a closed Post Plus protocol error.
+     *
+     * @param mixed  $operation Operation name.
+     * @param string $code      Stable error code.
+     * @return array
+     */
+    private function post_plus_v2_error( $operation, $code ) {
+        return array(
+            'protocol'  => '2',
+            'operation' => is_string( $operation ) && '' !== $operation ? $operation : 'unknown',
+            'ok'        => false,
+            'code'      => $code,
+        );
+    }
+
+    /**
      * Get all pages.
      *
      * @uses \MainWP\Child\MainWP_Child_Posts::get_all_posts_by_type()

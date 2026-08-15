@@ -682,6 +682,9 @@ class MainWP_Child_WP_Rocket {//phpcs:ignore -- NOSONAR - multi methods.
                     case 'optimize_database':
                         $information = $this->optimize_database();
                         break;
+                    case 'abilities_v2':
+                        $information = $this->abilities_v2_action();
+                        break;
                     case 'get_optimize_info':
                         $information = $this->get_optimize_info();
                         break;
@@ -1009,6 +1012,170 @@ class MainWP_Child_WP_Rocket {//phpcs:ignore -- NOSONAR - multi methods.
 
         $return['result'] = 'SUCCESS';
         return $return;
+    }
+
+    /**
+     * Decode the additive WP Rocket abilities-v2 transport request.
+     *
+     * @return array Closed protocol result.
+     */
+    private function abilities_v2_action() {
+        // phpcs:ignore WordPress.Security.NonceVerification.Missing -- Authenticated MainWP Child callable.
+        if ( ! isset( $_POST['request'] ) || ! is_string( $_POST['request'] ) ) {
+            return $this->abilities_v2_error( 'unknown' );
+        }
+        // phpcs:ignore WordPress.Security.NonceVerification.Missing,WordPress.Security.ValidatedSanitizedInput.InputNotSanitized -- Closed JSON is validated below.
+        $raw = wp_unslash( $_POST['request'] );
+        if ( '' === $raw || 16384 < strlen( $raw ) ) {
+            return $this->abilities_v2_error( 'unknown' );
+        }
+        $request = json_decode( $raw, true );
+        return $this->abilities_v2( $request );
+    }
+
+    /**
+     * Process one closed WP Rocket abilities-v2 request.
+     *
+     * @param mixed $request Decoded request.
+     * @return array Closed protocol result.
+     */
+    public function abilities_v2( $request ) {
+        $operation = is_array( $request ) && isset( $request['operation'] ) && is_string( $request['operation'] ) ? $request['operation'] : 'unknown';
+        if ( ! is_array( $request ) || ! isset( $request['protocol'] ) || '2' !== $request['protocol'] ) {
+            return $this->abilities_v2_error( $operation );
+        }
+
+        if ( 'capabilities' === $operation ) {
+            if ( ! $this->abilities_v2_exact_keys( $request, array( 'protocol', 'operation', 'payload' ) ) || ! is_array( $request['payload'] ) || array() !== $request['payload'] ) {
+                return $this->abilities_v2_error( $operation );
+            }
+            return array(
+                'protocol'   => '2',
+                'operation'  => 'capabilities',
+                'ok'         => true,
+                'operations' => array( 'optimize_database' ),
+                'categories' => array_keys( $this->abilities_v2_category_map() ),
+            );
+        }
+
+        if ( 'optimize_database' !== $operation || ! $this->abilities_v2_exact_keys( $request, array( 'protocol', 'operation', 'request_ref', 'payload' ) ) ) {
+            return $this->abilities_v2_error( $operation );
+        }
+        if ( ! is_string( $request['request_ref'] ) || 1 !== preg_match( '/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/D', $request['request_ref'] ) ) {
+            return $this->abilities_v2_error( $operation );
+        }
+        if ( ! is_array( $request['payload'] ) || ! $this->abilities_v2_exact_keys( $request['payload'], array( 'categories' ) ) ) {
+            return $this->abilities_v2_error( $operation );
+        }
+
+        $categories = $request['payload']['categories'];
+        $map        = $this->abilities_v2_category_map();
+        if ( ! is_array( $categories ) || array_keys( $categories ) !== range( 0, count( $categories ) - 1 ) || 1 > count( $categories ) || 8 < count( $categories ) ) {
+            return $this->abilities_v2_error( $operation );
+        }
+        $provider_categories = array();
+        foreach ( $categories as $category ) {
+            if ( ! is_string( $category ) || ! isset( $map[ $category ] ) || in_array( $category, array_slice( $categories, 0, count( $provider_categories ) ), true ) ) {
+                return $this->abilities_v2_error( $operation );
+            }
+            $provider_categories[] = $map[ $category ];
+        }
+
+        try {
+            $result = $this->abilities_v2_provider_optimize_database( $provider_categories );
+        } catch ( \Throwable $e ) {
+            return $this->abilities_v2_error( $operation, 'provider_failed' );
+        }
+        if ( false === $result || is_wp_error( $result ) ) {
+            return $this->abilities_v2_error( $operation, 'provider_failed' );
+        }
+
+        return array(
+            'protocol'   => '2',
+            'operation'  => 'optimize_database',
+            'ok'         => true,
+            'status'     => 'completed',
+            'categories' => $categories,
+        );
+    }
+
+    /**
+     * Run explicit WP Rocket optimization categories without reading settings.
+     *
+     * @param array $categories WP Rocket category keys.
+     * @return bool
+     * @throws MainWP_Exception Missing provider support.
+     */
+    protected function abilities_v2_provider_optimize_database( $categories ) {
+        MainWP_Helper::instance()->check_classes_exists(
+            array(
+                '\\WP_Rocket\\Admin\\Database\\Optimization',
+                '\\WP_Rocket\\Admin\\Database\\Optimization_Process',
+            )
+        );
+        $process      = new \WP_Rocket\Admin\Database\Optimization_Process();
+        $optimization = new \WP_Rocket\Admin\Database\Optimization( $process );
+        MainWP_Helper::instance()->check_methods( $optimization, array( 'process_handler', 'get_options' ) );
+
+        $supported = array_keys( $optimization->get_options() );
+        foreach ( $categories as $category ) {
+            if ( ! in_array( $category, $supported, true ) ) {
+                return false;
+            }
+        }
+        $optimization->process_handler( $categories );
+        return true;
+    }
+
+    /**
+     * Map public categories to WP Rocket provider categories.
+     *
+     * @return array<string,string>
+     */
+    private function abilities_v2_category_map() {
+        return array(
+            'revisions'          => 'database_revisions',
+            'auto_drafts'        => 'database_auto_drafts',
+            'trashed_posts'      => 'database_trashed_posts',
+            'spam_comments'      => 'database_spam_comments',
+            'trashed_comments'   => 'database_trashed_comments',
+            'expired_transients' => 'database_expired_transients',
+            'all_transients'     => 'database_all_transients',
+            'optimize_tables'    => 'database_optimize_tables',
+        );
+    }
+
+    /**
+     * Check an associative array's exact key set.
+     *
+     * @param array $value Value.
+     * @param array $keys Expected keys.
+     * @return bool
+     */
+    private function abilities_v2_exact_keys( $value, $keys ) {
+        if ( ! is_array( $value ) ) {
+            return false;
+        }
+        $actual = array_keys( $value );
+        sort( $actual );
+        sort( $keys );
+        return $actual === $keys;
+    }
+
+    /**
+     * Build a stable redacted protocol error.
+     *
+     * @param string $operation Operation.
+     * @param string $code Stable code.
+     * @return array
+     */
+    private function abilities_v2_error( $operation, $code = 'invalid_request' ) {
+        return array(
+            'protocol'   => '2',
+            'operation'  => is_string( $operation ) && 64 >= strlen( $operation ) ? $operation : 'unknown',
+            'ok'         => false,
+            'error_code' => $code,
+        );
     }
 
     /**

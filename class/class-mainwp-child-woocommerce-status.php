@@ -76,13 +76,24 @@ class MainWP_Child_WooCommerce_Status {
      */
     public function action() {
         $information = array();
+        $mwp_action  = MainWP_System::instance()->validate_params( 'mwp_action' );
+
+        if ( 'abilities_v2' === $mwp_action ) {
+            // phpcs:disable WordPress.Security.NonceVerification
+            $raw_request = isset( $_POST['request'] ) && is_string( $_POST['request'] ) ? wp_unslash( $_POST['request'] ) : '';
+            // phpcs:enable
+            $request = 65536 >= strlen( $raw_request ) ? json_decode( $raw_request, true ) : null;
+            MainWP_Helper::write( $this->abilities_v2( $request ) );
+            return;
+        }
+
         if ( ! class_exists( '\WooCommerce' ) || ! defined( 'WC_VERSION' ) ) {
             $information['error'] = 'NO_WOOCOMMERCE';
             MainWP_Helper::write( $information );
+            return;
         }
 
-        $is_ver220  = $this->is_version_220();
-        $mwp_action = MainWP_System::instance()->validate_params( 'mwp_action' );
+        $is_ver220 = $this->is_version_220();
         if ( ! empty( $mwp_action ) ) {
             switch ( $mwp_action ) {
                 case 'sync_data':
@@ -100,6 +111,200 @@ class MainWP_Child_WooCommerce_Status {
             }
         }
         MainWP_Helper::write( $information );
+    }
+
+    /**
+     * Execute one closed WooCommerce Status protocol-v2 request.
+     *
+     * @param mixed $request Decoded request object.
+     * @return array<string,mixed> Closed response.
+     */
+    public function abilities_v2( $request ) {
+        $operation = is_array( $request ) && isset( $request['operation'] ) && is_string( $request['operation'] ) ? $request['operation'] : 'unknown';
+        if ( ! is_array( $request ) || ! $this->abilities_v2_exact_keys( $request, array( 'protocol', 'operation', 'payload' ) ) || '2' !== $request['protocol'] || ! is_array( $request['payload'] ) ) {
+            return $this->abilities_v2_error( 'unknown', 'invalid_request' );
+        }
+
+        if ( 'capabilities' === $operation ) {
+            if ( array() !== $request['payload'] ) {
+                return $this->abilities_v2_error( $operation, 'invalid_request' );
+            }
+            return array(
+                'protocol'           => '2',
+                'operation'          => 'capabilities',
+                'ok'                 => true,
+                'operations'         => array( 'status_v2_prepare' ),
+                'mutation_supported' => false,
+            );
+        }
+
+        if ( 'status_v2_prepare' !== $operation || ! $this->abilities_v2_valid_prepare_request( $request['payload'] ) ) {
+            return $this->abilities_v2_error( $operation, 'invalid_request' );
+        }
+
+        $runtime = $this->abilities_v2_runtime();
+        if ( false === $runtime ) {
+            return $this->abilities_v2_error( $operation, 'woocommerce_unavailable' );
+        }
+        if ( ! $this->abilities_v2_valid_runtime( $runtime ) ) {
+            return $this->abilities_v2_error( $operation, 'runtime_invalid' );
+        }
+
+        return array(
+            'protocol'                 => '2',
+            'operation'                => 'status_v2_prepare',
+            'ok'                       => true,
+            'request_ref'              => $request['payload']['request_ref'],
+            'site_fingerprint'         => $request['payload']['site_fingerprint'],
+            'start_at'                 => $request['payload']['start_at'],
+            'end_at'                   => $request['payload']['end_at'],
+            'top_limit'                => $request['payload']['top_limit'],
+            'wc_version'               => $runtime['wc_version'],
+            'storage_mode'             => $runtime['storage_mode'],
+            'store_timezone'           => $runtime['store_timezone'],
+            'current_db_version'       => $runtime['current_db_version'],
+            'target_db_version'        => $runtime['target_db_version'],
+            'database_update_needed'   => $runtime['database_update_needed'],
+            'accounting_profile'       => 'net-order-total-v1',
+            'page_size_max'            => 250,
+            'order_limit'              => 100000,
+            'preparation_generation'   => hash( 'sha256', wp_json_encode( array( $request['payload'], $runtime ) ) ),
+        );
+    }
+
+    /**
+     * Read non-secret WooCommerce runtime identity without querying orders.
+     *
+     * @return array<string,mixed>|false
+     */
+    protected function abilities_v2_runtime() {
+        if ( ! class_exists( '\WooCommerce' ) || ! defined( 'WC_VERSION' ) ) {
+            return false;
+        }
+
+        $timezone = wp_timezone_string();
+        if ( ! is_string( $timezone ) || ! in_array( $timezone, timezone_identifiers_list(), true ) ) {
+            return false;
+        }
+
+        $current_db = get_option( 'woocommerce_db_version', '' );
+        $target_db  = WC_VERSION;
+        if ( ! is_string( $current_db ) || ! is_string( $target_db ) || '' === $current_db || '' === $target_db ) {
+            return false;
+        }
+
+        $storage_mode = 'legacy';
+        if ( class_exists( '\Automattic\WooCommerce\Utilities\OrderUtil' ) && method_exists( '\Automattic\WooCommerce\Utilities\OrderUtil', 'custom_orders_table_usage_is_enabled' ) ) {
+            $storage_mode = \Automattic\WooCommerce\Utilities\OrderUtil::custom_orders_table_usage_is_enabled() ? 'hpos' : 'legacy';
+        }
+
+        return array(
+            'wc_version'             => WC_VERSION,
+            'storage_mode'           => $storage_mode,
+            'store_timezone'         => $timezone,
+            'current_db_version'     => $current_db,
+            'target_db_version'      => $target_db,
+            'database_update_needed' => version_compare( $current_db, $target_db, '<' ),
+        );
+    }
+
+    /**
+     * Validate a prepare request.
+     *
+     * @param array $payload Request payload.
+     * @return bool
+     */
+    private function abilities_v2_valid_prepare_request( $payload ) {
+        if ( ! $this->abilities_v2_exact_keys( $payload, array( 'request_ref', 'site_fingerprint', 'start_at', 'end_at', 'top_limit' ) ) || ! is_string( $payload['request_ref'] ) || 1 !== preg_match( '/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/D', $payload['request_ref'] ) || ! is_string( $payload['site_fingerprint'] ) || 1 !== preg_match( '/^[a-f0-9]{64}$/D', $payload['site_fingerprint'] ) || ! is_int( $payload['top_limit'] ) || 1 > $payload['top_limit'] || 20 < $payload['top_limit'] ) {
+            return false;
+        }
+
+        $start = $this->abilities_v2_utc_timestamp( $payload['start_at'] );
+        $end   = $this->abilities_v2_utc_timestamp( $payload['end_at'] );
+
+        return false !== $start && false !== $end && $start < $end && 366 * DAY_IN_SECONDS >= $end - $start;
+    }
+
+    /**
+     * Parse one exact RFC3339 UTC timestamp.
+     *
+     * @param mixed $value Candidate timestamp.
+     * @return int|false
+     */
+    private function abilities_v2_utc_timestamp( $value ) {
+        if ( ! is_string( $value ) || 1 !== preg_match( '/^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$/D', $value ) ) {
+            return false;
+        }
+        $date   = \DateTimeImmutable::createFromFormat( '!Y-m-d\TH:i:s\Z', $value, new \DateTimeZone( 'UTC' ) );
+        $errors = \DateTimeImmutable::getLastErrors();
+        if ( false === $date || ( false !== $errors && ( 0 !== $errors['warning_count'] || 0 !== $errors['error_count'] ) ) || $date->format( 'Y-m-d\TH:i:s\Z' ) !== $value ) {
+            return false;
+        }
+
+        return $date->getTimestamp();
+    }
+
+    /**
+     * Validate a closed runtime identity.
+     *
+     * @param array $runtime Runtime identity.
+     * @return bool
+     */
+    private function abilities_v2_valid_runtime( $runtime ) {
+        return is_array( $runtime )
+            && $this->abilities_v2_exact_keys( $runtime, array( 'wc_version', 'storage_mode', 'store_timezone', 'current_db_version', 'target_db_version', 'database_update_needed' ) )
+            && $this->abilities_v2_string( $runtime['wc_version'], 100 )
+            && in_array( $runtime['storage_mode'], array( 'hpos', 'legacy' ), true )
+            && is_string( $runtime['store_timezone'] )
+            && in_array( $runtime['store_timezone'], timezone_identifiers_list(), true )
+            && $this->abilities_v2_string( $runtime['current_db_version'], 100 )
+            && $this->abilities_v2_string( $runtime['target_db_version'], 100 )
+            && is_bool( $runtime['database_update_needed'] );
+    }
+
+    /**
+     * Validate a bounded non-control string.
+     *
+     * @param mixed $value  Candidate value.
+     * @param int   $length Maximum byte length.
+     * @return bool
+     */
+    private function abilities_v2_string( $value, $length ) {
+        return is_string( $value ) && '' !== $value && $length >= strlen( $value ) && 0 === preg_match( '/[\x00-\x1F\x7F]/', $value );
+    }
+
+    /**
+     * Check an exact associative-key set.
+     *
+     * @param array $value Input object.
+     * @param array $keys  Expected keys.
+     * @return bool
+     */
+    private function abilities_v2_exact_keys( $value, $keys ) {
+        if ( ! is_array( $value ) ) {
+            return false;
+        }
+        $actual = array_keys( $value );
+        sort( $actual, SORT_STRING );
+        sort( $keys, SORT_STRING );
+
+        return $actual === $keys;
+    }
+
+    /**
+     * Build a closed protocol error.
+     *
+     * @param string $operation Protocol operation.
+     * @param string $code      Stable error code.
+     * @return array<string,mixed>
+     */
+    private function abilities_v2_error( $operation, $code ) {
+        return array(
+            'protocol'  => '2',
+            'operation' => $operation,
+            'ok'        => false,
+            'code'      => $code,
+        );
     }
 
     /**

@@ -433,6 +433,79 @@ class MainWP_Child_Misc {
     }
 
     /**
+     * Handle the narrow Virusdie signed-installer protocol.
+     *
+     * The executable mutation remains unavailable until the Dashboard supplies
+     * the audited signed-manifest and one-use-token contract.
+     *
+     * @return void
+     */
+    public function virusdie_sync_install_v1() {
+        // phpcs:disable WordPress.Security.NonceVerification
+        $raw_request = isset( $_POST['request'] ) && is_string( $_POST['request'] ) ? wp_unslash( $_POST['request'] ) : '';
+        // phpcs:enable
+        $request = 4096 >= strlen( $raw_request ) ? json_decode( $raw_request, true ) : null;
+
+        MainWP_Helper::write( $this->virusdie_sync_install_v1_response( $request ) );
+    }
+
+    /**
+     * Build one closed Virusdie installer protocol response.
+     *
+     * @param mixed $request Decoded request object.
+     * @return array<string,mixed> Closed response.
+     */
+    public function virusdie_sync_install_v1_response( $request ) {
+        $operation = is_array( $request ) && isset( $request['operation'] ) && is_string( $request['operation'] ) ? $request['operation'] : 'unknown';
+        if ( ! is_array( $request ) || ! $this->virusdie_sync_install_v1_exact_keys( $request, array( 'protocol', 'operation', 'payload' ) ) || '1' !== $request['protocol'] || ! is_array( $request['payload'] ) ) {
+            return $this->virusdie_sync_install_v1_error( 'unknown', 'invalid_request' );
+        }
+
+        if ( 'capabilities' === $operation && array() === $request['payload'] ) {
+            return array(
+                'protocol'           => '1',
+                'operation'          => 'capabilities',
+                'ok'                 => true,
+                'operations'         => array(),
+                'mutation_supported' => false,
+            );
+        }
+
+        return $this->virusdie_sync_install_v1_error( $operation, 'unsupported_operation' );
+    }
+
+    /**
+     * Check an exact associative-key set.
+     *
+     * @param array $value Input object.
+     * @param array $keys  Expected keys.
+     * @return bool
+     */
+    private function virusdie_sync_install_v1_exact_keys( $value, $keys ) {
+        $actual = array_keys( $value );
+        sort( $actual, SORT_STRING );
+        sort( $keys, SORT_STRING );
+
+        return $actual === $keys;
+    }
+
+    /**
+     * Build a closed Virusdie installer protocol error.
+     *
+     * @param string $operation Protocol operation.
+     * @param string $code      Stable error code.
+     * @return array<string,mixed>
+     */
+    private function virusdie_sync_install_v1_error( $operation, $code ) {
+        return array(
+            'protocol'  => '1',
+            'operation' => $operation,
+            'ok'        => false,
+            'code'      => $code,
+        );
+    }
+
+    /**
      * Method uploader_upload_file()
      *
      * Upload file from the MainWP Dashboard.
@@ -591,8 +664,15 @@ class MainWP_Child_Misc {
     public function code_snippet() {
         // phpcs:disable WordPress.Security.NonceVerification
         $action = MainWP_System::instance()->validate_params( 'action' );
-        $type   = isset( $_POST['type'] ) ? sanitize_text_field( wp_unslash( $_POST['type'] ) ) : '';
-        $slug   = isset( $_POST['slug'] ) ? sanitize_text_field( wp_unslash( $_POST['slug'] ) ) : '';
+
+        if ( in_array( $action, array( 'run_snippet_v2', 'apply_snippet_v2', 'remove_snippet_v2' ), true ) ) {
+            $raw_request = isset( $_POST['request'] ) && is_string( $_POST['request'] ) ? wp_unslash( $_POST['request'] ) : '';
+            $request     = 70000 >= strlen( $raw_request ) ? json_decode( $raw_request, true ) : null;
+            MainWP_Helper::write( $this->snippet_v2( $action, $request ) );
+        }
+
+        $type = isset( $_POST['type'] ) ? sanitize_text_field( wp_unslash( $_POST['type'] ) ) : '';
+        $slug = isset( $_POST['slug'] ) ? sanitize_text_field( wp_unslash( $_POST['slug'] ) ) : '';
 
         $snippets = get_option( 'mainwp_ext_code_snippets' );
 
@@ -620,6 +700,342 @@ class MainWP_Child_Misc {
         }
 
         MainWP_Helper::write( $information );
+    }
+
+    /**
+     * Execute one closed Code Snippets protocol-v2 request.
+     *
+     * @param string $action  Protocol action.
+     * @param mixed  $request Decoded request object.
+     * @return array<string,mixed> Closed result.
+     */
+    public function snippet_v2( $action, $request ) {
+        if ( ! is_array( $request ) ) {
+            return $this->snippet_v2_error( 'invalid_request' );
+        }
+
+        $keys = array(
+            'run_snippet_v2'    => array( 'protocol_version', 'request_ref', 'slug', 'type', 'code' ),
+            'apply_snippet_v2'  => array( 'protocol_version', 'request_ref', 'slug', 'type', 'code' ),
+            'remove_snippet_v2' => array( 'protocol_version', 'request_ref', 'slug', 'type' ),
+        );
+        if ( ! isset( $keys[ $action ] ) || $keys[ $action ] !== array_keys( $request ) || 2 !== $request['protocol_version'] || ! $this->snippet_v2_valid_request_ref( $request['request_ref'] ) || ! $this->snippet_v2_valid_slug( $request['slug'] ) ) { // phpcs:ignore WordPress.PHP.YodaConditions.NotYoda -- Exact ordered key comparison has no literal operand.
+            return $this->snippet_v2_error( 'invalid_request' );
+        }
+
+        $type = $request['type'];
+        if ( ! is_string( $type ) || ! in_array( $type, array( 'R', 'S', 'C' ), true ) ) {
+            return $this->snippet_v2_error( 'invalid_request' );
+        }
+
+        if ( 'run_snippet_v2' === $action ) {
+            if ( 'R' !== $type || ! $this->snippet_v2_valid_code( $request['code'] ) ) {
+                return $this->snippet_v2_error( 'invalid_request' );
+            }
+            return $this->snippet_v2_run( $request );
+        }
+
+        if ( 'R' === $type || ( 'apply_snippet_v2' === $action && ! $this->snippet_v2_valid_code( $request['code'] ) ) ) {
+            return $this->snippet_v2_error( 'invalid_request' );
+        }
+
+        $owner = $this->snippet_v2_acquire_lock( $request['slug'] );
+        if ( false === $owner ) {
+            return $this->snippet_v2_error( 'lock_busy' );
+        }
+
+        try {
+            $result = 'apply_snippet_v2' === $action
+                ? $this->snippet_v2_apply( $request['slug'], $type, $request['code'] )
+                : $this->snippet_v2_remove( $request['slug'], $type );
+        } finally {
+            $released = $this->snippet_v2_release_lock( $request['slug'], $owner );
+        }
+
+        if ( ! $released || ! is_array( $result ) ) {
+            return $this->snippet_v2_error( 'storage_failed' );
+        }
+        if ( isset( $result['error_code'] ) ) {
+            return $this->snippet_v2_error( $result['error_code'] );
+        }
+
+        return array_merge( array( 'request_ref' => $request['request_ref'] ), $result );
+    }
+
+    /** @return array<string,mixed> */
+    private function snippet_v2_error( $code ) {
+        $allowed = array( 'invalid_request', 'lock_busy', 'execution_failed', 'storage_failed' );
+        return array(
+            'success'    => false,
+            'error_code' => in_array( $code, $allowed, true ) ? $code : 'storage_failed',
+        );
+    }
+
+    /** @return bool */
+    private function snippet_v2_valid_request_ref( $value ) {
+        return is_string( $value ) && 1 === preg_match( '/^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/D', $value );
+    }
+
+    /** @return bool */
+    private function snippet_v2_valid_slug( $value ) {
+        return is_string( $value ) && 1 === preg_match( '/^[A-Za-z0-9]{1,32}$/D', $value );
+    }
+
+    /** @return bool */
+    private function snippet_v2_valid_code( $value ) {
+        return is_string( $value ) && '' !== $value && 60000 >= strlen( $value ) && wp_check_invalid_utf8( $value ) === $value;
+    }
+
+    /** @return int */
+    protected function snippet_v2_now() {
+        return time();
+    }
+
+    /** @return mixed */
+    protected function snippet_v2_get_option( $name, $fallback = false ) {
+        return get_option( $name, $fallback );
+    }
+
+    /** @return bool */
+    protected function snippet_v2_update_option( $name, $value ) {
+        return update_option( $name, $value ) || get_option( $name, null ) === $value;
+    }
+
+    /** @return bool */
+    protected function snippet_v2_delete_option( $name ) {
+        return delete_option( $name ) || false === get_option( $name, false );
+    }
+
+    /** @return string|false */
+    protected function snippet_v2_acquire_lock( $slug ) {
+        $name  = 'mainwp_cs_v2_lock_' . hash( 'sha256', $slug );
+        $now   = $this->snippet_v2_now();
+        $owner = wp_generate_uuid4();
+        $lock  = $this->snippet_v2_get_option( $name, false );
+        if ( is_array( $lock ) && isset( $lock['expires'] ) && is_int( $lock['expires'] ) && $lock['expires'] < $now ) {
+            $this->snippet_v2_delete_option( $name );
+        }
+        if ( ! add_option(
+            $name,
+            array(
+                'owner'   => $owner,
+                'expires' => $now + 120,
+            ),
+            '',
+            false
+        ) ) {
+            return false;
+        }
+        return $owner;
+    }
+
+    /** @return bool */
+    protected function snippet_v2_release_lock( $slug, $owner ) {
+        $name = 'mainwp_cs_v2_lock_' . hash( 'sha256', $slug );
+        $lock = $this->snippet_v2_get_option( $name, false );
+        return is_array( $lock ) && isset( $lock['owner'] ) && is_string( $lock['owner'] ) && hash_equals( $lock['owner'], $owner ) && $this->snippet_v2_delete_option( $name );
+    }
+
+    /** @return array<string,mixed> */
+    private function snippet_v2_run( $request ) {
+        $execution = $this->snippet_v2_execute_code( $request['code'] );
+        if ( ! is_array( $execution ) || ! isset( $execution['status'], $execution['output'], $execution['output_truncated'] ) ) {
+            return $this->snippet_v2_error( 'execution_failed' );
+        }
+        return array(
+            'request_ref'      => $request['request_ref'],
+            'status'           => $execution['status'],
+            'output'           => $execution['output'],
+            'output_truncated' => $execution['output_truncated'],
+            'error_code'       => 'succeeded' === $execution['status'] ? null : 'execution_failed',
+        );
+    }
+
+    /** @return array<string,mixed> */
+    protected function snippet_v2_execute_code( $code ) {
+        $level = ob_get_level();
+        ob_start();
+        try {
+            eval( $code ); // phpcs:ignore Squiz.PHP.Eval, Generic.PHP.ForbiddenFunctions.Found -- Executes an already authorized stored Code Snippets definition under the authenticated Child callable.
+            $output = (string) ob_get_clean();
+            $status = 'succeeded';
+        } catch ( \Throwable $exception ) {
+            while ( ob_get_level() > $level ) {
+                ob_end_clean();
+            }
+            $output = '';
+            $status = 'failed';
+        }
+        $truncated = 65535 < strlen( $output );
+        if ( $truncated ) {
+            $output = substr( $output, 0, 65535 );
+        }
+        $output = wp_check_invalid_utf8( $output );
+        return array(
+            'status'           => $status,
+            'output'           => $output,
+            'output_truncated' => $truncated,
+        );
+    }
+
+    /** @return array<string,mixed> */
+    private function snippet_v2_apply( $slug, $type, $code ) {
+        if ( 'S' === $type ) {
+            $before  = $this->snippet_v2_get_option( 'mainwp_ext_code_snippets', array() );
+            $enabled = $this->snippet_v2_get_option( 'mainwp_ext_snippets_enabled', false );
+            if ( ! is_array( $before ) ) {
+                return array( 'error_code' => 'storage_failed' );
+            }
+            if ( isset( $before[ $slug ] ) && $code === $before[ $slug ] && true === (bool) $enabled ) {
+                return array(
+                    'result'          => 'unchanged',
+                    'installed_state' => 'confirmed',
+                );
+            }
+            $after          = $before;
+            $after[ $slug ] = $code;
+            if ( ! $this->snippet_v2_update_option( 'mainwp_ext_code_snippets', $after ) || ! $this->snippet_v2_update_option( 'mainwp_ext_snippets_enabled', true ) || $after !== $this->snippet_v2_get_option( 'mainwp_ext_code_snippets', null ) || true !== (bool) $this->snippet_v2_get_option( 'mainwp_ext_snippets_enabled', false ) ) {
+                $this->snippet_v2_update_option( 'mainwp_ext_code_snippets', $before );
+                $this->snippet_v2_update_option( 'mainwp_ext_snippets_enabled', $enabled );
+                return array( 'error_code' => 'storage_failed' );
+            }
+            return array(
+                'result'          => 'changed',
+                'installed_state' => 'confirmed',
+            );
+        }
+        return $this->snippet_v2_config_change( 'apply', $slug, $code );
+    }
+
+    /** @return array<string,mixed> */
+    private function snippet_v2_remove( $slug, $type ) {
+        if ( 'S' === $type ) {
+            $before = $this->snippet_v2_get_option( 'mainwp_ext_code_snippets', array() );
+            if ( ! is_array( $before ) ) {
+                return array( 'error_code' => 'storage_failed' );
+            }
+            if ( ! array_key_exists( $slug, $before ) ) {
+                return array(
+                    'result'          => 'already_absent',
+                    'installed_state' => 'absent',
+                );
+            }
+            $after = $before;
+            unset( $after[ $slug ] );
+            if ( ! $this->snippet_v2_update_option( 'mainwp_ext_code_snippets', $after ) || $after !== $this->snippet_v2_get_option( 'mainwp_ext_code_snippets', null ) ) {
+                $this->snippet_v2_update_option( 'mainwp_ext_code_snippets', $before );
+                return array( 'error_code' => 'storage_failed' );
+            }
+            return array(
+                'result'          => 'removed',
+                'installed_state' => 'absent',
+            );
+        }
+        return $this->snippet_v2_config_change( 'remove', $slug, '' );
+    }
+
+    /** @return string|false */
+    protected function snippet_v2_config_path() {
+        if ( file_exists( ABSPATH . 'wp-config.php' ) ) {
+            return ABSPATH . 'wp-config.php';
+        }
+        $parent = dirname( ABSPATH ) . '/wp-config.php';
+        return file_exists( $parent ) && ! file_exists( dirname( ABSPATH ) . '/wp-settings.php' ) ? $parent : false;
+    }
+
+    /** @return array<string,mixed> */
+    private function snippet_v2_config_change( $operation, $slug, $code ) {
+        $path = $this->snippet_v2_config_path();
+        if ( false === $path ) {
+            return array( 'error_code' => 'storage_failed' );
+        }
+        $original = $this->snippet_v2_read_file( $path );
+        if ( ! is_string( $original ) ) {
+            return array( 'error_code' => 'storage_failed' );
+        }
+        $start = '/***snippet_' . $slug . '***/';
+        $end   = '/***end_' . $slug . '***/';
+        if ( substr_count( $original, $start ) !== substr_count( $original, $end ) || substr_count( $original, $start ) > 1 ) {
+            return array( 'error_code' => 'storage_failed' );
+        }
+        $next = $original;
+        if ( 1 === substr_count( $next, $start ) ) {
+            $pattern = '/(?:\r?\n){0,2}' . preg_quote( $start, '/' ) . '.*?' . preg_quote( $end, '/' ) . '(?:\r?\n){0,2}/s';
+            $next    = preg_replace( $pattern, "\n", $next, 1, $removed );
+            if ( ! is_string( $next ) || 1 !== $removed ) {
+                return array( 'error_code' => 'storage_failed' );
+            }
+        } elseif ( 'remove' === $operation ) {
+            return array(
+                'result'          => 'already_absent',
+                'installed_state' => 'absent',
+            );
+        }
+        if ( 'apply' === $operation ) {
+            $block = $start . "\n" . $code . "\n" . $end;
+            $next  = preg_replace_callback(
+                '/(\$table_prefix\s*=\s*[\'\"][^\'\"]*[\'\"]\s*;)/i',
+                static function ( $matches ) use ( $block ) {
+                    return $matches[1] . "\n\n" . $block;
+                },
+                $next,
+                1,
+                $inserted
+            );
+            if ( ! is_string( $next ) || 1 !== $inserted ) {
+                return array( 'error_code' => 'storage_failed' );
+            }
+        }
+        if ( $original === $next ) {
+            return array(
+                'result'          => 'unchanged',
+                'installed_state' => 'confirmed',
+            );
+        }
+        if ( ! $this->snippet_v2_write_file_atomic( $path, $original, $next ) ) {
+            return array( 'error_code' => 'storage_failed' );
+        }
+        return array(
+            'result'          => 'apply' === $operation ? 'changed' : 'removed',
+            'installed_state' => 'apply' === $operation ? 'confirmed' : 'absent',
+        );
+    }
+
+    /** @return string|false */
+    protected function snippet_v2_read_file( $path ) {
+        return file_get_contents( $path );
+    }
+
+    /** @return bool */
+    protected function snippet_v2_write_file_atomic( $path, $expected, $next ) {
+        $handle = fopen( $path, 'c+' );
+        if ( false === $handle || ! flock( $handle, LOCK_EX ) ) {
+            false !== $handle && fclose( $handle );
+            return false;
+        }
+        $current = stream_get_contents( $handle );
+        $mode    = fileperms( $path );
+        if ( $expected !== $current || false === $mode ) {
+            flock( $handle, LOCK_UN );
+            fclose( $handle );
+            return false;
+        }
+        $temporary = tempnam( dirname( $path ), '.mainwp-cs-' );
+        $ok        = is_string( $temporary ) && false !== file_put_contents( $temporary, $next ) && chmod( $temporary, $mode & 0777 ) && rename( $temporary, $path ) && file_get_contents( $path ) === $next;
+        if ( ! $ok ) {
+            if ( is_string( $temporary ) && file_exists( $temporary ) ) {
+                unlink( $temporary );
+            }
+            $rollback = tempnam( dirname( $path ), '.mainwp-cs-rollback-' );
+            if ( is_string( $rollback ) ) {
+                file_put_contents( $rollback, $expected );
+                chmod( $rollback, $mode & 0777 );
+                rename( $rollback, $path );
+            }
+        }
+        flock( $handle, LOCK_UN );
+        fclose( $handle );
+        return $ok && file_get_contents( $path ) === $next;
     }
 
     /**

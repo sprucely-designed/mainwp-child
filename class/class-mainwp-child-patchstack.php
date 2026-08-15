@@ -24,6 +24,19 @@ if ( ! defined( 'ABSPATH' ) ) {
  */
 class MainWP_Child_Patchstack { //phpcs:ignore -- NOSONAR - multi methods.
 
+    /** Durable visibility receipt option. */
+    const ABILITIES_V2_RECEIPTS_OPTION = 'mainwp_child_patchstack_v2_receipts';
+
+    /** Atomic visibility mutation lock. */
+    const ABILITIES_V2_LOCK_OPTION = 'mainwp_child_patchstack_v2_lock';
+
+    /**
+     * Current visibility lock owner.
+     *
+     * @var string
+     */
+    private $abilities_v2_lock_owner = '';
+
     /**
      * Public static variable to hold the single instance of the class.
      *
@@ -128,6 +141,9 @@ class MainWP_Child_Patchstack { //phpcs:ignore -- NOSONAR - multi methods.
         $mwp_action  = MainWP_System::instance()->validate_params( 'action' );
         if ( ! empty( $mwp_action ) ) {
             switch ( $mwp_action ) {
+                case 'patchstack_capabilities_v2':
+                    $information = $this->abilities_v2_action();
+                    break;
                 case 'install_plugin':
                     $information = $this->install_plugin();
                     break;
@@ -145,6 +161,433 @@ class MainWP_Child_Patchstack { //phpcs:ignore -- NOSONAR - multi methods.
         }
 
         MainWP_Helper::write( $information );
+    }
+
+    /**
+     * Handle the closed Patchstack abilities protocol envelope.
+     *
+     * @return array Protocol response.
+     */
+    private function abilities_v2_action() {
+        if ( ! isset( $_POST['request'] ) || ! is_string( $_POST['request'] ) ) { // phpcs:ignore WordPress.Security.NonceVerification.Missing -- authenticated MainWP request.
+            return $this->abilities_v2_error( 'unknown', 'invalid_request' );
+        }
+
+        $raw = wp_unslash( $_POST['request'] ); // phpcs:ignore WordPress.Security.NonceVerification.Missing,WordPress.Security.ValidatedSanitizedInput.InputNotSanitized -- Closed JSON is validated below.
+        if ( '' === $raw || 4096 < strlen( $raw ) ) {
+            return $this->abilities_v2_error( 'unknown', 'invalid_request' );
+        }
+
+        return $this->abilities_v2( json_decode( $raw, true ) );
+    }
+
+    /**
+     * Negotiate the Patchstack abilities protocol.
+     *
+     * No Patchstack mutation is advertised until its full preview, execute,
+     * status, and visibility contracts are implemented.
+     *
+     * @param mixed $request Decoded request envelope.
+     * @return array Protocol response.
+     */
+    public function abilities_v2( $request ) {
+        if ( ! is_array( $request ) || ! $this->abilities_v2_exact_keys( $request, array( 'protocol', 'operation', 'payload' ) ) || '2' !== $request['protocol'] || ! is_string( $request['operation'] ) || ! is_array( $request['payload'] ) ) {
+            return $this->abilities_v2_error( 'unknown', 'invalid_request' );
+        }
+
+        $operation = $request['operation'];
+        if ( 'capabilities' === $operation && array() === $request['payload'] ) {
+            return array(
+                'protocol'           => '2',
+                'operation'          => 'capabilities',
+                'ok'                 => true,
+                'operations'         => array( 'patchstack_protection_preview_v2', 'patchstack_visibility_replace_v2' ),
+                'mutation_supported' => true,
+            );
+        }
+
+        if ( 'patchstack_protection_preview_v2' === $operation ) {
+            return $this->abilities_v2_protection_preview( $request['payload'] );
+        }
+        if ( 'patchstack_visibility_replace_v2' === $operation ) {
+            if ( ! $this->abilities_v2_begin_mutation() ) {
+                return $this->abilities_v2_error( $operation, 'lock_busy' );
+            }
+            $result   = $this->abilities_v2_visibility_replace( $request['payload'] );
+            $released = $this->abilities_v2_end_mutation();
+            return $released ? $result : $this->abilities_v2_error( $operation, 'outcome_unknown' );
+        }
+
+        return $this->abilities_v2_error( $operation, 'unsupported_operation' );
+    }
+
+    /**
+     * Return local protection and package-verification readiness.
+     *
+     * @param array $payload Closed preview payload.
+     * @return array Protocol response.
+     */
+    private function abilities_v2_protection_preview( $payload ) {
+        $operation = 'patchstack_protection_preview_v2';
+        if ( ! $this->abilities_v2_valid_common_payload( $payload ) ) {
+            return $this->abilities_v2_error( $operation, 'invalid_request' );
+        }
+        $state      = $this->abilities_v2_plugin_state();
+        $visibility = $this->abilities_v2_visibility();
+        if ( ! in_array( $state, array( 'absent', 'installed', 'active', 'protected', 'unknown' ), true ) || ! in_array( $visibility, array( 'shown', 'hidden' ), true ) ) {
+            return $this->abilities_v2_error( $operation, 'invalid_snapshot' );
+        }
+        $planned_action = array(
+            'absent'    => 'install',
+            'installed' => 'license',
+            'active'    => 'license',
+            'protected' => 'none',
+            'unknown'   => 'repair',
+        );
+        return array(
+            'protocol'       => '2',
+            'operation'      => $operation,
+            'ok'             => true,
+            'operation_ref'  => $payload['operation_ref'],
+            'current_state'  => $state,
+            'planned_action' => $planned_action[ $state ],
+            'package_state'  => 'absent' === $state || 'unknown' === $state ? 'verification_unavailable' : 'not_needed',
+            'visibility'     => $visibility,
+            'state_revision' => $this->abilities_v2_state_revision( $payload, $state, $visibility ),
+            'observed_at'    => gmdate( 'Y-m-d\TH:i:s\Z' ),
+        );
+    }
+
+    /**
+     * Replace and verify the local Patchstack visibility preference.
+     *
+     * @param array $payload Closed visibility payload.
+     * @return array Protocol response.
+     */
+    private function abilities_v2_visibility_replace( $payload ) { // phpcs:ignore Generic.Metrics.CyclomaticComplexity -- Explicit receipt/write/readback flow.
+        $operation = 'patchstack_visibility_replace_v2';
+        if ( ! is_array( $payload ) || ! $this->abilities_v2_exact_keys( $payload, array( 'operation_ref', 'expected_plugin_slug', 'provider_binding_digest', 'expires_at', 'desired_state', 'if_match' ) ) || ! in_array( isset( $payload['desired_state'] ) ? $payload['desired_state'] : null, array( 'shown', 'hidden' ), true ) || ! isset( $payload['if_match'] ) || ! $this->abilities_v2_hash( $payload['if_match'] ) ) {
+            return $this->abilities_v2_error( $operation, 'invalid_request' );
+        }
+        $common = array_intersect_key( $payload, array_flip( array( 'operation_ref', 'expected_plugin_slug', 'provider_binding_digest', 'expires_at' ) ) );
+        if ( ! $this->abilities_v2_valid_common_payload( $common ) ) {
+            return $this->abilities_v2_error( $operation, 'invalid_request' );
+        }
+        $effect_hash = hash( 'sha256', wp_json_encode( $payload ) );
+        $receipts    = $this->abilities_v2_read_receipts();
+        if ( false === $receipts ) {
+            return $this->abilities_v2_error( $operation, 'storage_unavailable' );
+        }
+        if ( isset( $receipts[ $payload['operation_ref'] ] ) ) {
+            $receipt = $receipts[ $payload['operation_ref'] ];
+            if ( ! hash_equals( $receipt['effect_hash'], $effect_hash ) ) {
+                return $this->abilities_v2_error( $operation, 'request_conflict' );
+            }
+            return 'completed' === $receipt['state'] ? $receipt['response'] : $this->abilities_v2_error( $operation, 'outcome_unknown' );
+        }
+
+        $receipts = array_filter(
+            $receipts,
+            static function ( $receipt ) {
+                return 'pending' === $receipt['state'] || $receipt['updated_at'] >= time() - 90 * DAY_IN_SECONDS;
+            }
+        );
+        if ( 100 <= count( $receipts ) ) {
+            return $this->abilities_v2_error( $operation, 'storage_unavailable' );
+        }
+
+        $state      = $this->abilities_v2_plugin_state();
+        $visibility = $this->abilities_v2_visibility();
+        if ( ! in_array( $state, array( 'absent', 'installed', 'active', 'protected', 'unknown' ), true ) || ! in_array( $visibility, array( 'shown', 'hidden' ), true ) ) {
+            return $this->abilities_v2_error( $operation, 'invalid_snapshot' );
+        }
+        $revision = $this->abilities_v2_state_revision( $common, $state, $visibility );
+        if ( ! hash_equals( $revision, $payload['if_match'] ) ) {
+            return $this->abilities_v2_error( $operation, 'stale_revision' );
+        }
+
+        $receipts[ $payload['operation_ref'] ] = array(
+            'effect_hash' => $effect_hash,
+            'state'       => 'pending',
+            'response'    => null,
+            'updated_at'  => time(),
+        );
+        if ( ! $this->abilities_v2_write_receipts( $receipts ) ) {
+            return $this->abilities_v2_error( $operation, 'storage_unavailable' );
+        }
+
+        $changed = $visibility !== $payload['desired_state'];
+        if ( $changed ) {
+            $write = $this->abilities_v2_write_visibility( $payload['desired_state'] );
+            if ( ! is_array( $write ) || ! $this->abilities_v2_exact_keys( $write, array( 'prior', 'current' ) ) || $visibility !== $write['prior'] || $payload['desired_state'] !== $write['current'] ) {
+                $this->abilities_v2_restore_visibility( $visibility );
+                $response = $this->abilities_v2_error( $operation, 'write_failed' );
+                return $this->abilities_v2_complete_receipt( $receipts, $payload['operation_ref'], $effect_hash, $response );
+            }
+        }
+
+        $current = $this->abilities_v2_visibility();
+        if ( $payload['desired_state'] !== $current ) {
+            $this->abilities_v2_restore_visibility( $visibility );
+            $response = $this->abilities_v2_error( $operation, 'write_failed' );
+            return $this->abilities_v2_complete_receipt( $receipts, $payload['operation_ref'], $effect_hash, $response );
+        }
+        $response = array(
+            'protocol'       => '2',
+            'operation'      => $operation,
+            'ok'             => true,
+            'operation_ref'  => $payload['operation_ref'],
+            'visibility'     => $current,
+            'changed'        => $changed,
+            'state_revision' => $this->abilities_v2_state_revision( $common, $state, $current ),
+        );
+        return $this->abilities_v2_complete_receipt( $receipts, $payload['operation_ref'], $effect_hash, $response );
+    }
+
+    /** Return the local installed/active protection state. */
+    protected function abilities_v2_plugin_state() {
+        $installed = defined( 'WP_PLUGIN_DIR' ) && file_exists( WP_PLUGIN_DIR . '/' . $this->the_plugin_slug );
+        if ( ! $installed ) {
+            return 'absent';
+        }
+        return function_exists( 'is_plugin_active' ) && is_plugin_active( $this->the_plugin_slug ) ? 'active' : 'installed';
+    }
+
+    /** Return the exact local visibility preference. */
+    protected function abilities_v2_visibility() {
+        $value = get_site_option( $this->option_hide_name, false );
+        if ( 'hide' === $value ) {
+            return 'hidden';
+        }
+        return false === $value || '' === $value ? 'shown' : false;
+    }
+
+    /**
+     * Write and read back one visibility preference.
+     *
+     * @param string $visibility Desired visibility.
+     * @return array Readback snapshot.
+     */
+    protected function abilities_v2_write_visibility( $visibility ) {
+        $prior = $this->abilities_v2_visibility();
+        update_site_option( $this->option_hide_name, 'hidden' === $visibility ? 'hide' : '' );
+        return array(
+            'prior'   => $prior,
+            'current' => $this->abilities_v2_visibility(),
+        );
+    }
+
+    /**
+     * Restore and verify one visibility preference.
+     *
+     * @param string $visibility Prior visibility.
+     * @return bool Whether restoration was verified.
+     */
+    protected function abilities_v2_restore_visibility( $visibility ) {
+        update_site_option( $this->option_hide_name, 'hidden' === $visibility ? 'hide' : '' );
+        return $visibility === $this->abilities_v2_visibility();
+    }
+
+    /** Read and validate bounded visibility receipts. */
+    protected function abilities_v2_read_receipts() {
+        $receipts = get_site_option( self::ABILITIES_V2_RECEIPTS_OPTION, array() );
+        if ( ! is_array( $receipts ) || 100 < count( $receipts ) ) {
+            return false;
+        }
+        foreach ( $receipts as $operation_ref => $receipt ) {
+            if ( ! $this->abilities_v2_valid_uuid( $operation_ref ) || ! $this->abilities_v2_valid_receipt( $receipt ) ) {
+                return false;
+            }
+        }
+        return $receipts;
+    }
+
+    /**
+     * Write and exactly read back bounded visibility receipts.
+     *
+     * @param array $receipts Receipt map.
+     * @return bool Whether persistence was verified.
+     */
+    protected function abilities_v2_write_receipts( $receipts ) {
+        if ( ! is_array( $receipts ) || 100 < count( $receipts ) ) {
+            return false;
+        }
+        update_site_option( self::ABILITIES_V2_RECEIPTS_OPTION, $receipts );
+        return get_site_option( self::ABILITIES_V2_RECEIPTS_OPTION, null ) === $receipts;
+    }
+
+    /** Acquire the local visibility mutation lock. */
+    protected function abilities_v2_begin_mutation() {
+        $now      = time();
+        $existing = get_site_option( self::ABILITIES_V2_LOCK_OPTION, null );
+        if ( is_array( $existing ) && isset( $existing['expires_at'] ) && is_int( $existing['expires_at'] ) && $existing['expires_at'] >= $now ) {
+            return false;
+        }
+        if ( null !== $existing && ( ! delete_site_option( self::ABILITIES_V2_LOCK_OPTION ) || null !== get_site_option( self::ABILITIES_V2_LOCK_OPTION, null ) ) ) {
+            return false;
+        }
+        $owner = wp_generate_uuid4();
+        $lock  = array(
+            'owner'      => $owner,
+            'expires_at' => $now + 60,
+        );
+        if ( ! add_site_option( self::ABILITIES_V2_LOCK_OPTION, $lock ) || get_site_option( self::ABILITIES_V2_LOCK_OPTION, null ) !== $lock ) {
+            return false;
+        }
+        $this->abilities_v2_lock_owner = $owner;
+        return true;
+    }
+
+    /** Release and verify the local visibility mutation lock. */
+    protected function abilities_v2_end_mutation() {
+        $lock = get_site_option( self::ABILITIES_V2_LOCK_OPTION, null );
+        if ( '' === $this->abilities_v2_lock_owner || ! is_array( $lock ) || ! isset( $lock['owner'] ) || ! is_string( $lock['owner'] ) || ! hash_equals( $this->abilities_v2_lock_owner, $lock['owner'] ) ) {
+            $this->abilities_v2_lock_owner = '';
+            return false;
+        }
+        delete_site_option( self::ABILITIES_V2_LOCK_OPTION );
+        $this->abilities_v2_lock_owner = '';
+        return null === get_site_option( self::ABILITIES_V2_LOCK_OPTION, null );
+    }
+
+    /**
+     * Complete and persist one visibility receipt.
+     *
+     * @param array  $receipts     Receipt map.
+     * @param string $operation_ref Operation reference.
+     * @param string $effect_hash   Canonical effect digest.
+     * @param array  $response      Closed response.
+     * @return array Persisted response or stable error.
+     */
+    private function abilities_v2_complete_receipt( $receipts, $operation_ref, $effect_hash, $response ) {
+        $receipts[ $operation_ref ] = array(
+            'effect_hash' => $effect_hash,
+            'state'       => 'completed',
+            'response'    => $response,
+            'updated_at'  => time(),
+        );
+        return $this->abilities_v2_write_receipts( $receipts ) ? $response : $this->abilities_v2_error( 'patchstack_visibility_replace_v2', 'outcome_unknown' );
+    }
+
+    /**
+     * Validate the shared preview/mutation binding.
+     *
+     * @param array $payload Closed payload.
+     * @return bool Whether the payload is valid.
+     */
+    private function abilities_v2_valid_common_payload( $payload ) {
+        return is_array( $payload )
+            && $this->abilities_v2_exact_keys( $payload, array( 'operation_ref', 'expected_plugin_slug', 'provider_binding_digest', 'expires_at' ) )
+            && $this->abilities_v2_valid_uuid( $payload['operation_ref'] )
+            && 'patchstack/patchstack.php' === $payload['expected_plugin_slug']
+            && $this->abilities_v2_hash( $payload['provider_binding_digest'] )
+            && is_int( $payload['expires_at'] )
+            && time() <= $payload['expires_at']
+            && time() + 600 >= $payload['expires_at'];
+    }
+
+    /**
+     * Return the bound local state revision.
+     *
+     * @param array  $payload    Bound payload.
+     * @param string $state      Plugin state.
+     * @param string $visibility Visibility state.
+     * @return string State digest.
+     */
+    private function abilities_v2_state_revision( $payload, $state, $visibility ) {
+        return hash( 'sha256', wp_json_encode( array( $payload['expected_plugin_slug'], $payload['provider_binding_digest'], $state, $visibility ) ) );
+    }
+
+    /**
+     * Validate one durable receipt.
+     *
+     * @param mixed $receipt Receipt value.
+     * @return bool Whether the receipt is valid.
+     */
+    private function abilities_v2_valid_receipt( $receipt ) {
+        return is_array( $receipt )
+            && $this->abilities_v2_exact_keys( $receipt, array( 'effect_hash', 'state', 'response', 'updated_at' ) )
+            && $this->abilities_v2_hash( $receipt['effect_hash'] )
+            && in_array( $receipt['state'], array( 'pending', 'completed' ), true )
+            && ( ( 'pending' === $receipt['state'] && null === $receipt['response'] ) || ( 'completed' === $receipt['state'] && $this->abilities_v2_valid_visibility_response( $receipt['response'] ) ) )
+            && is_int( $receipt['updated_at'] )
+            && 0 < $receipt['updated_at'];
+    }
+
+    /**
+     * Validate one closed visibility receipt response.
+     *
+     * @param mixed $response Response value.
+     * @return bool Whether the response is valid.
+     */
+    private function abilities_v2_valid_visibility_response( $response ) {
+        if ( ! is_array( $response ) || ! isset( $response['ok'] ) || ! is_bool( $response['ok'] ) || '2' !== ( isset( $response['protocol'] ) ? $response['protocol'] : null ) || 'patchstack_visibility_replace_v2' !== ( isset( $response['operation'] ) ? $response['operation'] : null ) ) {
+            return false;
+        }
+        if ( false === $response['ok'] ) {
+            return $this->abilities_v2_exact_keys( $response, array( 'protocol', 'operation', 'ok', 'code' ) )
+                && is_string( $response['code'] )
+                && in_array( $response['code'], array( 'write_failed', 'outcome_unknown' ), true );
+        }
+        return $this->abilities_v2_exact_keys( $response, array( 'protocol', 'operation', 'ok', 'operation_ref', 'visibility', 'changed', 'state_revision' ) )
+            && $this->abilities_v2_valid_uuid( $response['operation_ref'] )
+            && in_array( $response['visibility'], array( 'shown', 'hidden' ), true )
+            && is_bool( $response['changed'] )
+            && $this->abilities_v2_hash( $response['state_revision'] );
+    }
+
+    /**
+     * Validate a UUID operation reference.
+     *
+     * @param mixed $value Candidate value.
+     * @return bool Whether the value is valid.
+     */
+    private function abilities_v2_valid_uuid( $value ) {
+        return is_string( $value ) && 1 === preg_match( '/^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/D', $value );
+    }
+
+    /**
+     * Validate a SHA-256 digest.
+     *
+     * @param mixed $value Candidate value.
+     * @return bool Whether the value is valid.
+     */
+    private function abilities_v2_hash( $value ) {
+        return is_string( $value ) && 1 === preg_match( '/^[a-f0-9]{64}$/D', $value );
+    }
+
+    /**
+     * Check that an array contains exactly the expected keys.
+     *
+     * @param array $value Value to inspect.
+     * @param array $keys  Expected keys.
+     * @return bool
+     */
+    private function abilities_v2_exact_keys( $value, $keys ) {
+        if ( ! is_array( $value ) ) {
+            return false;
+        }
+
+        $actual = array_keys( $value );
+        sort( $actual );
+        sort( $keys );
+        return $actual === $keys;
+    }
+
+    /**
+     * Build a closed Patchstack abilities error response.
+     *
+     * @param string $operation Operation name.
+     * @param string $code      Stable error code.
+     * @return array
+     */
+    private function abilities_v2_error( $operation, $code ) {
+        return array(
+            'protocol'  => '2',
+            'operation' => is_string( $operation ) && '' !== $operation ? $operation : 'unknown',
+            'ok'        => false,
+            'code'      => $code,
+        );
     }
 
     /**
@@ -185,7 +628,7 @@ class MainWP_Child_Patchstack { //phpcs:ignore -- NOSONAR - multi methods.
             }
         }
 
-        $pos = isset( $_SERVER['REQUEST_URI'] ) ? stripos( wp_unslash( $_SERVER['REQUEST_URI'] ), 'options-general.php?page=patchstack' ) : false;
+        $pos = isset( $_SERVER['REQUEST_URI'] ) ? stripos( sanitize_text_field( wp_unslash( $_SERVER['REQUEST_URI'] ) ), 'options-general.php?page=patchstack' ) : false;
         if ( false !== $pos ) {
             wp_safe_redirect( get_option( 'siteurl' ) . '/wp-admin/index.php' );
             exit();

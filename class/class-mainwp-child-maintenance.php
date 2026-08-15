@@ -24,6 +24,22 @@ if ( ! defined( 'ABSPATH' ) ) {
  */
 class MainWP_Child_Maintenance {
 
+    /** Durable bounded v2 operation records. */
+    const ABILITIES_V2_OPERATIONS_OPTION = 'mainwp_child_maintenance_v2_operations';
+
+    /** Maximum retained v2 operations. */
+    const ABILITIES_V2_MAX_OPERATIONS = 100;
+
+    /** Atomic v2 mutation lock. */
+    const ABILITIES_V2_LOCK_OPTION = 'mainwp_child_maintenance_v2_lock';
+
+    /**
+     * Current v2 mutation-lock owner.
+     *
+     * @var string
+     */
+    private $abilities_v2_lock_owner = '';
+
     /**
      * Public static variable to hold the single instance of the class.
      *
@@ -77,6 +93,13 @@ class MainWP_Child_Maintenance {
         // phpcs:disable WordPress.Security.NonceVerification
         if ( isset( $_POST['action'] ) ) {
             $action = MainWP_System::instance()->validate_params( 'action' );
+            if ( 'abilities_v2' === $action ) {
+                // phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized -- Bounded JSON is decoded and closed-schema validated below.
+                $raw_request = isset( $_POST['request'] ) && is_string( $_POST['request'] ) ? wp_unslash( $_POST['request'] ) : '';
+                $request     = 4096 >= strlen( $raw_request ) ? json_decode( $raw_request, true ) : null;
+                MainWP_Helper::write( $this->abilities_v2( $request ) );
+                return;
+            }
             $this->maintenance_action( $action ); // exit.
         }
 
@@ -92,6 +115,1021 @@ class MainWP_Child_Maintenance {
         $information = $this->maintenance_db( $maint_options, $max_revisions );
 
         MainWP_Helper::write( $information );
+    }
+
+    /**
+     * Negotiate the additive Maintenance abilities protocol.
+     *
+     * Domain operations remain unavailable until their closed adapters and
+     * postcondition tests are implemented.
+     *
+     * @param mixed $request Decoded request object.
+     * @return array<string,mixed> Closed protocol response.
+     */
+    public function abilities_v2( $request ) {
+        $operation = is_array( $request ) && isset( $request['operation'] ) && is_string( $request['operation'] ) ? $request['operation'] : 'unknown';
+        if ( ! is_array( $request ) || ! $this->abilities_v2_exact_keys( $request, array( 'protocol', 'operation', 'payload' ) ) || '2' !== $request['protocol'] || ! is_array( $request['payload'] ) ) {
+            return $this->abilities_v2_error( 'unknown', 'invalid_request' );
+        }
+
+        if ( 'capabilities' === $operation && array() === $request['payload'] ) {
+            return array(
+                'protocol'           => '2',
+                'operation'          => 'capabilities',
+                'ok'                 => true,
+                'operations'         => array( 'ability_maintenance_preview_v2', 'ability_maintenance_execute_v2', 'ability_maintenance_operation_v2' ),
+                'mutation_supported' => true,
+            );
+        }
+
+        if ( 'ability_maintenance_preview_v2' === $operation ) {
+            return $this->abilities_v2_preview( $request['payload'] );
+        }
+        if ( 'ability_maintenance_execute_v2' === $operation ) {
+            if ( ! $this->abilities_v2_begin_mutation() ) {
+                return $this->abilities_v2_error( $operation, 'lock_busy' );
+            }
+            $result   = $this->abilities_v2_execute( $request['payload'] );
+            $released = $this->abilities_v2_end_mutation();
+            return $released ? $result : $this->abilities_v2_error( $operation, 'outcome_unknown' );
+        }
+        if ( 'ability_maintenance_operation_v2' === $operation ) {
+            return $this->abilities_v2_operation( $request['payload'] );
+        }
+
+        return $this->abilities_v2_error( $operation, 'unsupported_operation' );
+    }
+
+    /**
+     * Return a read-only bounded maintenance impact preview.
+     *
+     * @param array $payload Closed preview payload.
+     * @return array<string,mixed> Closed preview response.
+     */
+    private function abilities_v2_preview( $payload ) {
+        $operation = 'ability_maintenance_preview_v2';
+        if ( ! $this->abilities_v2_exact_keys( $payload, array( 'actions', 'revision_retention' ) ) || ! is_array( $payload['actions'] ) || ! is_int( $payload['revision_retention'] ) || 0 > $payload['revision_retention'] || 1000 < $payload['revision_retention'] ) {
+            return $this->abilities_v2_error( $operation, 'invalid_request' );
+        }
+
+        $catalog = array( 'revisions', 'autodraft', 'trashpost', 'spam', 'pending', 'trashcomment', 'tags', 'categories', 'optimize', 'transients_expired', 'transients_all' );
+        $count   = count( $payload['actions'] );
+        if ( 1 > $count || 11 < $count || array_keys( $payload['actions'] ) !== range( 0, $count - 1 ) ) {
+            return $this->abilities_v2_error( $operation, 'invalid_request' );
+        }
+        $selected = array();
+        foreach ( $payload['actions'] as $action ) {
+            if ( ! is_string( $action ) || ! in_array( $action, $catalog, true ) || isset( $selected[ $action ] ) ) {
+                return $this->abilities_v2_error( $operation, 'invalid_request' );
+            }
+            $selected[ $action ] = true;
+        }
+        if ( isset( $selected['transients_expired'], $selected['transients_all'] ) ) {
+            return $this->abilities_v2_error( $operation, 'invalid_request' );
+        }
+
+        $impacts = array();
+        foreach ( $catalog as $action ) {
+            if ( ! isset( $selected[ $action ] ) ) {
+                continue;
+            }
+            $impact = $this->abilities_v2_preview_impact( $action, $payload['revision_retention'] );
+            if ( ! is_array( $impact ) || ! $this->abilities_v2_exact_keys( $impact, array( 'would_affect', 'capability' ) ) || ! is_int( $impact['would_affect'] ) || 0 > $impact['would_affect'] || ! is_bool( $impact['capability'] ) ) {
+                return $this->abilities_v2_error( $operation, 'invalid_snapshot' );
+            }
+            $impacts[] = array(
+                'action'       => $action,
+                'would_affect' => min( 1000000, $impact['would_affect'] ),
+                'risk'         => $this->abilities_v2_action_risk( $action, $payload['revision_retention'] ),
+                'capability'   => $impact['capability'],
+            );
+        }
+
+        $observed_at = gmdate( 'Y-m-d\TH:i:s\Z' );
+        return array(
+            'protocol'          => '2',
+            'operation'         => $operation,
+            'ok'                => true,
+            'impacts'           => $impacts,
+            'snapshot_revision' => hash( 'sha256', wp_json_encode( array( $payload['revision_retention'], $impacts ) ) ),
+            'observed_at'       => $observed_at,
+        );
+    }
+
+    /**
+     * Calculate one read-only maintenance impact.
+     *
+     * @param string $action             Canonical action.
+     * @param int    $revision_retention Revisions retained.
+     * @return array<string,int|bool>|false
+     */
+    protected function abilities_v2_preview_impact( $action, $revision_retention ) { // phpcs:ignore Generic.Metrics.CyclomaticComplexity -- Closed action switch is intentional.
+        global $wpdb;
+
+        if ( in_array( $action, array( 'transients_expired', 'transients_all' ), true ) && function_exists( 'wp_using_ext_object_cache' ) && wp_using_ext_object_cache() ) {
+            return array(
+                'would_affect' => 0,
+                'capability'   => false,
+            );
+        }
+
+        $sql = '';
+        if ( 'revisions' === $action ) {
+            if ( 0 === $revision_retention ) {
+                $sql = "SELECT COUNT(*) FROM $wpdb->posts WHERE post_type = 'revision'";
+            } else {
+                $sql = $wpdb->prepare( "SELECT COALESCE(SUM(revision_count - %d), 0) FROM (SELECT COUNT(*) revision_count FROM $wpdb->posts WHERE post_type = 'revision' GROUP BY post_parent HAVING COUNT(*) > %d) maintenance_revision_counts", $revision_retention, $revision_retention );
+            }
+        } elseif ( 'autodraft' === $action ) {
+            $sql = "SELECT COUNT(*) FROM $wpdb->posts WHERE post_status = 'auto-draft'";
+        } elseif ( 'trashpost' === $action ) {
+            $sql = "SELECT COUNT(*) FROM $wpdb->posts WHERE post_status = 'trash'";
+        } elseif ( 'spam' === $action ) {
+            $sql = "SELECT COUNT(*) FROM $wpdb->comments WHERE comment_approved = 'spam'";
+        } elseif ( 'pending' === $action ) {
+            $sql = "SELECT COUNT(*) FROM $wpdb->comments WHERE comment_approved = '0'";
+        } elseif ( 'trashcomment' === $action ) {
+            $sql = "SELECT COUNT(*) FROM $wpdb->comments WHERE comment_approved = 'trash'";
+        }
+        if ( '' !== $sql ) {
+            return $this->abilities_v2_preview_sql_count( $sql );
+        }
+
+        if ( 'tags' === $action || 'categories' === $action ) {
+            $taxonomy = 'tags' === $action ? 'post_tag' : 'category';
+            $terms    = get_terms(
+                array(
+                    'taxonomy'   => $taxonomy,
+                    'hide_empty' => false,
+                )
+            );
+            if ( is_wp_error( $terms ) || ! is_array( $terms ) ) {
+                return false;
+            }
+            $default_category = (int) get_option( 'default_category', 0 );
+            $would_affect     = 0;
+            foreach ( $terms as $term ) {
+                if ( ! is_object( $term ) || ! isset( $term->term_id, $term->count ) ) {
+                    return false;
+                }
+                if ( 0 === (int) $term->count && ( 'category' !== $taxonomy || $default_category !== (int) $term->term_id ) ) {
+                    ++$would_affect;
+                }
+            }
+            return array(
+                'would_affect' => $would_affect,
+                'capability'   => true,
+            );
+        }
+
+        if ( 'optimize' === $action ) {
+            $wpdb->last_error = '';
+            // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Read-only preview of current-blog tables.
+            $tables = $wpdb->get_results( 'SHOW TABLE STATUS FROM `' . esc_sql( DB_NAME ) . '`', ARRAY_A );
+            if ( '' !== $wpdb->last_error || ! is_array( $tables ) ) {
+                return false;
+            }
+            $would_affect = 0;
+            foreach ( $tables as $table ) {
+                if ( ! is_array( $table ) || ! isset( $table['Name'] ) || ! is_string( $table['Name'] ) ) {
+                    return false;
+                }
+                if ( 0 === strpos( $table['Name'], $wpdb->prefix ) ) {
+                    ++$would_affect;
+                }
+            }
+            return array(
+                'would_affect' => $would_affect,
+                'capability'   => true,
+            );
+        }
+
+        if ( 'transients_expired' === $action ) {
+            return $this->abilities_v2_preview_transients( true );
+        }
+        if ( 'transients_all' === $action ) {
+            return $this->abilities_v2_preview_transients( false );
+        }
+
+        return false;
+    }
+
+    /**
+     * Return a stable action risk class.
+     *
+     * @param string $action             Canonical action.
+     * @param int    $revision_retention Revisions retained.
+     * @return string
+     */
+    private function abilities_v2_action_risk( $action, $revision_retention ) {
+        if ( ( 'revisions' === $action && 0 === $revision_retention ) || in_array( $action, array( 'pending', 'tags', 'categories', 'optimize', 'transients_all' ), true ) ) {
+            return 'elevated';
+        }
+        return 'standard';
+    }
+
+    /**
+     * Run a checked scalar count query.
+     *
+     * @param string $sql Read-only count query.
+     * @return array<string,int|bool>|false
+     */
+    private function abilities_v2_preview_sql_count( $sql ) {
+        global $wpdb;
+        $wpdb->last_error = '';
+        // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared -- Query is assembled only from fixed statements above.
+        $value = $wpdb->get_var( $sql );
+        if ( '' !== $wpdb->last_error || ! is_numeric( $value ) || 0 > (int) $value ) {
+            return false;
+        }
+        return array(
+            'would_affect' => (int) $value,
+            'capability'   => true,
+        );
+    }
+
+    /**
+     * Count unique transient names without deleting cache data.
+     *
+     * @param bool $expired_only Whether only expired transients are counted.
+     * @return array<string,int|bool>|false
+     */
+    private function abilities_v2_preview_transients( $expired_only ) {
+        global $wpdb;
+        $now              = time();
+        $transient_prefix = $expired_only ? '_transient_timeout_' : '_transient_';
+        $site_prefix      = $expired_only ? '_site_transient_timeout_' : '_site_transient_';
+        $wpdb->last_error = '';
+        // phpcs:disable WordPress.DB.PreparedSQL.NotPrepared -- Placeholder-bearing fixed query structures are prepared in each branch before execution.
+        $sql = "SELECT option_name FROM $wpdb->options WHERE option_name LIKE %s";
+        if ( $expired_only ) {
+            $sql .= ' AND option_value < %d';
+            $sql  = $wpdb->prepare( $sql, $wpdb->esc_like( $transient_prefix ) . '%', $now );
+        } else {
+            $sql = $wpdb->prepare( $sql, $wpdb->esc_like( $transient_prefix ) . '%' );
+        }
+        // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Read-only preview of transient keys.
+        $names = $wpdb->get_col( $sql );
+        if ( '' !== $wpdb->last_error || ! is_array( $names ) ) {
+            return false;
+        }
+
+        $wpdb->last_error = '';
+        $column           = is_multisite() ? 'meta_key' : 'option_name';
+        $table            = is_multisite() ? $wpdb->sitemeta : $wpdb->options;
+        $value_column     = is_multisite() ? 'meta_value' : 'option_value';
+        $site_sql         = "SELECT $column FROM $table WHERE $column LIKE %s";
+        if ( $expired_only ) {
+            $site_sql .= " AND $value_column < %d";
+            $site_sql  = $wpdb->prepare( $site_sql, $wpdb->esc_like( $site_prefix ) . '%', $now );
+        } else {
+            $site_sql = $wpdb->prepare( $site_sql, $wpdb->esc_like( $site_prefix ) . '%' );
+        }
+        // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- Table and column names are fixed WordPress properties.
+        $site_names = $wpdb->get_col( $site_sql );
+        if ( '' !== $wpdb->last_error || ! is_array( $site_names ) ) {
+            return false;
+        }
+        // phpcs:enable WordPress.DB.PreparedSQL.NotPrepared
+
+        $keys = array();
+        foreach ( $names as $name ) {
+            if ( is_string( $name ) ) {
+                $keys[ 'local:' . str_replace( $transient_prefix, '', $name ) ] = true;
+            }
+        }
+        foreach ( $site_names as $name ) {
+            if ( is_string( $name ) ) {
+                $keys[ 'site:' . str_replace( $site_prefix, '', $name ) ] = true;
+            }
+        }
+        return array(
+            'would_affect' => count( $keys ),
+            'capability'   => true,
+        );
+    }
+
+    /**
+     * Execute one exact maintenance effect with durable replay protection.
+     *
+     * @param array $payload Closed execute payload.
+     * @return array<string,mixed> Closed operation response.
+     */
+    private function abilities_v2_execute( $payload ) { // phpcs:ignore Generic.Metrics.CyclomaticComplexity -- Explicit durable transition flow.
+        $operation = 'ability_maintenance_execute_v2';
+        if ( ! is_array( $payload ) || ! $this->abilities_v2_exact_keys( $payload, array( 'operation_ref', 'actions', 'revision_retention', 'snapshot_revision', 'action_hash' ) ) || ! $this->abilities_v2_valid_uuid( $payload['operation_ref'] ) || ! $this->abilities_v2_hash( $payload['snapshot_revision'] ) || ! $this->abilities_v2_hash( $payload['action_hash'] ) || ! is_int( $payload['revision_retention'] ) || 0 > $payload['revision_retention'] || 1000 < $payload['revision_retention'] ) {
+            return $this->abilities_v2_error( $operation, 'invalid_request' );
+        }
+
+        $actions = $this->abilities_v2_canonical_actions( $payload['actions'] );
+        if ( false === $actions ) {
+            return $this->abilities_v2_error( $operation, 'invalid_request' );
+        }
+        $action_hash = hash( 'sha256', wp_json_encode( array( $actions, $payload['revision_retention'] ) ) );
+        if ( ! hash_equals( $action_hash, $payload['action_hash'] ) ) {
+            return $this->abilities_v2_error( $operation, 'invalid_request' );
+        }
+        $effect_hash = hash( 'sha256', wp_json_encode( array( $payload['operation_ref'], $actions, $payload['revision_retention'], $payload['snapshot_revision'], $action_hash ) ) );
+        $records     = $this->abilities_v2_read_operations();
+        if ( false === $records ) {
+            return $this->abilities_v2_error( $operation, 'storage_unavailable' );
+        }
+        if ( isset( $records[ $payload['operation_ref'] ] ) ) {
+            $record = $records[ $payload['operation_ref'] ];
+            if ( ! hash_equals( $record['effect_hash'], $effect_hash ) ) {
+                return $this->abilities_v2_error( $operation, 'request_conflict' );
+            }
+            return $this->abilities_v2_project_operation( $record, $operation );
+        }
+
+        $preview = $this->abilities_v2_preview(
+            array(
+                'actions'            => $actions,
+                'revision_retention' => $payload['revision_retention'],
+            )
+        );
+        if ( ! isset( $preview['ok'] ) || true !== $preview['ok'] || ! isset( $preview['snapshot_revision'] ) || ! is_string( $preview['snapshot_revision'] ) ) {
+            return $this->abilities_v2_error( $operation, 'invalid_snapshot' );
+        }
+        if ( ! hash_equals( $preview['snapshot_revision'], $payload['snapshot_revision'] ) ) {
+            return $this->abilities_v2_error( $operation, 'stale_snapshot' );
+        }
+        foreach ( $preview['impacts'] as $impact ) {
+            if ( ! isset( $impact['capability'] ) || true !== $impact['capability'] ) {
+                return $this->abilities_v2_error( $operation, 'unsupported' );
+            }
+        }
+
+        $now                                  = time();
+        $record                               = array(
+            'operation_ref'      => $payload['operation_ref'],
+            'effect_hash'        => $effect_hash,
+            'action_hash'        => $action_hash,
+            'snapshot_revision'  => $payload['snapshot_revision'],
+            'actions'            => $actions,
+            'revision_retention' => $payload['revision_retention'],
+            'status'             => 'running',
+            'outcomes'           => array(),
+            'accepted_at'        => $now,
+            'finished_at'        => null,
+            'retryable'          => false,
+            'report_emitted'     => false,
+            'updated_at'         => $now,
+        );
+        $records[ $payload['operation_ref'] ] = $record;
+        if ( ! $this->abilities_v2_write_operations( $records ) ) {
+            return $this->abilities_v2_error( $operation, 'storage_unavailable' );
+        }
+
+        $successful = array();
+        foreach ( $actions as $action ) {
+            if ( ! $this->abilities_v2_renew_mutation() ) {
+                return $this->abilities_v2_error( $operation, 'outcome_unknown' );
+            }
+            $outcome = $this->abilities_v2_execute_action( $action, $payload['revision_retention'] );
+            if ( ! $this->abilities_v2_valid_action_outcome( $outcome ) ) {
+                $outcome = array(
+                    'status'     => 'unknown',
+                    'affected'   => null,
+                    'error_code' => 'outcome_unknown',
+                );
+            }
+            $record['outcomes'][] = array(
+                'action'     => $action,
+                'status'     => $outcome['status'],
+                'affected'   => $outcome['affected'],
+                'error_code' => $outcome['error_code'],
+            );
+            if ( 'succeeded' === $outcome['status'] ) {
+                $successful[] = $action;
+            }
+            $record['updated_at']                 = time();
+            $records[ $payload['operation_ref'] ] = $record;
+            if ( ! $this->abilities_v2_write_operations( $records ) ) {
+                return $this->abilities_v2_error( $operation, 'outcome_unknown' );
+            }
+        }
+
+        if ( ! empty( $successful ) ) {
+            $this->abilities_v2_emit_report( $successful, $payload['revision_retention'] );
+            $record['report_emitted'] = true;
+        }
+        $statuses                             = array_column( $record['outcomes'], 'status' );
+        $succeeded                            = count(
+            array_filter(
+                $statuses,
+                static function ( $status ) {
+                    return 'succeeded' === $status;
+                }
+            )
+        );
+        $record['status']                     = in_array( 'unknown', $statuses, true ) ? 'unknown' : ( count( $statuses ) === $succeeded ? 'succeeded' : ( 0 < $succeeded ? 'partial' : 'failed' ) );
+        $record['finished_at']                = time();
+        $record['updated_at']                 = $record['finished_at'];
+        $record['retryable']                  = 'failed' === $record['status'];
+        $records[ $payload['operation_ref'] ] = $record;
+        if ( ! $this->abilities_v2_write_operations( $records ) ) {
+            return $this->abilities_v2_error( $operation, 'outcome_unknown' );
+        }
+
+        return $this->abilities_v2_project_operation( $record, $operation );
+    }
+
+    /**
+     * Read one durable maintenance operation.
+     *
+     * @param array $payload Closed status payload.
+     * @return array<string,mixed> Closed operation response.
+     */
+    private function abilities_v2_operation( $payload ) {
+        $operation = 'ability_maintenance_operation_v2';
+        if ( ! is_array( $payload ) || ! $this->abilities_v2_exact_keys( $payload, array( 'operation_ref' ) ) || ! $this->abilities_v2_valid_uuid( $payload['operation_ref'] ) ) {
+            return $this->abilities_v2_error( $operation, 'invalid_request' );
+        }
+        $records = $this->abilities_v2_read_operations();
+        if ( false === $records ) {
+            return $this->abilities_v2_error( $operation, 'storage_unavailable' );
+        }
+        if ( ! isset( $records[ $payload['operation_ref'] ] ) ) {
+            return $this->abilities_v2_error( $operation, 'operation_not_found' );
+        }
+        return $this->abilities_v2_project_operation( $records[ $payload['operation_ref'] ], $operation );
+    }
+
+    /**
+     * Execute one checked cleanup action.
+     *
+     * @param string $action             Canonical action.
+     * @param int    $revision_retention Revisions retained.
+     * @return array<string,int|string|null>|false
+     */
+    protected function abilities_v2_execute_action( $action, $revision_retention ) { // phpcs:ignore Generic.Metrics.CyclomaticComplexity -- Closed action switch.
+        if ( in_array( $action, array( 'transients_expired', 'transients_all' ), true ) && function_exists( 'wp_using_ext_object_cache' ) && wp_using_ext_object_cache() ) {
+            return $this->abilities_v2_failed_outcome( 'unsupported' );
+        }
+        if ( 'revisions' === $action ) {
+            return $this->abilities_v2_delete_revisions( $revision_retention );
+        }
+        $sql_actions = array(
+            'autodraft'    => array( 'posts', "post_status = 'auto-draft'" ),
+            'trashpost'    => array( 'posts', "post_status = 'trash'" ),
+            'spam'         => array( 'comments', "comment_approved = 'spam'" ),
+            'pending'      => array( 'comments', "comment_approved = '0'" ),
+            'trashcomment' => array( 'comments', "comment_approved = 'trash'" ),
+        );
+        if ( isset( $sql_actions[ $action ] ) ) {
+            return $this->abilities_v2_delete_rows( $sql_actions[ $action ][0], $sql_actions[ $action ][1] );
+        }
+        if ( 'tags' === $action || 'categories' === $action ) {
+            return $this->abilities_v2_delete_terms( 'tags' === $action ? 'post_tag' : 'category' );
+        }
+        if ( 'optimize' === $action ) {
+            return $this->abilities_v2_optimize_tables();
+        }
+        if ( 'transients_expired' === $action || 'transients_all' === $action ) {
+            return $this->abilities_v2_delete_transients( 'transients_expired' === $action );
+        }
+        return false;
+    }
+
+    /**
+     * Read, validate and prune durable operation records.
+     *
+     * @return array<string,array>|false
+     */
+    protected function abilities_v2_read_operations() {
+        $records = get_option( self::ABILITIES_V2_OPERATIONS_OPTION, array() );
+        if ( ! is_array( $records ) || self::ABILITIES_V2_MAX_OPERATIONS < count( $records ) ) {
+            return false;
+        }
+        foreach ( $records as $operation_ref => $record ) {
+            if ( ! is_string( $operation_ref ) || ! $this->abilities_v2_valid_operation_record( $record ) || ! hash_equals( $operation_ref, $record['operation_ref'] ) ) {
+                return false;
+            }
+        }
+        return $records;
+    }
+
+    /**
+     * Persist and exactly read back durable operation records.
+     *
+     * @param array $records Operation records.
+     * @return bool
+     */
+    protected function abilities_v2_write_operations( $records ) {
+        if ( ! is_array( $records ) ) {
+            return false;
+        }
+        $cutoff = time() - ( 7 * DAY_IN_SECONDS );
+        foreach ( $records as $operation_ref => $record ) {
+            if ( ! $this->abilities_v2_valid_operation_record( $record ) || ! hash_equals( $operation_ref, $record['operation_ref'] ) ) {
+                return false;
+            }
+            if ( null !== $record['finished_at'] && $record['finished_at'] < $cutoff ) {
+                unset( $records[ $operation_ref ] );
+            }
+        }
+        if ( self::ABILITIES_V2_MAX_OPERATIONS < count( $records ) ) {
+            return false;
+        }
+        update_option( self::ABILITIES_V2_OPERATIONS_OPTION, $records, false );
+        return get_option( self::ABILITIES_V2_OPERATIONS_OPTION, null ) === $records;
+    }
+
+    /**
+     * Emit one legacy report event for a durable successful action set.
+     *
+     * @param array $actions            Successful actions.
+     * @param int   $revision_retention Revisions retained.
+     * @return void
+     */
+    protected function abilities_v2_emit_report( $actions, $revision_retention ) {
+        if ( has_action( 'mainwp_reports_maintenance' ) ) {
+            $details = array_map(
+                static function ( $action ) use ( $revision_retention ) {
+                    return 'revisions' === $action && 0 < $revision_retention ? 'revisions_max' : $action;
+                },
+                $actions
+            );
+            do_action( 'mainwp_reports_maintenance', 'Maintenance Performed', time(), implode( ',', $details ), 'Maintenance Performed', $revision_retention );
+        }
+    }
+
+    /** Acquire the exact Child mutation lock. */
+    protected function abilities_v2_begin_mutation() {
+        $now      = time();
+        $existing = get_option( self::ABILITIES_V2_LOCK_OPTION, null );
+        if ( is_array( $existing ) && $this->abilities_v2_exact_keys( $existing, array( 'owner', 'expires_at' ) ) && is_string( $existing['owner'] ) && is_int( $existing['expires_at'] ) && $existing['expires_at'] >= $now ) {
+            return false;
+        }
+        if ( null !== $existing ) {
+            delete_option( self::ABILITIES_V2_LOCK_OPTION );
+            if ( null !== get_option( self::ABILITIES_V2_LOCK_OPTION, null ) ) {
+                return false;
+            }
+        }
+        $owner = wp_generate_uuid4();
+        $lock  = array(
+            'owner'      => $owner,
+            'expires_at' => $now + 300,
+        );
+        if ( ! add_option( self::ABILITIES_V2_LOCK_OPTION, $lock, '', false ) || get_option( self::ABILITIES_V2_LOCK_OPTION, null ) !== $lock ) {
+            return false;
+        }
+        $this->abilities_v2_lock_owner = $owner;
+        return true;
+    }
+
+    /** Renew and verify the exact Child mutation lock. */
+    protected function abilities_v2_renew_mutation() {
+        $lock = get_option( self::ABILITIES_V2_LOCK_OPTION, null );
+        if ( '' === $this->abilities_v2_lock_owner || ! is_array( $lock ) || ! $this->abilities_v2_exact_keys( $lock, array( 'owner', 'expires_at' ) ) || ! is_string( $lock['owner'] ) || ! hash_equals( $this->abilities_v2_lock_owner, $lock['owner'] ) ) {
+            return false;
+        }
+        $renewed = array(
+            'owner'      => $lock['owner'],
+            'expires_at' => time() + 300,
+        );
+        update_option( self::ABILITIES_V2_LOCK_OPTION, $renewed, false );
+        return get_option( self::ABILITIES_V2_LOCK_OPTION, null ) === $renewed;
+    }
+
+    /** Release and verify the exact Child mutation lock. */
+    protected function abilities_v2_end_mutation() {
+        $lock = get_option( self::ABILITIES_V2_LOCK_OPTION, null );
+        if ( '' === $this->abilities_v2_lock_owner || ! is_array( $lock ) || ! isset( $lock['owner'] ) || ! is_string( $lock['owner'] ) || ! hash_equals( $this->abilities_v2_lock_owner, $lock['owner'] ) ) {
+            $this->abilities_v2_lock_owner = '';
+            return false;
+        }
+        delete_option( self::ABILITIES_V2_LOCK_OPTION );
+        $this->abilities_v2_lock_owner = '';
+        return null === get_option( self::ABILITIES_V2_LOCK_OPTION, null );
+    }
+
+    /**
+     * Canonicalize a closed action set.
+     *
+     * @param mixed $actions Requested actions.
+     * @return array<int,string>|false
+     */
+    private function abilities_v2_canonical_actions( $actions ) {
+        $catalog = array( 'revisions', 'autodraft', 'trashpost', 'spam', 'pending', 'trashcomment', 'tags', 'categories', 'optimize', 'transients_expired', 'transients_all' );
+        if ( ! is_array( $actions ) || empty( $actions ) || 11 < count( $actions ) || array_keys( $actions ) !== range( 0, count( $actions ) - 1 ) ) {
+            return false;
+        }
+        $selected = array();
+        foreach ( $actions as $action ) {
+            if ( ! is_string( $action ) || ! in_array( $action, $catalog, true ) || isset( $selected[ $action ] ) ) {
+                return false;
+            }
+            $selected[ $action ] = true;
+        }
+        if ( isset( $selected['transients_expired'], $selected['transients_all'] ) ) {
+            return false;
+        }
+        return array_values(
+            array_filter(
+                $catalog,
+                static function ( $action ) use ( $selected ) {
+                    return isset( $selected[ $action ] );
+                }
+            )
+        );
+    }
+
+    /**
+     * Validate a UUID-valued operation reference.
+     *
+     * @param mixed $value Candidate value.
+     * @return bool
+     */
+    private function abilities_v2_valid_uuid( $value ) {
+        return is_string( $value ) && 1 === preg_match( '/^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/D', $value );
+    }
+
+    /**
+     * Validate a SHA-256 value.
+     *
+     * @param mixed $value Candidate value.
+     * @return bool
+     */
+    private function abilities_v2_hash( $value ) {
+        return is_string( $value ) && 1 === preg_match( '/^[a-f0-9]{64}$/D', $value );
+    }
+
+    /**
+     * Validate one protected action outcome.
+     *
+     * @param mixed $outcome Outcome.
+     * @return bool
+     */
+    private function abilities_v2_valid_action_outcome( $outcome ) {
+        if ( ! is_array( $outcome ) || ! $this->abilities_v2_exact_keys( $outcome, array( 'status', 'affected', 'error_code' ) ) || ! in_array( $outcome['status'], array( 'succeeded', 'failed', 'unknown' ), true ) ) {
+            return false;
+        }
+        if ( 'succeeded' === $outcome['status'] ) {
+            return is_int( $outcome['affected'] ) && 0 <= $outcome['affected'] && null === $outcome['error_code'];
+        }
+        return null === $outcome['affected'] && in_array( $outcome['error_code'], array( 'mutation_failed', 'unsupported', 'outcome_unknown' ), true );
+    }
+
+    /**
+     * Validate one durable operation record.
+     *
+     * @param mixed $record Candidate record.
+     * @return bool
+     */
+    private function abilities_v2_valid_operation_record( $record ) { // phpcs:ignore Generic.Metrics.CyclomaticComplexity -- Closed durable row validator.
+        $keys = array( 'operation_ref', 'effect_hash', 'action_hash', 'snapshot_revision', 'actions', 'revision_retention', 'status', 'outcomes', 'accepted_at', 'finished_at', 'retryable', 'report_emitted', 'updated_at' );
+        if ( ! is_array( $record ) || array_keys( $record ) !== $keys || ! $this->abilities_v2_valid_uuid( $record['operation_ref'] ) || ! $this->abilities_v2_hash( $record['effect_hash'] ) || ! $this->abilities_v2_hash( $record['action_hash'] ) || ! $this->abilities_v2_hash( $record['snapshot_revision'] ) || false === $this->abilities_v2_canonical_actions( $record['actions'] ) || ! is_int( $record['revision_retention'] ) || 0 > $record['revision_retention'] || 1000 < $record['revision_retention'] || ! in_array( $record['status'], array( 'running', 'succeeded', 'partial', 'failed', 'unknown' ), true ) || ! is_array( $record['outcomes'] ) || 11 < count( $record['outcomes'] ) || ! is_int( $record['accepted_at'] ) || 0 >= $record['accepted_at'] || ! is_bool( $record['retryable'] ) || ! is_bool( $record['report_emitted'] ) || ! is_int( $record['updated_at'] ) || $record['updated_at'] < $record['accepted_at'] ) {
+            return false;
+        }
+        $expected_action_hash = hash( 'sha256', wp_json_encode( array( $record['actions'], $record['revision_retention'] ) ) );
+        $expected_effect_hash = hash( 'sha256', wp_json_encode( array( $record['operation_ref'], $record['actions'], $record['revision_retention'], $record['snapshot_revision'], $expected_action_hash ) ) );
+        if ( ! hash_equals( $expected_action_hash, $record['action_hash'] ) || ! hash_equals( $expected_effect_hash, $record['effect_hash'] ) ) {
+            return false;
+        }
+        if ( null !== $record['finished_at'] && ( ! is_int( $record['finished_at'] ) || $record['finished_at'] < $record['accepted_at'] ) ) {
+            return false;
+        }
+        foreach ( $record['outcomes'] as $index => $outcome ) {
+            if ( ! is_array( $outcome ) || ! $this->abilities_v2_exact_keys( $outcome, array( 'action', 'status', 'affected', 'error_code' ) ) || ! isset( $record['actions'][ $index ] ) || $outcome['action'] !== $record['actions'][ $index ] || ! $this->abilities_v2_valid_action_outcome(
+                array(
+                    'status'     => $outcome['status'],
+                    'affected'   => $outcome['affected'],
+                    'error_code' => $outcome['error_code'],
+                )
+            ) ) {
+                return false;
+            }
+        }
+        if ( 'running' === $record['status'] ) {
+            return null === $record['finished_at'] && false === $record['retryable'];
+        }
+        $successful = count(
+            array_filter(
+                array_column( $record['outcomes'], 'status' ),
+                static function ( $status ) {
+                    return 'succeeded' === $status;
+                }
+            )
+        );
+        return null !== $record['finished_at'] && count( $record['actions'] ) === count( $record['outcomes'] ) && ( 0 < $successful ) === $record['report_emitted'];
+    }
+
+    /**
+     * Project a durable record into a closed response.
+     *
+     * @param array  $record    Durable record.
+     * @param string $operation Response operation.
+     * @return array<string,mixed>
+     */
+    private function abilities_v2_project_operation( $record, $operation ) {
+        $status   = 'running' === $record['status'] && $record['updated_at'] < time() - 300 ? 'unknown' : $record['status'];
+        $outcomes = $record['outcomes'];
+        if ( 'unknown' === $status ) {
+            foreach ( array_slice( $record['actions'], count( $outcomes ) ) as $action ) {
+                $outcomes[] = array(
+                    'action'     => $action,
+                    'status'     => 'unknown',
+                    'affected'   => null,
+                    'error_code' => 'outcome_unknown',
+                );
+            }
+        }
+        return array(
+            'protocol'      => '2',
+            'operation'     => $operation,
+            'ok'            => true,
+            'operation_ref' => $record['operation_ref'],
+            'status'        => $status,
+            'outcomes'      => $outcomes,
+            'accepted_at'   => gmdate( 'Y-m-d\TH:i:s\Z', $record['accepted_at'] ),
+            'finished_at'   => null === $record['finished_at'] ? null : gmdate( 'Y-m-d\TH:i:s\Z', $record['finished_at'] ),
+            'retryable'     => $record['retryable'],
+        );
+    }
+
+    /**
+     * Return a stable failed action outcome.
+     *
+     * @param string $code Stable error code.
+     * @return array<string,string|null>
+     */
+    private function abilities_v2_failed_outcome( $code = 'mutation_failed' ) {
+        return array(
+            'status'     => 'failed',
+            'affected'   => null,
+            'error_code' => $code,
+        );
+    }
+
+    /**
+     * Delete revisions with exact retention.
+     *
+     * @param int $revision_retention Revisions retained per parent.
+     * @return array<string,int|string|null>
+     */
+    private function abilities_v2_delete_revisions( $revision_retention ) {
+        global $wpdb;
+        if ( 0 === $revision_retention ) {
+            return $this->abilities_v2_delete_rows( 'posts', "post_type = 'revision'" );
+        }
+        $wpdb->last_error = '';
+        // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Reads exact revision candidates for immediate checked deletion.
+        $rows = $wpdb->get_results( "SELECT ID, post_parent FROM $wpdb->posts WHERE post_type = 'revision' ORDER BY post_parent ASC, post_modified DESC, ID DESC" );
+        if ( '' !== $wpdb->last_error || ! is_array( $rows ) ) {
+            return $this->abilities_v2_failed_outcome();
+        }
+        $seen     = array();
+        $affected = 0;
+        foreach ( $rows as $row ) {
+            if ( ! is_object( $row ) || ! isset( $row->ID, $row->post_parent ) || ! is_numeric( $row->ID ) || ! is_numeric( $row->post_parent ) ) {
+                return $this->abilities_v2_failed_outcome();
+            }
+            $parent          = (int) $row->post_parent;
+            $seen[ $parent ] = isset( $seen[ $parent ] ) ? $seen[ $parent ] + 1 : 1;
+            if ( $seen[ $parent ] <= $revision_retention ) {
+                continue;
+            }
+            $wpdb->last_error = '';
+            // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Checked exact revision deletion.
+            $deleted = $wpdb->delete( $wpdb->posts, array( 'ID' => (int) $row->ID ), array( '%d' ) );
+            if ( 1 !== $deleted || '' !== $wpdb->last_error ) {
+                return $this->abilities_v2_failed_outcome();
+            }
+            ++$affected;
+        }
+        return array(
+            'status'     => 'succeeded',
+            'affected'   => $affected,
+            'error_code' => null,
+        );
+    }
+
+    /**
+     * Delete a fixed closed row class.
+     *
+     * @param string $table_kind Closed table selector.
+     * @param string $where      Closed SQL predicate.
+     * @return array<string,int|string|null>
+     */
+    private function abilities_v2_delete_rows( $table_kind, $where ) {
+        global $wpdb;
+        $table            = 'posts' === $table_kind ? $wpdb->posts : $wpdb->comments;
+        $wpdb->last_error = '';
+        // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- Table and predicate are selected only from the closed action map.
+        $affected = $wpdb->query( "DELETE FROM $table WHERE $where" );
+        if ( false === $affected || '' !== $wpdb->last_error || ! is_int( $affected ) || 0 > $affected ) {
+            return $this->abilities_v2_failed_outcome();
+        }
+        return array(
+            'status'     => 'succeeded',
+            'affected'   => $affected,
+            'error_code' => null,
+        );
+    }
+
+    /**
+     * Delete empty terms in one exact taxonomy.
+     *
+     * @param string $taxonomy Exact taxonomy.
+     * @return array<string,int|string|null>
+     */
+    private function abilities_v2_delete_terms( $taxonomy ) {
+        $terms = get_terms(
+            array(
+                'taxonomy'   => $taxonomy,
+                'hide_empty' => false,
+            )
+        );
+        if ( is_wp_error( $terms ) || ! is_array( $terms ) ) {
+            return $this->abilities_v2_failed_outcome();
+        }
+        $default_category = (int) get_option( 'default_category', 0 );
+        $affected         = 0;
+        foreach ( $terms as $term ) {
+            if ( ! is_object( $term ) || ! isset( $term->term_id, $term->count ) ) {
+                return $this->abilities_v2_failed_outcome();
+            }
+            if ( 0 !== (int) $term->count || ( 'category' === $taxonomy && $default_category === (int) $term->term_id ) ) {
+                continue;
+            }
+            $deleted = wp_delete_term( (int) $term->term_id, $taxonomy );
+            if ( false === $deleted || is_wp_error( $deleted ) ) {
+                return $this->abilities_v2_failed_outcome();
+            }
+            ++$affected;
+        }
+        return array(
+            'status'     => 'succeeded',
+            'affected'   => $affected,
+            'error_code' => null,
+        );
+    }
+
+    /** Optimize only exact current-blog-prefix tables. */
+    private function abilities_v2_optimize_tables() {
+        global $wpdb;
+        $wpdb->last_error = '';
+        // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Reads current database table status for checked optimization.
+        $tables = $wpdb->get_results( 'SHOW TABLE STATUS FROM `' . esc_sql( DB_NAME ) . '`', ARRAY_A );
+        if ( '' !== $wpdb->last_error || ! is_array( $tables ) ) {
+            return $this->abilities_v2_failed_outcome();
+        }
+        $affected = 0;
+        foreach ( $tables as $table ) {
+            if ( ! is_array( $table ) || ! isset( $table['Name'] ) || ! is_string( $table['Name'] ) ) {
+                return $this->abilities_v2_failed_outcome();
+            }
+            if ( 0 !== strpos( $table['Name'], $wpdb->prefix ) ) {
+                continue;
+            }
+            $identifier       = str_replace( '`', '``', $table['Name'] );
+            $wpdb->last_error = '';
+            // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- Identifier comes from SHOW TABLE STATUS and is quoted.
+            $optimized = $wpdb->query( "OPTIMIZE TABLE `$identifier`" );
+            if ( false === $optimized || '' !== $wpdb->last_error ) {
+                return $this->abilities_v2_failed_outcome();
+            }
+            ++$affected;
+        }
+        return array(
+            'status'     => 'succeeded',
+            'affected'   => $affected,
+            'error_code' => null,
+        );
+    }
+
+    /**
+     * Delete checked local and site transients.
+     *
+     * @param bool $expired_only Delete expired entries only.
+     * @return array<string,int|string|null>
+     */
+    private function abilities_v2_delete_transients( $expired_only ) {
+        $names = $this->abilities_v2_transient_names( $expired_only );
+        if ( false === $names ) {
+            return $this->abilities_v2_failed_outcome();
+        }
+        $affected = 0;
+        foreach ( $names['local'] as $name ) {
+            if ( ! delete_transient( $name ) ) {
+                return $this->abilities_v2_failed_outcome();
+            }
+            ++$affected;
+        }
+        foreach ( $names['site'] as $name ) {
+            if ( ! delete_site_transient( $name ) ) {
+                return $this->abilities_v2_failed_outcome();
+            }
+            ++$affected;
+        }
+        return array(
+            'status'     => 'succeeded',
+            'affected'   => $affected,
+            'error_code' => null,
+        );
+    }
+
+    /**
+     * Read exact transient names for checked deletion.
+     *
+     * @param bool $expired_only Read expired entries only.
+     * @return array<string,array<int,string>>|false
+     */
+    private function abilities_v2_transient_names( $expired_only ) {
+        global $wpdb;
+        $now          = time();
+        $local_prefix = $expired_only ? '_transient_timeout_' : '_transient_';
+        $site_prefix  = $expired_only ? '_site_transient_timeout_' : '_site_transient_';
+        $local_sql    = "SELECT option_name FROM $wpdb->options WHERE option_name LIKE %s";
+        // phpcs:disable WordPress.DB.PreparedSQL.NotPrepared -- Placeholder-bearing fixed query structures are prepared before execution.
+        if ( $expired_only ) {
+            $local_sql .= ' AND option_value < %d';
+            $local_sql  = $wpdb->prepare( $local_sql, $wpdb->esc_like( $local_prefix ) . '%', $now );
+        } else {
+            $local_sql = $wpdb->prepare( $local_sql, $wpdb->esc_like( $local_prefix ) . '%' );
+        }
+        $wpdb->last_error = '';
+        // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared -- Fixed prepared transient query.
+        $local = $wpdb->get_col( $local_sql );
+        if ( '' !== $wpdb->last_error || ! is_array( $local ) ) {
+            return false;
+        }
+        $column       = is_multisite() ? 'meta_key' : 'option_name';
+        $value_column = is_multisite() ? 'meta_value' : 'option_value';
+        $table        = is_multisite() ? $wpdb->sitemeta : $wpdb->options;
+        $site_sql     = "SELECT $column FROM $table WHERE $column LIKE %s";
+        if ( $expired_only ) {
+            $site_sql .= " AND $value_column < %d";
+            $site_sql  = $wpdb->prepare( $site_sql, $wpdb->esc_like( $site_prefix ) . '%', $now );
+        } else {
+            $site_sql = $wpdb->prepare( $site_sql, $wpdb->esc_like( $site_prefix ) . '%' );
+        }
+        // phpcs:enable WordPress.DB.PreparedSQL.NotPrepared
+        $wpdb->last_error = '';
+        // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- Fixed prepared transient query with WordPress table properties.
+        $site = $wpdb->get_col( $site_sql );
+        if ( '' !== $wpdb->last_error || ! is_array( $site ) ) {
+            return false;
+        }
+        $result = array(
+            'local' => array(),
+            'site'  => array(),
+        );
+        foreach ( $local as $name ) {
+            if ( ! is_string( $name ) ) {
+                return false;
+            }
+            $key = str_replace( array( '_transient_timeout_', '_transient_' ), '', $name );
+            if ( '' !== $key ) {
+                $result['local'][ $key ] = $key;
+            }
+        }
+        foreach ( $site as $name ) {
+            if ( ! is_string( $name ) ) {
+                return false;
+            }
+            $key = str_replace( array( '_site_transient_timeout_', '_site_transient_' ), '', $name );
+            if ( '' !== $key ) {
+                $result['site'][ $key ] = $key;
+            }
+        }
+        $result['local'] = array_values( $result['local'] );
+        $result['site']  = array_values( $result['site'] );
+        return $result;
+    }
+
+    /**
+     * Check an exact associative-key set.
+     *
+     * @param array $value Input object.
+     * @param array $keys  Expected keys.
+     * @return bool
+     */
+    private function abilities_v2_exact_keys( $value, $keys ) {
+        $actual = array_keys( $value );
+        sort( $actual, SORT_STRING );
+        sort( $keys, SORT_STRING );
+
+        return $actual === $keys;
+    }
+
+    /**
+     * Build a closed abilities protocol error.
+     *
+     * @param string $operation Protocol operation.
+     * @param string $code      Stable error code.
+     * @return array<string,string|bool>
+     */
+    private function abilities_v2_error( $operation, $code ) {
+        return array(
+            'protocol'  => '2',
+            'operation' => $operation,
+            'ok'        => false,
+            'code'      => $code,
+        );
     }
 
     /**
@@ -274,8 +1312,8 @@ class MainWP_Child_Maintenance {
             $number_to_delete = $results[ $i ]->cnt - $max_revisions;
             $count_deleted   += $number_to_delete;
             // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Fetches specific revision IDs for immediate deletion; not reused or cacheable.
-            $results_posts    = $wpdb->get_results( $wpdb->prepare( "SELECT `ID`, `post_modified` FROM  $wpdb->posts WHERE `post_parent`= %d AND `post_type`='revision' ORDER BY `post_modified` ASC", $results[ $i ]->post_parent ) );
-            $delete_ids       = array();
+            $results_posts = $wpdb->get_results( $wpdb->prepare( "SELECT `ID`, `post_modified` FROM  $wpdb->posts WHERE `post_parent`= %d AND `post_type`='revision' ORDER BY `post_modified` ASC", $results[ $i ]->post_parent ) );
+            $delete_ids    = array();
             if ( is_array( $results_posts ) && ! empty( $results_posts ) ) {
                 for ( $j = 0; $j < $number_to_delete; $j++ ) {
                     $delete_ids[] = $results_posts[ $j ]->ID;

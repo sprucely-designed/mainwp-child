@@ -171,7 +171,18 @@ class MainWP_Child_Staging { //phpcs:ignore -- NOSONAR - multi methods.
      * @return array An array of available clones.
      */
     public function get_sync_data() {
-        return $this->get_overview();
+        $legacy = $this->get_overview();
+        $v2     = $this->abilities_v2(
+            array(
+                'protocol'  => '2',
+                'operation' => 'inventory',
+                'payload'   => array(),
+            )
+        );
+        if ( is_array( $v2 ) && ! empty( $v2['ok'] ) ) {
+            $legacy['abilitiesV2Inventory'] = $v2;
+        }
+        return $legacy;
     }
 
     /**
@@ -259,6 +270,9 @@ class MainWP_Child_Staging { //phpcs:ignore -- NOSONAR - multi methods.
                     break;
                 case 'get_overview':
                     $information = $this->get_overview();
+                    break;
+                case 'abilities_v2':
+                    $information = $this->abilities_v2_action();
                     break;
                 case 'get_scan':
                     $information = $this->get_scan();
@@ -375,6 +389,488 @@ class MainWP_Child_Staging { //phpcs:ignore -- NOSONAR - multi methods.
             );
         }
         return $return;
+    }
+
+    /**
+     * Decode the additive Staging abilities-v2 transport request.
+     *
+     * @return array Closed protocol response.
+     */
+    private function abilities_v2_action() {
+        // phpcs:ignore WordPress.Security.NonceVerification.Missing -- Authenticated MainWP Child callable.
+        if ( ! isset( $_POST['request'] ) || ! is_string( $_POST['request'] ) ) {
+            return $this->abilities_v2_error( 'unknown' );
+        }
+
+        // phpcs:ignore WordPress.Security.NonceVerification.Missing,WordPress.Security.ValidatedSanitizedInput.InputNotSanitized -- Closed JSON is validated below.
+        $raw = wp_unslash( $_POST['request'] );
+        if ( '' === $raw || 65536 < strlen( $raw ) ) {
+            return $this->abilities_v2_error( 'unknown' );
+        }
+
+        return $this->abilities_v2( json_decode( $raw, true ) );
+    }
+
+    /**
+     * Process one closed Staging abilities-v2 request.
+     *
+     * Read operations deliberately avoid WP Staging's ambient Scan job. That
+     * class mutates provider state and therefore cannot back an Ability read.
+     *
+     * @param mixed $request Decoded request.
+     * @return array Closed protocol response.
+     */
+    public function abilities_v2( $request ) {
+        $operation = is_array( $request ) && isset( $request['operation'] ) && is_string( $request['operation'] ) ? $request['operation'] : 'unknown';
+        if ( ! is_array( $request ) || ! isset( $request['protocol'] ) || '2' !== $request['protocol'] ) {
+            return $this->abilities_v2_error( $operation );
+        }
+
+        if ( 'capabilities' === $operation ) {
+            if ( ! $this->abilities_v2_exact_keys( $request, array( 'protocol', 'operation', 'payload' ) ) || array() !== $request['payload'] ) {
+                return $this->abilities_v2_error( $operation );
+            }
+
+            return array(
+                'protocol'           => '2',
+                'operation'          => 'capabilities',
+                'ok'                 => true,
+                'operations'         => array( 'inventory', 'settings', 'preview', 'replace_settings' ),
+                'mutation_supported' => $this->abilities_v2_provider_supports_mutation(),
+                'wp_staging_version' => $this->abilities_v2_plugin_version(),
+            );
+        }
+
+        if ( 'replace_settings' === $operation ) {
+            return $this->abilities_v2_replace_settings( $request );
+        }
+
+        if ( ! $this->abilities_v2_exact_keys( $request, array( 'protocol', 'operation', 'payload' ) ) || ! is_array( $request['payload'] ) ) {
+            return $this->abilities_v2_error( $operation );
+        }
+
+        if ( 'inventory' === $operation ) {
+            if ( array() !== $request['payload'] ) {
+                return $this->abilities_v2_error( $operation );
+            }
+            return $this->abilities_v2_inventory();
+        }
+
+        if ( 'settings' === $operation ) {
+            if ( array() !== $request['payload'] ) {
+                return $this->abilities_v2_error( $operation );
+            }
+            return $this->abilities_v2_settings();
+        }
+
+        if ( 'preview' !== $operation || ! $this->abilities_v2_exact_keys( $request['payload'], array( 'kind', 'clone_ref' ) ) ) {
+            return $this->abilities_v2_error( $operation );
+        }
+
+        $kind      = $request['payload']['kind'];
+        $clone_ref = $request['payload']['clone_ref'];
+        if ( ! in_array( $kind, array( 'create', 'update' ), true ) || ( 'create' === $kind && null !== $clone_ref ) || ( 'update' === $kind && ! $this->abilities_v2_valid_hash( $clone_ref ) ) ) {
+            return $this->abilities_v2_error( $operation );
+        }
+
+        $inventory = $this->abilities_v2_inventory_rows();
+        if ( false === $inventory ) {
+            return $this->abilities_v2_error( $operation, 'provider_schema_invalid' );
+        }
+        if ( 'update' === $kind && ! isset( $inventory[ $clone_ref ] ) ) {
+            return $this->abilities_v2_error( $operation, 'clone_not_found' );
+        }
+
+        $preview = $this->abilities_v2_provider_preview( $kind, $clone_ref, $inventory );
+        if ( ! is_array( $preview ) || ! $this->abilities_v2_exact_keys( $preview, array( 'table_count', 'file_count', 'estimated_bytes', 'disk_sufficient', 'isolation_ready', 'warnings' ) ) || ! $this->abilities_v2_valid_preview( $preview ) ) {
+            return $this->abilities_v2_error( $operation, 'provider_schema_invalid' );
+        }
+
+        return array_merge(
+            array(
+                'protocol'           => '2',
+                'operation'          => 'preview',
+                'ok'                 => true,
+                'kind'               => $kind,
+                'clone_ref'          => $clone_ref,
+                'inventory_revision' => $this->abilities_v2_inventory_revision( $inventory ),
+            ),
+            $preview
+        );
+    }
+
+    /**
+     * Return the complete redacted clone inventory.
+     *
+     * @return array Closed protocol response.
+     */
+    private function abilities_v2_inventory() {
+        $rows = $this->abilities_v2_inventory_rows();
+        if ( false === $rows ) {
+            return $this->abilities_v2_error( 'inventory', 'provider_schema_invalid' );
+        }
+
+        return array(
+            'protocol'           => '2',
+            'operation'          => 'inventory',
+            'ok'                 => true,
+            'complete'           => true,
+            'observed_at'        => gmdate( 'c' ),
+            'wp_staging_version' => $this->abilities_v2_plugin_version(),
+            'inventory_revision' => $this->abilities_v2_inventory_revision( $rows ),
+            'clones'             => array_values( $rows ),
+        );
+    }
+
+    /**
+     * Normalize the provider clone option without exposing path, URL or name.
+     *
+     * @return array|false Clone rows keyed by opaque reference.
+     */
+    protected function abilities_v2_inventory_rows() {
+        $clones = $this->abilities_v2_provider_clones();
+        if ( ! is_array( $clones ) || 10000 < count( $clones ) ) {
+            return false;
+        }
+
+        $rows = array();
+        foreach ( $clones as $clone_key => $clone ) {
+            if ( ! is_string( $clone_key ) || '' === $clone_key || 128 < strlen( $clone_key ) || ! is_array( $clone ) ) {
+                return false;
+            }
+            $identity = $this->abilities_v2_clone_identity( $clone_key, $clone );
+            if ( false === $identity ) {
+                return false;
+            }
+            $clone_ref = hash_hmac( 'sha256', $identity['binding'], wp_salt( 'auth' ) );
+            if ( isset( $rows[ $clone_ref ] ) ) {
+                return false;
+            }
+            $rows[ $clone_ref ] = array(
+                'clone_ref'                   => $clone_ref,
+                'state'                       => 'ready',
+                'isolated'                    => $identity['isolated'],
+                'search_index_blocked'        => $identity['search_index_blocked'],
+                'outbound_side_effects_blocked' => $identity['outbound_side_effects_blocked'],
+                'created_at'                  => $identity['created_at'],
+                'updated_at'                  => $identity['updated_at'],
+                'revision'                    => hash( 'sha256', $identity['binding'] ),
+            );
+        }
+        ksort( $rows );
+        return $rows;
+    }
+
+    /**
+     * Read raw clone metadata from the provider's authoritative option.
+     *
+     * @return array
+     */
+    protected function abilities_v2_provider_clones() {
+        if ( defined( '\\WPStaging\\Staging\\Sites::STAGING_SITES_OPTION' ) ) {
+            return get_option( \WPStaging\Staging\Sites::STAGING_SITES_OPTION, array() );
+        }
+        if ( defined( '\\WPStaging\\Framework\\Staging\\Sites::STAGING_SITES_OPTION' ) ) {
+            return get_option( \WPStaging\Framework\Staging\Sites::STAGING_SITES_OPTION, array() );
+        }
+        return get_option( 'wpstg_existing_clones_beta', array() );
+    }
+
+    /**
+     * Build an internal clone binding and bounded public facts.
+     *
+     * @param string $clone_key Provider clone key.
+     * @param array  $clone Provider clone metadata.
+     * @return array|false
+     */
+    private function abilities_v2_clone_identity( $clone_key, $clone ) {
+        foreach ( array( 'directoryName', 'path', 'url' ) as $required ) {
+            if ( ! isset( $clone[ $required ] ) || ! is_string( $clone[ $required ] ) || '' === $clone[ $required ] || 4096 < strlen( $clone[ $required ] ) || false !== strpos( $clone[ $required ], "\0" ) ) {
+                return false;
+            }
+        }
+
+        $real_root  = realpath( ABSPATH );
+        $clone_path = realpath( $clone['path'] );
+        if ( false === $real_root || false === $clone_path || $clone_path === $real_root || 0 !== strpos( trailingslashit( $clone_path ), trailingslashit( $real_root ) ) ) {
+            return false;
+        }
+
+        $created_at = $this->abilities_v2_optional_time( isset( $clone['createdAt'] ) ? $clone['createdAt'] : null );
+        $updated_at = $this->abilities_v2_optional_time( isset( $clone['updatedAt'] ) ? $clone['updatedAt'] : null );
+        if ( false === $created_at || false === $updated_at ) {
+            return false;
+        }
+
+        $binding = wp_json_encode(
+            array(
+                'clone_key'    => $clone_key,
+                'directory'    => $clone['directoryName'],
+                'path'         => $clone_path,
+                'url'          => $clone['url'],
+                'db_prefix'    => isset( $clone['databasePrefix'] ) && is_string( $clone['databasePrefix'] ) ? $clone['databasePrefix'] : '',
+                'wpstg_version' => $this->abilities_v2_plugin_version(),
+            )
+        );
+        if ( ! is_string( $binding ) ) {
+            return false;
+        }
+
+        return array(
+            'binding'                      => $binding,
+            'isolated'                     => ! empty( $clone['isolated'] ),
+            'search_index_blocked'         => ! empty( $clone['searchIndexBlocked'] ),
+            'outbound_side_effects_blocked' => ! empty( $clone['outboundSideEffectsBlocked'] ),
+            'created_at'                   => $created_at,
+            'updated_at'                   => $updated_at,
+        );
+    }
+
+    /**
+     * Return bounded operational settings without provider-private fields.
+     *
+     * @return array Closed protocol response.
+     */
+    private function abilities_v2_settings() {
+        $settings = $this->abilities_v2_provider_settings();
+        if ( ! is_array( $settings ) ) {
+            return $this->abilities_v2_error( 'settings', 'provider_schema_invalid' );
+        }
+        $normalized = array(
+            'query_limit'      => $this->abilities_v2_bounded_int( $settings, 'queryLimit', 10, 10000, 1000 ),
+            'file_limit'       => $this->abilities_v2_file_limit( isset( $settings['fileLimit'] ) ? $settings['fileLimit'] : 500 ),
+            'batch_size_mb'    => $this->abilities_v2_bounded_int( $settings, 'batchSize', 1, 100, 10 ),
+            'max_file_size_mb' => $this->abilities_v2_bounded_int( $settings, 'maxFileSize', 1, 1024, 50 ),
+            'cpu_load'         => isset( $settings['cpuLoad'] ) && in_array( $settings['cpuLoad'], array( 'low', 'medium', 'high' ), true ) ? $settings['cpuLoad'] : 'low',
+            'delay_seconds'    => $this->abilities_v2_bounded_int( $settings, 'delayRequests', 0, 60, 1 ),
+            'debug_enabled'    => ! empty( $settings['debugMode'] ),
+        );
+        if ( false === $normalized['file_limit'] ) {
+            return $this->abilities_v2_error( 'settings', 'provider_schema_invalid' );
+        }
+
+        return array_merge(
+            array(
+                'protocol'  => '2',
+                'operation' => 'settings',
+                'ok'        => true,
+                'revision'  => hash( 'sha256', wp_json_encode( $normalized ) ),
+            ),
+            $normalized
+        );
+    }
+
+    /** @return array */
+    protected function abilities_v2_provider_settings() {
+        $settings = get_option( 'wpstg_settings', array() );
+        return is_array( $settings ) ? $settings : array();
+    }
+
+    /**
+     * Replace bounded provider settings with request replay and exact readback.
+     *
+     * @param array $request Closed request.
+     * @return array Closed protocol response.
+     */
+    private function abilities_v2_replace_settings( $request ) {
+        if ( ! $this->abilities_v2_exact_keys( $request, array( 'protocol', 'operation', 'request_ref', 'payload' ) ) || ! $this->abilities_v2_valid_request_ref( $request['request_ref'] ) || ! is_array( $request['payload'] ) || ! $this->abilities_v2_exact_keys( $request['payload'], array( 'if_match', 'settings' ) ) || ! $this->abilities_v2_valid_hash( $request['payload']['if_match'] ) ) {
+            return $this->abilities_v2_error( 'replace_settings' );
+        }
+        $settings = $this->abilities_v2_validate_public_settings( $request['payload']['settings'] );
+        if ( false === $settings ) {
+            return $this->abilities_v2_error( 'replace_settings' );
+        }
+
+        $effect_hash = hash( 'sha256', wp_json_encode( array( $request['payload']['if_match'], $settings ) ) );
+        $receipts    = get_option( 'mainwp_staging_abilities_v2_receipts', array() );
+        if ( ! is_array( $receipts ) ) {
+            return $this->abilities_v2_error( 'replace_settings', 'storage_unavailable' );
+        }
+        if ( isset( $receipts[ $request['request_ref'] ] ) ) {
+            $receipt = $receipts[ $request['request_ref'] ];
+            if ( ! is_array( $receipt ) || ! isset( $receipt['effect_hash'], $receipt['response'] ) || ! is_string( $receipt['effect_hash'] ) || ! is_array( $receipt['response'] ) ) {
+                return $this->abilities_v2_error( 'replace_settings', 'storage_unavailable' );
+            }
+            return hash_equals( $receipt['effect_hash'], $effect_hash ) ? $receipt['response'] : $this->abilities_v2_error( 'replace_settings', 'request_conflict' );
+        }
+
+        $current = $this->abilities_v2_settings();
+        if ( empty( $current['ok'] ) || ! isset( $current['revision'] ) || ! hash_equals( $current['revision'], $request['payload']['if_match'] ) ) {
+            return $this->abilities_v2_error( 'replace_settings', 'stale_revision' );
+        }
+
+        $provider = $this->abilities_v2_provider_settings();
+        if ( ! is_array( $provider ) ) {
+            return $this->abilities_v2_error( 'replace_settings', 'provider_schema_invalid' );
+        }
+        $map = array(
+            'query_limit'      => 'queryLimit',
+            'file_limit'       => 'fileLimit',
+            'batch_size_mb'    => 'batchSize',
+            'max_file_size_mb' => 'maxFileSize',
+            'cpu_load'         => 'cpuLoad',
+            'delay_seconds'    => 'delayRequests',
+            'debug_enabled'    => 'debugMode',
+        );
+        foreach ( $map as $public => $private ) {
+            $provider[ $private ] = 'debug_enabled' === $public ? ( $settings[ $public ] ? 1 : 0 ) : $settings[ $public ];
+        }
+        if ( ! $this->abilities_v2_provider_store_settings( $provider ) ) {
+            return $this->abilities_v2_error( 'replace_settings', 'storage_unavailable' );
+        }
+        $stored = $this->abilities_v2_settings();
+        if ( empty( $stored['ok'] ) ) {
+            return $this->abilities_v2_error( 'replace_settings', 'outcome_unknown' );
+        }
+        foreach ( $settings as $key => $value ) {
+            if ( ! array_key_exists( $key, $stored ) || $stored[ $key ] !== $value ) {
+                return $this->abilities_v2_error( 'replace_settings', 'outcome_unknown' );
+            }
+        }
+
+        $response = array(
+            'protocol'    => '2',
+            'operation'   => 'replace_settings',
+            'ok'          => true,
+            'request_ref' => $request['request_ref'],
+            'revision'    => $stored['revision'],
+        );
+        $receipts[ $request['request_ref'] ] = array(
+            'effect_hash' => $effect_hash,
+            'response'    => $response,
+            'created_at'  => time(),
+        );
+        if ( 100 < count( $receipts ) ) {
+            uasort(
+                $receipts,
+                static function ( $left, $right ) {
+                    return ( isset( $left['created_at'] ) ? (int) $left['created_at'] : 0 ) <=> ( isset( $right['created_at'] ) ? (int) $right['created_at'] : 0 );
+                }
+            );
+            $receipts = array_slice( $receipts, -100, null, true );
+        }
+        if ( ! update_option( 'mainwp_staging_abilities_v2_receipts', $receipts, false ) && $receipts !== get_option( 'mainwp_staging_abilities_v2_receipts', array() ) ) {
+            return $this->abilities_v2_error( 'replace_settings', 'outcome_unknown' );
+        }
+        return $response;
+    }
+
+    /** @param array $settings Settings. @return bool */
+    protected function abilities_v2_provider_store_settings( $settings ) {
+        return update_option( 'wpstg_settings', $settings, false ) || $settings === get_option( 'wpstg_settings', array() );
+    }
+
+    /** @param mixed $settings Settings. @return array|false */
+    private function abilities_v2_validate_public_settings( $settings ) {
+        $keys = array( 'query_limit', 'file_limit', 'batch_size_mb', 'max_file_size_mb', 'cpu_load', 'delay_seconds', 'debug_enabled' );
+        if ( ! $this->abilities_v2_exact_keys( $settings, $keys ) ) {
+            return false;
+        }
+        if ( ! is_int( $settings['query_limit'] ) || 10 > $settings['query_limit'] || 10000 < $settings['query_limit'] || false === $this->abilities_v2_file_limit( $settings['file_limit'] ) || ! is_int( $settings['batch_size_mb'] ) || 1 > $settings['batch_size_mb'] || 100 < $settings['batch_size_mb'] || ! is_int( $settings['max_file_size_mb'] ) || 1 > $settings['max_file_size_mb'] || 1024 < $settings['max_file_size_mb'] || ! in_array( $settings['cpu_load'], array( 'low', 'medium', 'high' ), true ) || ! is_int( $settings['delay_seconds'] ) || 0 > $settings['delay_seconds'] || 60 < $settings['delay_seconds'] || ! is_bool( $settings['debug_enabled'] ) ) {
+            return false;
+        }
+        return $settings;
+    }
+
+    /**
+     * Provider-free preview seam. Production refuses to guess when WP Staging
+     * does not expose a side-effect-free scanner.
+     *
+     * @param string $kind Operation kind.
+     * @param string|null $clone_ref Clone reference.
+     * @param array $inventory Redacted inventory.
+     * @return array|false
+     */
+    protected function abilities_v2_provider_preview( $kind, $clone_ref, $inventory ) {
+        unset( $kind, $clone_ref, $inventory );
+        return false;
+    }
+
+    /** @return bool */
+    protected function abilities_v2_provider_supports_mutation() {
+        return false;
+    }
+
+    /** @return string */
+    private function abilities_v2_plugin_version() {
+        return defined( 'WPSTG_VERSION' ) && is_string( WPSTG_VERSION ) && 64 >= strlen( WPSTG_VERSION ) ? WPSTG_VERSION : ( is_string( $this->plugin_version ) ? $this->plugin_version : '' );
+    }
+
+    /** @param array $rows Rows. @return string */
+    private function abilities_v2_inventory_revision( $rows ) {
+        return hash( 'sha256', wp_json_encode( array_values( $rows ) ) );
+    }
+
+    /** @param mixed $value Value. @return string|null|false */
+    private function abilities_v2_optional_time( $value ) {
+        if ( null === $value || '' === $value ) {
+            return null;
+        }
+        if ( ! is_string( $value ) || 64 < strlen( $value ) || false === strtotime( $value ) ) {
+            return false;
+        }
+        return gmdate( 'c', strtotime( $value ) );
+    }
+
+    /** @param array $settings Settings. @param string $key Key. @param int $minimum Minimum. @param int $maximum Maximum. @param int $default Default. @return int */
+    private function abilities_v2_bounded_int( $settings, $key, $minimum, $maximum, $default ) {
+        $value = isset( $settings[ $key ] ) && is_numeric( $settings[ $key ] ) ? (int) $settings[ $key ] : $default;
+        return max( $minimum, min( $maximum, $value ) );
+    }
+
+    /** @param mixed $value Value. @return int|false */
+    private function abilities_v2_file_limit( $value ) {
+        $value = is_numeric( $value ) ? (int) $value : -1;
+        return in_array( $value, array( 1, 10, 50, 250, 500, 1000 ), true ) ? $value : false;
+    }
+
+    /** @param array $preview Preview. @return bool */
+    private function abilities_v2_valid_preview( $preview ) {
+        foreach ( array( 'table_count' => 100000, 'file_count' => 100000000, 'estimated_bytes' => 9007199254740991 ) as $key => $maximum ) {
+            if ( ! is_int( $preview[ $key ] ) || 0 > $preview[ $key ] || $maximum < $preview[ $key ] ) {
+                return false;
+            }
+        }
+        if ( ! is_bool( $preview['disk_sufficient'] ) || ! is_bool( $preview['isolation_ready'] ) || ! is_array( $preview['warnings'] ) || 20 < count( $preview['warnings'] ) ) {
+            return false;
+        }
+        foreach ( $preview['warnings'] as $warning ) {
+            if ( ! in_array( $warning, array( 'large_clone', 'limited_disk_margin', 'plugin_version_legacy', 'existing_incomplete_job' ), true ) ) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** @param mixed $value Value. @return bool */
+    private function abilities_v2_valid_hash( $value ) {
+        return is_string( $value ) && 1 === preg_match( '/^[a-f0-9]{64}$/D', $value );
+    }
+
+    /** @param mixed $value Value. @return bool */
+    private function abilities_v2_valid_request_ref( $value ) {
+        return is_string( $value ) && 1 === preg_match( '/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/D', $value );
+    }
+
+    /** @param mixed $value Value. @param array $keys Expected keys. @return bool */
+    private function abilities_v2_exact_keys( $value, $keys ) {
+        if ( ! is_array( $value ) ) {
+            return false;
+        }
+        $actual = array_keys( $value );
+        sort( $actual );
+        sort( $keys );
+        return $actual === $keys;
+    }
+
+    /** @param string $operation Operation. @param string $code Stable code. @return array */
+    private function abilities_v2_error( $operation, $code = 'invalid_request' ) {
+        return array(
+            'protocol'   => '2',
+            'operation'  => is_string( $operation ) && 64 >= strlen( $operation ) ? $operation : 'unknown',
+            'ok'         => false,
+            'error_code' => $code,
+        );
     }
 
     /**

@@ -556,6 +556,17 @@ class MainWP_Child_Wordfence { //phpcs:ignore -- NOSONAR - multi methods.
      */
     public function action() { // phpcs:ignore -- NOSONAR - Current complexity is the only way to achieve desired results, pull request solutions appreciated.
         $information = array();
+        $mwp_action  = MainWP_System::instance()->validate_params( 'mwp_action' );
+
+        if ( 'abilities_v2' === $mwp_action ) {
+            // phpcs:disable WordPress.Security.NonceVerification
+            $raw_request = isset( $_POST['request'] ) && is_string( $_POST['request'] ) ? wp_unslash( $_POST['request'] ) : '';
+            // phpcs:enable
+            $request = 4096 >= strlen( $raw_request ) ? json_decode( $raw_request, true ) : null;
+            MainWP_Helper::write( $this->abilities_v2( $request ) );
+            return;
+        }
+
         if ( ! $this->is_wordfence_installed ) {
             MainWP_Helper::write( array( 'error' => esc_html__( 'Please install the Wordfence plugin on the child site.', 'mainwp-child' ) ) );
             return;
@@ -568,7 +579,6 @@ class MainWP_Child_Wordfence { //phpcs:ignore -- NOSONAR - multi methods.
 
         try {
 
-            $mwp_action = MainWP_System::instance()->validate_params( 'mwp_action' );
             if ( ! empty( $mwp_action ) ) {
                 switch ( $mwp_action ) { // NOSONAR - multi case.
                     case 'start_scan':
@@ -786,6 +796,65 @@ class MainWP_Child_Wordfence { //phpcs:ignore -- NOSONAR - multi methods.
         }
 
         MainWP_Helper::write( $information );
+    }
+
+    /**
+     * Execute one closed Wordfence protocol-v2 negotiation request.
+     *
+     * @param mixed $request Decoded request object.
+     * @return array<string,mixed> Closed response.
+     */
+    public function abilities_v2( $request ) {
+        $operation = is_array( $request ) && isset( $request['operation'] ) && is_string( $request['operation'] ) ? $request['operation'] : 'unknown';
+        if ( ! is_array( $request ) || ! $this->abilities_v2_exact_keys( $request, array( 'protocol', 'operation', 'payload' ) ) || '2' !== $request['protocol'] || ! is_array( $request['payload'] ) ) {
+            return $this->abilities_v2_error( 'unknown', 'invalid_request' );
+        }
+
+        if ( 'capabilities' === $operation && array() === $request['payload'] ) {
+            return array(
+                'protocol'           => '2',
+                'operation'          => 'capabilities',
+                'ok'                 => true,
+                'operations'         => array(),
+                'mutation_supported' => false,
+            );
+        }
+
+        return $this->abilities_v2_error( $operation, 'unsupported_operation' );
+    }
+
+    /**
+     * Check an exact associative-key set.
+     *
+     * @param array $value Input object.
+     * @param array $keys  Expected keys.
+     * @return bool
+     */
+    private function abilities_v2_exact_keys( $value, $keys ) {
+        if ( ! is_array( $value ) ) {
+            return false;
+        }
+        $actual = array_keys( $value );
+        sort( $actual, SORT_STRING );
+        sort( $keys, SORT_STRING );
+
+        return $actual === $keys;
+    }
+
+    /**
+     * Build a closed Wordfence protocol error.
+     *
+     * @param string $operation Protocol operation.
+     * @param string $code      Stable error code.
+     * @return array<string,mixed>
+     */
+    private function abilities_v2_error( $operation, $code ) {
+        return array(
+            'protocol'  => '2',
+            'operation' => $operation,
+            'ok'        => false,
+            'code'      => $code,
+        );
     }
 
     /**

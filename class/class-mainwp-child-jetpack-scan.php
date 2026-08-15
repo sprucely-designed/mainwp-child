@@ -108,13 +108,23 @@ class MainWP_Child_Jetpack_Scan {
      * Fires of certain Jetpack Scan plugin actions.
      */
     public function action() { // phpcs:ignore -- NOSONAR - ignore complex method notice.
+        $mwp_action = MainWP_System::instance()->validate_params( 'mwp_action' );
+        if ( 'abilities_v2' === $mwp_action ) {
+            // phpcs:disable WordPress.Security.NonceVerification
+            // phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized -- Strict JSON validation follows.
+            $raw_request = isset( $_POST['request'] ) && is_string( $_POST['request'] ) ? wp_unslash( $_POST['request'] ) : '';
+            // phpcs:enable
+            $request = 4096 >= strlen( $raw_request ) ? json_decode( $raw_request, true ) : null;
+            MainWP_Helper::write( $this->abilities_v2( $request ) );
+            return;
+        }
+
         if ( ! $this->is_plugin_installed ) {
             MainWP_Helper::write( array( 'error' => __( 'Please install Jetpack Protect or Jetpact Scan plugin on child website', 'mainwp-child' ) ) );
         }
 
         $information = array();
 
-        $mwp_action = MainWP_System::instance()->validate_params( 'mwp_action' );
         if ( ! empty( $mwp_action ) ) {
             try {
                 if ( 'set_showhide' === $mwp_action ) {
@@ -125,6 +135,160 @@ class MainWP_Child_Jetpack_Scan {
             }
         }
         MainWP_Helper::write( $information );
+    }
+
+    /**
+     * Negotiate the additive Jetpack Scan abilities protocol.
+     *
+     * Visibility reads and exact desired-state writes are advertised only
+     * after their closed normalization and readback tests pass.
+     *
+     * @param mixed $request Decoded request object.
+     * @return array<string,mixed> Closed protocol response.
+     */
+    public function abilities_v2( $request ) {
+        $operation = is_array( $request ) && isset( $request['operation'] ) && is_string( $request['operation'] ) ? $request['operation'] : 'unknown';
+        if ( ! is_array( $request ) || ! $this->abilities_v2_exact_keys( $request, array( 'protocol', 'operation', 'payload' ) ) || '2' !== $request['protocol'] || ! is_array( $request['payload'] ) ) {
+            return $this->abilities_v2_error( 'unknown', 'invalid_request' );
+        }
+
+        if ( 'capabilities' === $operation && array() === $request['payload'] ) {
+            return array(
+                'protocol'           => '2',
+                'operation'          => 'capabilities',
+                'ok'                 => true,
+                'operations'         => array( 'visibility_get', 'visibility_set' ),
+                'mutation_supported' => true,
+            );
+        }
+
+        if ( 'visibility_get' === $operation ) {
+            if ( array() !== $request['payload'] ) {
+                return $this->abilities_v2_error( $operation, 'invalid_request' );
+            }
+
+            return $this->abilities_v2_visibility();
+        }
+
+        if ( 'visibility_set' === $operation ) {
+            if ( ! $this->abilities_v2_exact_keys( $request['payload'], array( 'desired_state', 'if_match' ) ) || ! is_string( $request['payload']['desired_state'] ) || ! in_array( $request['payload']['desired_state'], array( 'visible', 'hidden' ), true ) || ! is_string( $request['payload']['if_match'] ) || 1 !== preg_match( '/^[a-f0-9]{64}$/D', $request['payload']['if_match'] ) ) {
+                return $this->abilities_v2_error( $operation, 'invalid_request' );
+            }
+
+            return $this->abilities_v2_replace_visibility( $request['payload']['desired_state'], $request['payload']['if_match'] );
+        }
+
+        return $this->abilities_v2_error( $operation, 'unsupported_operation' );
+    }
+
+    /**
+     * Return the current closed Jetpack Scan visibility state.
+     *
+     * @return array<string,mixed> Closed visibility response.
+     */
+    private function abilities_v2_visibility() {
+        if ( $this->is_plugin_installed ) {
+            $plugin_state = 'active';
+        } else {
+            $protect_file = WP_PLUGIN_DIR . '/jetpack-protect/jetpack-protect.php';
+            $jetpack_file = WP_PLUGIN_DIR . '/' . $this->the_plugin_slug;
+            $plugin_state = file_exists( $protect_file ) || file_exists( $jetpack_file ) ? 'inactive' : 'missing';
+        }
+
+        $visibility = 'unknown';
+        if ( 'active' === $plugin_state ) {
+            $hide_option = get_option( 'mainwp_child_jetpack_scan_hide_plugin', false );
+            if ( 'hide' === $hide_option ) {
+                $visibility = 'hidden';
+            } elseif ( false === $hide_option || '' === $hide_option || 'show' === $hide_option ) {
+                $visibility = 'visible';
+            }
+        }
+
+        return array(
+            'protocol'     => '2',
+            'operation'    => 'visibility_get',
+            'ok'           => true,
+            'plugin_state' => $plugin_state,
+            'visibility'   => $visibility,
+            'revision'     => hash( 'sha256', $plugin_state . '|' . $visibility ),
+            'observed_at'  => gmdate( 'Y-m-d\TH:i:s\Z' ),
+        );
+    }
+
+    /**
+     * Replace the exact Jetpack Scan visibility option with CAS and readback.
+     *
+     * @param string $desired_state Exact desired state.
+     * @param string $if_match      Current visibility revision.
+     * @return array<string,mixed> Closed mutation response.
+     */
+    private function abilities_v2_replace_visibility( $desired_state, $if_match ) {
+        $current = $this->abilities_v2_visibility();
+        if ( 'active' !== $current['plugin_state'] || 'unknown' === $current['visibility'] ) {
+            return $this->abilities_v2_error( 'visibility_set', 'unsupported_version' );
+        }
+        if ( ! hash_equals( $current['revision'], $if_match ) ) {
+            return $this->abilities_v2_error( 'visibility_set', 'stale_revision' );
+        }
+        if ( $desired_state === $current['visibility'] ) {
+            $current['operation'] = 'visibility_set';
+            $current['changed']   = false;
+            return $current;
+        }
+
+        $option_name = 'mainwp_child_jetpack_scan_hide_plugin';
+        $old_value   = get_option( $option_name, false );
+        $new_value   = 'hidden' === $desired_state ? 'hide' : 'show';
+        $write_ok    = MainWP_Helper::update_option( $option_name, $new_value, 'yes' );
+        $stored      = $this->abilities_v2_visibility();
+        if ( $desired_state === $stored['visibility'] ) {
+            $stored['operation'] = 'visibility_set';
+            $stored['changed']   = true;
+            return $stored;
+        }
+
+        if ( false === $old_value ) {
+            $restored = delete_option( $option_name ) || false === get_option( $option_name, false );
+        } else {
+            $restored = MainWP_Helper::update_option( $option_name, $old_value, 'yes' ) || get_option( $option_name, false ) === $old_value;
+        }
+        if ( ! $restored ) {
+            return $this->abilities_v2_error( 'visibility_set', 'outcome_unknown' );
+        }
+
+        return $this->abilities_v2_error( 'visibility_set', $write_ok ? 'contradictory_readback' : 'write_failed' );
+    }
+
+    /**
+     * Check an exact associative-key set.
+     *
+     * @param array $value Input object.
+     * @param array $keys  Expected keys.
+     * @return bool
+     */
+    private function abilities_v2_exact_keys( $value, $keys ) {
+        $actual = array_keys( $value );
+        sort( $actual, SORT_STRING );
+        sort( $keys, SORT_STRING );
+
+        return $actual === $keys;
+    }
+
+    /**
+     * Build a closed abilities protocol error.
+     *
+     * @param string $operation Protocol operation.
+     * @param string $code      Stable error code.
+     * @return array<string,string|bool>
+     */
+    private function abilities_v2_error( $operation, $code ) {
+        return array(
+            'protocol'  => '2',
+            'operation' => $operation,
+            'ok'        => false,
+            'code'      => $code,
+        );
     }
 
     /**

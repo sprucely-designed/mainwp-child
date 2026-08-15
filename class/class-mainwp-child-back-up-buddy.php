@@ -22,7 +22,7 @@ namespace MainWP\Child;
 
 // Exit if accessed directly.
 if ( ! defined( 'ABSPATH' ) ) {
-    exit;
+	exit;
 }
 
 // phpcs:disable -- third party credit.
@@ -376,6 +376,15 @@ class MainWP_Child_Back_Up_Buddy { //phpcs:ignore -- NOSONAR - multi methods.
      */
     public function action() { //phpcs:ignore -- NOSONAR - multi lines.
         $information = array();
+        $mwp_action  = MainWP_System::instance()->validate_params( 'mwp_action' );
+        if ( 'abilities_v2' === $mwp_action ) {
+            $request = isset( $_POST['request'] ) ? wp_unslash( $_POST['request'] ) : array();
+            if ( is_string( $request ) ) {
+                $request = json_decode( $request, true );
+            }
+            MainWP_Helper::write( $this->abilities_v2( $request ) );
+            return;
+        }
         if ( ! $this->is_backupbuddy_installed ) {
             MainWP_Helper::write( array( 'error' => esc_html__( 'Please install the BackupBuddy plugin on the child site.', $this->plugin_translate ) ) );
         }
@@ -387,7 +396,6 @@ class MainWP_Child_Back_Up_Buddy { //phpcs:ignore -- NOSONAR - multi methods.
             \pb_backupbuddy::load();
         }
 
-        $mwp_action = MainWP_System::instance()->validate_params( 'mwp_action' );
         if ( ! empty( $mwp_action ) ) {
             switch ( $mwp_action ) { // NOSONAR - multi case.
                 case 'set_showhide':
@@ -533,6 +541,1196 @@ class MainWP_Child_Back_Up_Buddy { //phpcs:ignore -- NOSONAR - multi methods.
             }
         }
         MainWP_Helper::write( $information );
+    }
+
+    /**
+     * Execute the closed BackupBuddy abilities v2 protocol.
+     *
+     * @param array $request Typed request.
+     * @return array
+     */
+    public function abilities_v2( $request ) { // phpcs:ignore -- Closed dispatcher is intentionally explicit.
+        if ( ! is_array( $request ) || ! isset( $request['operation'] ) || ! is_string( $request['operation'] ) ) {
+            return $this->abilities_v2_error( 'invalid_request' );
+        }
+
+        $operation = $request['operation'];
+        $allowed   = array(
+            'capabilities'      => array( 'operation' ),
+            'list_profiles'     => array( 'operation', 'page', 'per_page' ),
+            'list_schedules'    => array( 'operation', 'page', 'per_page' ),
+            'list_destinations' => array( 'operation', 'page', 'per_page' ),
+            'list_archives'     => array( 'operation', 'page', 'per_page', 'type' ),
+            'preview_run'       => array( 'operation', 'target_kind', 'target_ref' ),
+            'start_backup'      => array( 'operation', 'profile_ref', 'preview_token', 'request_ref' ),
+            'run_schedule'      => array( 'operation', 'schedule_ref', 'preview_token', 'request_ref' ),
+            'get_operation'     => array( 'operation', 'operation_ref' ),
+            'cancel_operation'  => array( 'operation', 'operation_ref' ),
+            'delete_archive'    => array( 'operation', 'archive_ref', 'expected_size_bytes', 'expected_modified_at', 'request_ref' ),
+            'start_transfer'    => array( 'operation', 'archive_ref', 'destination_ref', 'request_ref', 'delete_local_after' ),
+        );
+        if ( ! isset( $allowed[ $operation ] ) ) {
+            return $this->abilities_v2_error( 'invalid_request' );
+        }
+        $request_keys = array_keys( $request );
+        $allowed_keys = $allowed[ $operation ];
+        if ( array() !== array_values( array_diff( $request_keys, $allowed_keys ) ) ) {
+            return $this->abilities_v2_error( 'invalid_request' );
+        }
+
+        if ( 'capabilities' === $operation ) {
+            return array(
+                'protocol'   => '2',
+                'operations' => array_keys( $allowed ),
+            );
+        }
+        if ( ! $this->is_backupbuddy_installed ) {
+            return $this->abilities_v2_error( 'backupbuddy_unavailable' );
+        }
+
+        if ( 0 === strpos( $operation, 'list_' ) ) {
+            $page     = isset( $request['page'] ) ? $request['page'] : 1;
+            $per_page = isset( $request['per_page'] ) ? $request['per_page'] : 25;
+            if ( ! is_int( $page ) || $page < 1 || ! is_int( $per_page ) || $per_page < 1 || $per_page > 100 ) {
+                return $this->abilities_v2_error( 'invalid_request' );
+            }
+        }
+
+        switch ( $operation ) {
+            case 'list_profiles':
+                return $this->abilities_v2_list_profiles( $page, $per_page );
+            case 'list_schedules':
+                return $this->abilities_v2_list_schedules( $page, $per_page );
+            case 'list_destinations':
+                return $this->abilities_v2_list_destinations( $page, $per_page );
+            case 'list_archives':
+                $type = isset( $request['type'] ) ? $request['type'] : 'all';
+                if ( ! in_array( $type, array( 'all', 'full', 'database', 'files' ), true ) ) {
+                    return $this->abilities_v2_error( 'invalid_request' );
+                }
+                return $this->abilities_v2_list_archives( $page, $per_page, $type );
+            case 'preview_run':
+                if ( ! isset( $request['target_kind'], $request['target_ref'] ) || ! in_array( $request['target_kind'], array( 'profile', 'schedule' ), true ) || ! $this->abilities_v2_valid_ref( $request['target_ref'] ) ) {
+                    return $this->abilities_v2_error( 'invalid_request' );
+                }
+                return $this->abilities_v2_preview( $request['target_kind'], $request['target_ref'], $this->abilities_v2_now() );
+            case 'start_backup':
+            case 'run_schedule':
+                return $this->abilities_v2_start_operation( $operation, $request );
+            case 'get_operation':
+                return $this->abilities_v2_get_operation( isset( $request['operation_ref'] ) ? $request['operation_ref'] : '' );
+            case 'cancel_operation':
+                return $this->abilities_v2_cancel_operation( isset( $request['operation_ref'] ) ? $request['operation_ref'] : '' );
+            case 'delete_archive':
+                return $this->abilities_v2_delete_archive( $request );
+            case 'start_transfer':
+                return $this->abilities_v2_start_transfer( $request );
+        }
+        return $this->abilities_v2_error( 'invalid_request' );
+    }
+
+    /** @return int */
+    protected function abilities_v2_now() {
+        return time();
+    }
+
+    /** @return string */
+    protected function abilities_v2_secret() {
+        return hash_hmac( 'sha256', 'mainwp-backupbuddy-abilities-v1', wp_salt( 'auth' ) );
+    }
+
+    /** @return array */
+    protected function abilities_v2_read_options() {
+        return isset( \pb_backupbuddy::$options ) && is_array( \pb_backupbuddy::$options ) ? \pb_backupbuddy::$options : array();
+    }
+
+    /** @return mixed */
+    protected function abilities_v2_read_records() {
+        $records = get_option( 'mainwp_backupbuddy_ability_operations_v1', array() );
+        return $records;
+    }
+
+    /**
+     * @param array $records Records.
+     * @return bool
+     */
+    protected function abilities_v2_write_records( $records ) {
+        return MainWP_Helper::update_option( 'mainwp_backupbuddy_ability_operations_v1', $records );
+    }
+
+    /**
+     * @param string $code Stable code.
+     * @return array
+     */
+    private function abilities_v2_error( $code ) {
+        $messages = array(
+            'invalid_request'         => 'The request is invalid.',
+            'not_found'               => 'The requested resource was not found.',
+            'request_conflict'        => 'The request reference conflicts with an existing effect.',
+            'preview_stale'           => 'The preview is stale or invalid.',
+            'operation_limit_reached' => 'The operation ledger is full.',
+            'effect_failed'           => 'The requested effect could not be started.',
+            'storage_failed'          => 'The operation state could not be stored.',
+            'lock_busy'               => 'Another BackupBuddy effect is active.',
+            'too_large'               => 'The requested source snapshot is too large.',
+            'outcome_unknown'         => 'The effect outcome could not be confirmed.',
+            'backupbuddy_unavailable' => 'BackupBuddy is unavailable.',
+        );
+        return array(
+            'error' => array(
+                'code'    => isset( $messages[ $code ] ) ? $code : 'effect_failed',
+                'message' => isset( $messages[ $code ] ) ? $messages[ $code ] : $messages['effect_failed'],
+            ),
+        );
+    }
+
+    /**
+     * @param mixed $value Value.
+     * @return bool
+     */
+    private function abilities_v2_valid_ref( $value ) {
+        return is_string( $value ) && strlen( $value ) >= 24 && strlen( $value ) <= 512 && 1 === preg_match( '/^[A-Za-z0-9._~-]+$/D', $value );
+    }
+
+    /**
+     * @param mixed $value Value.
+     * @return bool
+     */
+    private function abilities_v2_valid_request_ref( $value ) {
+        return is_string( $value ) && 1 === preg_match( '/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/D', $value );
+    }
+
+    /**
+     * @param string $type        Type prefix.
+     * @param string $internal_id Internal identifier.
+     * @return string
+     */
+    private function abilities_v2_ref( $type, $internal_id ) {
+        return $type . '.v1.' . hash_hmac( 'sha256', $type . "\0" . $internal_id, $this->abilities_v2_secret() );
+    }
+
+    /**
+     * @param string $value Value.
+     * @param int    $max   Maximum length.
+     * @return string
+     */
+    private function abilities_v2_text( $value, $max ) {
+        if ( ! is_string( $value ) || preg_match( '/[\x00-\x1F\x7F]/', $value ) ) {
+            return '';
+        }
+        return function_exists( 'mb_substr' ) ? mb_substr( $value, 0, $max ) : substr( $value, 0, $max );
+    }
+
+    /**
+     * Acquire the single per-site BackupBuddy effect lock.
+     *
+     * @return string|false
+     */
+    protected function abilities_v2_acquire_effect_lock() {
+        $key      = 'mainwp_backupbuddy_ability_effect_lock_v1';
+        $now      = $this->abilities_v2_now();
+        $owner    = wp_generate_uuid4();
+        $existing = get_option( $key, false );
+        if ( is_array( $existing ) && isset( $existing['expires_at'] ) && is_int( $existing['expires_at'] ) && $existing['expires_at'] <= $now ) {
+            delete_option( $key );
+        }
+        $value = array( 'owner' => $owner, 'expires_at' => $now + 120 );
+        if ( ! add_option( $key, $value, '', 'no' ) ) {
+            return false;
+        }
+        return $value === get_option( $key, false ) ? $owner : false;
+    }
+
+    /**
+     * Release the single per-site BackupBuddy effect lock.
+     *
+     * @param string $owner Lock owner.
+     * @return bool
+     */
+    protected function abilities_v2_release_effect_lock( $owner ) {
+        $key     = 'mainwp_backupbuddy_ability_effect_lock_v1';
+        $current = get_option( $key, false );
+        if ( ! is_array( $current ) || ! isset( $current['owner'] ) || ! is_string( $current['owner'] ) || ! hash_equals( $current['owner'], $owner ) ) {
+            return false;
+        }
+        delete_option( $key );
+        return false === get_option( $key, false );
+    }
+
+    /**
+     * @param array  $items    Items.
+     * @param int    $page     Page.
+     * @param int    $per_page Per page.
+     * @param string $key      Item key.
+     * @return array
+     */
+    private function abilities_v2_page( $items, $page, $per_page, $key ) {
+        return array(
+            'page'     => $page,
+            'per_page' => $per_page,
+            'total'    => count( $items ),
+            $key       => array_values( array_slice( $items, ( $page - 1 ) * $per_page, $per_page ) ),
+        );
+    }
+
+    /**
+     * @param int $page Page.
+     * @param int $per_page Per page.
+     * @return array
+     */
+    private function abilities_v2_list_profiles( $page, $per_page ) {
+        $options  = $this->abilities_v2_read_options();
+        $profiles = isset( $options['profiles'] ) && is_array( $options['profiles'] ) ? $options['profiles'] : array();
+        $items    = array();
+        foreach ( $profiles as $id => $profile ) {
+            if ( ! is_array( $profile ) || ! isset( $profile['type'] ) || ! is_string( $profile['type'] ) ) {
+                continue;
+            }
+            $type = $this->abilities_v2_profile_type( $profile['type'] );
+            $items[] = array(
+                'profile_ref' => $this->abilities_v2_ref( 'prf', (string) $id ),
+                'title'       => $this->abilities_v2_text( isset( $profile['title'] ) ? $profile['title'] : ucfirst( $type ), 200 ),
+                'type'        => $type,
+                'built_in'    => in_array( (string) $id, array( '0', '1', '2', '3' ), true ),
+            );
+        }
+        usort( $items, static function ( $left, $right ) { return strcmp( $left['profile_ref'], $right['profile_ref'] ); } );
+        return $this->abilities_v2_page( $items, $page, $per_page, 'profiles' );
+    }
+
+    /**
+     * @param string $type Product type.
+     * @return string
+     */
+    private function abilities_v2_profile_type( $type ) {
+        $map = array( 'full' => 'full', 'db' => 'database', 'database' => 'database', 'files' => 'files', 'themes' => 'themes', 'plugins' => 'plugins', 'media' => 'media' );
+        return isset( $map[ $type ] ) ? $map[ $type ] : 'custom';
+    }
+
+    /**
+     * @param int $schedule_id Schedule ID.
+     * @return int|null
+     */
+    protected function abilities_v2_schedule_next_run( $schedule_id ) {
+        $next = wp_next_scheduled( 'backupbuddy_cron', array( 'run_scheduled_backup', array( (int) $schedule_id ) ) );
+        return false === $next ? null : (int) $next;
+    }
+
+    /**
+     * @param int $page Page.
+     * @param int $per_page Per page.
+     * @return array
+     */
+    private function abilities_v2_list_schedules( $page, $per_page ) {
+        $options   = $this->abilities_v2_read_options();
+        $schedules = isset( $options['schedules'] ) && is_array( $options['schedules'] ) ? $options['schedules'] : array();
+        $items     = array();
+        foreach ( $schedules as $id => $schedule ) {
+            if ( ! is_array( $schedule ) ) {
+                continue;
+            }
+            $profile_id = isset( $schedule['profile'] ) ? $schedule['profile'] : ( isset( $schedule['profile_id'] ) ? $schedule['profile_id'] : null );
+            if ( null === $profile_id ) {
+                continue;
+            }
+            $supported = ! isset( $schedule['delete_after'] ) || false === $schedule['delete_after'] || 0 === $schedule['delete_after'] || '0' === $schedule['delete_after'];
+            $items[]   = array(
+                'schedule_ref' => $this->abilities_v2_ref( 'sch', (string) $id ),
+                'title'        => $this->abilities_v2_text( isset( $schedule['title'] ) ? $schedule['title'] : 'Schedule', 200 ),
+                'profile_ref'  => $this->abilities_v2_ref( 'prf', (string) $profile_id ),
+                'interval'     => $this->abilities_v2_text( isset( $schedule['interval'] ) ? $schedule['interval'] : '', 100 ),
+                'next_run_at'  => $this->abilities_v2_schedule_next_run( $id ),
+                'last_run_at'  => isset( $schedule['last_run'] ) && is_numeric( $schedule['last_run'] ) ? (int) $schedule['last_run'] : null,
+                'supported'    => $supported,
+            );
+        }
+        usort( $items, static function ( $left, $right ) { return strcmp( $left['schedule_ref'], $right['schedule_ref'] ); } );
+        return $this->abilities_v2_page( $items, $page, $per_page, 'schedules' );
+    }
+
+    /**
+     * @param int $page Page.
+     * @param int $per_page Per page.
+     * @return array
+     */
+    private function abilities_v2_list_destinations( $page, $per_page ) {
+        $options      = $this->abilities_v2_read_options();
+        $destinations = isset( $options['remote_destinations'] ) && is_array( $options['remote_destinations'] ) ? $options['remote_destinations'] : array();
+        $items        = array();
+        foreach ( $destinations as $id => $destination ) {
+            if ( ! is_array( $destination ) ) {
+                continue;
+            }
+            $type = isset( $destination['type'] ) && is_string( $destination['type'] ) ? strtolower( $destination['type'] ) : '';
+            if ( '' === $type || ! preg_match( '/^[a-z0-9_-]{1,100}$/D', $type ) ) {
+                $type = 'unknown';
+            }
+            $items[] = array(
+                'destination_ref' => $this->abilities_v2_ref( 'dst', (string) $id ),
+                'type'            => $type,
+                'label'           => $this->abilities_v2_text( isset( $destination['title'] ) ? $destination['title'] : ( isset( $destination['name'] ) ? $destination['name'] : ucfirst( $type ) ), 200 ),
+                'configured'      => $this->abilities_v2_destination_configured( $type, $destination ),
+            );
+        }
+        usort( $items, static function ( $left, $right ) { return strcmp( $left['destination_ref'], $right['destination_ref'] ); } );
+        return $this->abilities_v2_page( $items, $page, $per_page, 'destinations' );
+    }
+
+    /**
+     * @param string $type Destination type.
+     * @param array  $destination Internal destination settings.
+     * @return bool
+     */
+    private function abilities_v2_destination_configured( $type, $destination ) {
+        $required = array(
+            's3'        => array( 'accesskey', 'secretkey', 'bucket' ),
+            's32'       => array( 'accesskey', 'secretkey', 'bucket' ),
+            's33'       => array( 'accesskey', 'secretkey', 'bucket' ),
+            'ftp'       => array( 'address', 'username', 'password', 'path' ),
+            'sftp'      => array( 'address', 'username', 'password', 'path' ),
+            'rackspace' => array( 'username', 'api_key', 'container' ),
+            'gdrive'    => array( 'client_id', 'client_secret', 'tokens' ),
+            'local'     => array( 'path' ),
+            'site'      => array( 'api_key' ),
+            'dropbox2'  => array( 'access_token' ),
+            'email'     => array( 'address' ),
+            'stash2'    => array( 'itxapi_username', 'itxapi_token' ),
+            'stash3'    => array( 'itxapi_username', 'itxapi_token' ),
+        );
+        if ( ! isset( $required[ $type ] ) || isset( $destination['disabled'] ) && '1' === (string) $destination['disabled'] ) {
+            return false;
+        }
+        foreach ( $required[ $type ] as $key ) {
+            if ( ! isset( $destination[ $key ] ) || ! is_string( $destination[ $key ] ) || '' === trim( $destination[ $key ] ) ) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** @return array */
+    protected function abilities_v2_archive_candidates() {
+        if ( ! class_exists( $this->backupbuddy_core_class ) || ! method_exists( $this->backupbuddy_core_class, 'getBackupDirectory' ) ) {
+            return array();
+        }
+        $directory = realpath( \backupbuddy_core::getBackupDirectory() );
+        if ( false === $directory || ! is_dir( $directory ) ) {
+            return array();
+        }
+        $directory = rtrim( str_replace( '\\', '/', $directory ), '/' ) . '/';
+        $files     = glob( $directory . '*.zip' );
+        if ( ! is_array( $files ) ) {
+            return array();
+        }
+        if ( count( $files ) > 10000 ) {
+            return array( '__error' => 'too_large' );
+        }
+        $archives = array();
+        foreach ( $files as $file ) {
+            if ( is_link( $file ) || ! is_file( $file ) ) {
+                continue;
+            }
+            $resolved = realpath( $file );
+            if ( false === $resolved || 0 !== strpos( str_replace( '\\', '/', $resolved ), $directory ) ) {
+                continue;
+            }
+            $basename = basename( $resolved );
+            if ( false !== strpos( $basename, '/' ) || false !== strpos( $basename, '\\' ) || '.zip' !== strtolower( substr( $basename, -4 ) ) ) {
+                continue;
+            }
+            $lower = strtolower( $basename );
+            $type  = false !== strpos( $lower, '-db-' ) ? 'database' : ( false !== strpos( $lower, '-files-' ) ? 'files' : ( false !== strpos( $lower, '-full-' ) ? 'full' : 'unknown' ) );
+            $archives[] = array(
+                'internal_id' => $basename,
+                'type'        => $type,
+                'size_bytes'  => (int) filesize( $resolved ),
+                'modified_at' => (int) filemtime( $resolved ),
+                'status'      => filesize( $resolved ) > 0 ? 'complete' : 'incomplete',
+                'path'        => $resolved,
+            );
+        }
+        return $archives;
+    }
+
+    /**
+     * @param int    $page Page.
+     * @param int    $per_page Per page.
+     * @param string $type Type.
+     * @return array
+     */
+    private function abilities_v2_list_archives( $page, $per_page, $type ) {
+        $archives = $this->abilities_v2_archives();
+        if ( isset( $archives['error'] ) ) {
+            return $archives;
+        }
+        $items    = array();
+        foreach ( $archives as $archive ) {
+            if ( 'all' !== $type && $type !== $archive['type'] ) {
+                continue;
+            }
+            $items[] = array(
+                'archive_ref' => $this->abilities_v2_ref( 'arc', $archive['internal_id'] ),
+                'type'        => $archive['type'],
+                'size_bytes'  => $archive['size_bytes'],
+                'modified_at' => $archive['modified_at'],
+                'status'      => $archive['status'],
+            );
+        }
+        return $this->abilities_v2_page( $items, $page, $per_page, 'archives' );
+    }
+
+    /** @return array */
+    private function abilities_v2_archives() {
+        $archives = $this->abilities_v2_archive_candidates();
+        if ( is_array( $archives ) && isset( $archives['__error'] ) ) {
+            return $this->abilities_v2_error( 'too_large' );
+        }
+        if ( ! is_array( $archives ) ) {
+            return $this->abilities_v2_error( 'storage_failed' );
+        }
+        $valid    = array();
+        foreach ( $archives as $archive ) {
+            if ( ! is_array( $archive ) || ! isset( $archive['internal_id'], $archive['type'], $archive['size_bytes'], $archive['modified_at'], $archive['status'], $archive['path'] ) || ! is_string( $archive['internal_id'] ) || ! is_string( $archive['path'] ) || ! in_array( $archive['type'], array( 'full', 'database', 'files', 'unknown' ), true ) || ! is_int( $archive['size_bytes'] ) || $archive['size_bytes'] < 0 || ! is_int( $archive['modified_at'] ) || $archive['modified_at'] < 0 || ! in_array( $archive['status'], array( 'complete', 'incomplete' ), true ) ) {
+                return $this->abilities_v2_error( 'storage_failed' );
+            }
+            $valid[] = $archive;
+        }
+        usort(
+            $valid,
+            static function ( $left, $right ) {
+                if ( $left['modified_at'] === $right['modified_at'] ) {
+                    return strcmp( $left['internal_id'], $right['internal_id'] );
+                }
+                return $left['modified_at'] > $right['modified_at'] ? -1 : 1;
+            }
+        );
+        return $valid;
+    }
+
+    /**
+     * @param string $kind Target kind.
+     * @param string $ref Target ref.
+     * @param int    $issued_at Issued timestamp.
+     * @return array
+     */
+    private function abilities_v2_preview( $kind, $ref, $issued_at ) {
+        $target = $this->abilities_v2_resolve_target( $kind, $ref );
+        if ( ! is_array( $target ) ) {
+            return $this->abilities_v2_error( 'not_found' );
+        }
+        if ( 'schedule' === $kind && ! empty( $target['too_large'] ) ) {
+            return $this->abilities_v2_error( 'too_large' );
+        }
+        if ( 'schedule' === $kind && empty( $target['supported'] ) ) {
+            return $this->abilities_v2_error( 'request_conflict' );
+        }
+        $profile = 'profile' === $kind ? $target : $target['profile'];
+        $victims = $this->abilities_v2_retention_victims( $profile['type'] );
+        if ( isset( $victims['error'] ) ) {
+            return $victims;
+        }
+        $remote  = 'schedule' === $kind ? $target['remote_ids'] : array();
+        $snapshot = array(
+            'kind'       => $kind,
+            'target'     => $target['internal_id'],
+            'profile'    => $profile['internal_id'],
+            'type'       => $profile['type'],
+            'victims'    => array_map(
+                static function ( $item ) {
+                    return array(
+                        'internal_id' => $item['internal_id'],
+                        'size_bytes'  => $item['size_bytes'],
+                        'modified_at' => $item['modified_at'],
+                    );
+                },
+                $victims
+            ),
+            'remote_ids' => array_values( $remote ),
+            'delete'     => 'schedule' === $kind ? $target['delete_after'] : false,
+        );
+        $digest = hash_hmac( 'sha256', (string) $issued_at . "\0" . wp_json_encode( $snapshot ), $this->abilities_v2_secret() );
+        return array(
+            'target_kind'                   => $kind,
+            'target_ref'                    => $ref,
+            'backup_type'                   => $profile['type'],
+            'retention_delete_archive_refs' => array_map( function ( $item ) { return $this->abilities_v2_ref( 'arc', $item['internal_id'] ); }, $victims ),
+            'remote_destination_refs'        => array_map( function ( $id ) { return $this->abilities_v2_ref( 'dst', (string) $id ); }, $remote ),
+            'delete_local_after_transfer'    => (bool) $snapshot['delete'],
+            'preview_token'                  => 'pre.v1.' . $issued_at . '.' . $digest,
+            'expires_at'                     => $issued_at + 600,
+        );
+    }
+
+    /**
+     * @param string $kind Target kind.
+     * @param string $ref Ref.
+     * @return array|null
+     */
+    private function abilities_v2_resolve_target( $kind, $ref ) {
+        $options = $this->abilities_v2_read_options();
+        if ( 'profile' === $kind ) {
+            $profiles = isset( $options['profiles'] ) && is_array( $options['profiles'] ) ? $options['profiles'] : array();
+            foreach ( $profiles as $id => $profile ) {
+                if ( hash_equals( $this->abilities_v2_ref( 'prf', (string) $id ), $ref ) && is_array( $profile ) && isset( $profile['type'] ) ) {
+                    return array( 'internal_id' => (string) $id, 'type' => $this->abilities_v2_profile_type( $profile['type'] ), 'raw' => $profile );
+                }
+            }
+            return null;
+        }
+        $schedules = isset( $options['schedules'] ) && is_array( $options['schedules'] ) ? $options['schedules'] : array();
+        foreach ( $schedules as $id => $schedule ) {
+            if ( ! hash_equals( $this->abilities_v2_ref( 'sch', (string) $id ), $ref ) || ! is_array( $schedule ) ) {
+                continue;
+            }
+            $profile_id = isset( $schedule['profile'] ) ? $schedule['profile'] : ( isset( $schedule['profile_id'] ) ? $schedule['profile_id'] : null );
+            if ( null === $profile_id || ! isset( $options['profiles'][ $profile_id ] ) || ! is_array( $options['profiles'][ $profile_id ] ) ) {
+                return null;
+            }
+            $delete_after = ! empty( $schedule['delete_after'] );
+            $remote_ids   = isset( $schedule['remote_destinations'] ) && is_array( $schedule['remote_destinations'] ) ? array_values( $schedule['remote_destinations'] ) : array();
+            $too_large    = count( $remote_ids ) > 10;
+            $destinations = isset( $options['remote_destinations'] ) && is_array( $options['remote_destinations'] ) ? $options['remote_destinations'] : array();
+            $remote_valid = true;
+            foreach ( $remote_ids as $remote_id ) {
+                if ( ! ( is_int( $remote_id ) || is_string( $remote_id ) ) || ! isset( $destinations[ $remote_id ] ) || ! is_array( $destinations[ $remote_id ] ) || ! isset( $destinations[ $remote_id ]['type'] ) || ! is_string( $destinations[ $remote_id ]['type'] ) || ! $this->abilities_v2_destination_configured( strtolower( $destinations[ $remote_id ]['type'] ), $destinations[ $remote_id ] ) ) {
+                    $remote_valid = false;
+                    break;
+                }
+            }
+            return array(
+                'internal_id' => (string) $id,
+                'profile'     => array( 'internal_id' => (string) $profile_id, 'type' => $this->abilities_v2_profile_type( $options['profiles'][ $profile_id ]['type'] ), 'raw' => $options['profiles'][ $profile_id ] ),
+                'remote_ids'  => $too_large ? array() : $remote_ids,
+                'delete_after'=> $delete_after,
+                'supported'   => ! $delete_after && $remote_valid,
+                'too_large'   => $too_large,
+            );
+        }
+        return null;
+    }
+
+    /**
+     * @param string $type Profile type.
+     * @return array
+     */
+    private function abilities_v2_retention_victims( $type ) {
+        unset( $type );
+        $options   = $this->abilities_v2_read_options();
+        $archives  = $this->abilities_v2_archives();
+        if ( isset( $archives['error'] ) ) {
+            return $archives;
+        }
+        $remaining = array();
+        $victims   = array();
+        $total_mb  = 0.0;
+        foreach ( $archives as $archive ) {
+            $remaining[ $archive['internal_id'] ] = $archive;
+            $total_mb += $archive['size_bytes'] / 1048576;
+        }
+        $mark = static function ( $archive ) use ( &$remaining, &$victims ) {
+            $victims[ $archive['internal_id'] ] = $archive;
+            unset( $remaining[ $archive['internal_id'] ] );
+        };
+
+        $age_limit = isset( $options['archive_limit_age'] ) && is_numeric( $options['archive_limit_age'] ) ? (int) $options['archive_limit_age'] : 0;
+        if ( $age_limit > 0 ) {
+            foreach ( array_values( $remaining ) as $archive ) {
+                $age_days = (int) ( ( $this->abilities_v2_now() - $archive['modified_at'] ) / DAY_IN_SECONDS );
+                if ( $age_days > $age_limit ) {
+                    $mark( $archive );
+                }
+            }
+        }
+
+        foreach ( array( 'full' => 'archive_limit_full', 'database' => 'archive_limit_db', 'files' => 'archive_limit_files' ) as $archive_type => $key ) {
+            $limit = isset( $options[ $key ] ) && is_numeric( $options[ $key ] ) ? (int) $options[ $key ] : 0;
+            if ( $limit < 1 ) {
+                continue;
+            }
+            $seen = 0;
+            foreach ( array_values( $remaining ) as $archive ) {
+                if ( $archive_type === $archive['type'] && ++$seen > $limit ) {
+                    $mark( $archive );
+                }
+            }
+        }
+
+        $global_limit = isset( $options['archive_limit'] ) && is_numeric( $options['archive_limit'] ) ? (int) $options['archive_limit'] : 0;
+        if ( $global_limit > 0 ) {
+            $seen = 0;
+            foreach ( array_values( $remaining ) as $archive ) {
+                if ( ++$seen > $global_limit ) {
+                    $mark( $archive );
+                }
+            }
+        }
+
+        $size_limit     = isset( $options['archive_limit_size'] ) && is_numeric( $options['archive_limit_size'] ) ? (float) $options['archive_limit_size'] : 0.0;
+        $big_size_limit = isset( $options['archive_limit_size_big'] ) && is_numeric( $options['archive_limit_size_big'] ) ? (float) $options['archive_limit_size_big'] : 0.0;
+        $effective_size = 0.0 === $size_limit ? $big_size_limit : ( 0.0 === $big_size_limit ? $size_limit : min( $size_limit, $big_size_limit ) );
+        if ( $effective_size > 0.0 && $total_mb > $effective_size ) {
+            foreach ( array_reverse( array_values( $remaining ) ) as $archive ) {
+                if ( $total_mb <= $effective_size ) {
+                    break;
+                }
+                $total_mb -= $archive['size_bytes'] / 1048576;
+                $mark( $archive );
+            }
+        }
+
+        $victims = array_values( $victims );
+        usort( $victims, static function ( $left, $right ) { return $left['modified_at'] <=> $right['modified_at']; } );
+        return count( $victims ) > 100 ? $this->abilities_v2_error( 'too_large' ) : $victims;
+    }
+
+    /**
+     * @param string $operation Operation.
+     * @param array  $request Request.
+     * @return array
+     */
+    private function abilities_v2_start_operation( $operation, $request ) {
+        $target_key = 'start_backup' === $operation ? 'profile_ref' : 'schedule_ref';
+        $kind       = 'start_backup' === $operation ? 'profile' : 'schedule';
+        if ( ! isset( $request[ $target_key ], $request['preview_token'], $request['request_ref'] ) || ! $this->abilities_v2_valid_ref( $request[ $target_key ] ) || ! $this->abilities_v2_valid_ref( $request['preview_token'] ) || ! $this->abilities_v2_valid_request_ref( $request['request_ref'] ) ) {
+            return $this->abilities_v2_error( 'invalid_request' );
+        }
+        $owner = $this->abilities_v2_acquire_effect_lock();
+        if ( false === $owner ) {
+            return $this->abilities_v2_error( 'lock_busy' );
+        }
+        $result = null;
+        try {
+            $replay = $this->abilities_v2_replay( $request['request_ref'], $request );
+            if ( null !== $replay ) {
+                $result = $replay;
+            } else {
+                $preview = $this->abilities_v2_verify_preview( $kind, $request[ $target_key ], $request['preview_token'] );
+                if ( ! is_array( $preview ) || isset( $preview['error'] ) ) {
+                    $result = $this->abilities_v2_error( 'preview_stale' );
+                } else {
+                    $target  = $this->abilities_v2_resolve_target( $kind, $request[ $target_key ] );
+                    $profile = 'profile' === $kind ? $target : $target['profile'];
+                    $steps   = 'schedule' === $kind ? array( 'remote_destinations' => $target['remote_ids'], 'delete_after' => false ) : array();
+                    $record  = $this->abilities_v2_new_operation( $request['request_ref'], $this->abilities_v2_request_hash( $request ), 'profile' === $kind ? 'backup' : 'scheduled_backup', null, null );
+                    $records = $this->abilities_v2_prepare_records();
+                    if ( isset( $records['error'] ) ) {
+                        $result = $records;
+                    } else {
+                        $records['operations'][ $record['operation_ref'] ] = $record;
+                        if ( ! $this->abilities_v2_write_records( $records ) ) {
+                            $result = $this->abilities_v2_error( 'storage_failed' );
+                        } elseif ( ! $this->abilities_v2_start_backup_effect( $profile['raw'], $record['serial'], $steps ) ) {
+                            $record['state']      = 'failed';
+                            $record['updated_at'] = $this->abilities_v2_now();
+                            $records['operations'][ $record['operation_ref'] ] = $record;
+                            $result = $this->abilities_v2_write_records( $records ) ? $this->abilities_v2_error( 'effect_failed' ) : $this->abilities_v2_error( 'outcome_unknown' );
+                        } else {
+                            $result = array( 'operation' => $this->abilities_v2_public_operation( $record ) );
+                        }
+                    }
+                }
+            }
+        } finally {
+            $released = $this->abilities_v2_release_effect_lock( $owner );
+        }
+        return $released ? $result : $this->abilities_v2_error( 'storage_failed' );
+    }
+
+    /**
+     * @param string $kind Kind.
+     * @param string $ref Ref.
+     * @param string $token Token.
+     * @return array|null
+     */
+    private function abilities_v2_verify_preview( $kind, $ref, $token ) {
+        if ( ! preg_match( '/^pre\.v1\.([0-9]{1,12})\.([a-f0-9]{64})$/D', $token, $matches ) ) {
+            return null;
+        }
+        $issued = (int) $matches[1];
+        if ( $issued > $this->abilities_v2_now() || $issued + 600 < $this->abilities_v2_now() ) {
+            return null;
+        }
+        $preview = $this->abilities_v2_preview( $kind, $ref, $issued );
+        return ! isset( $preview['error'] ) && hash_equals( $preview['preview_token'], $token ) ? $preview : null;
+    }
+
+    /**
+     * @param array $request Request.
+     * @return string
+     */
+    private function abilities_v2_request_hash( $request ) {
+        ksort( $request );
+        return hash( 'sha256', wp_json_encode( $request ) );
+    }
+
+    /**
+     * @param string $request_ref Request reference.
+     * @param array  $request Request.
+     * @return array|null
+     */
+    private function abilities_v2_replay( $request_ref, $request ) {
+        $records = $this->abilities_v2_normalize_records( $this->abilities_v2_read_records() );
+        if ( isset( $records['error'] ) ) {
+            return $records;
+        }
+        $hash    = $this->abilities_v2_request_hash( $request );
+        foreach ( $records['operations'] as $record ) {
+            if ( isset( $record['request_ref'] ) && hash_equals( $record['request_ref'], $request_ref ) ) {
+                return isset( $record['request_hash'] ) && hash_equals( $record['request_hash'], $hash ) ? array( 'operation' => $this->abilities_v2_public_operation( $record ) ) : $this->abilities_v2_error( 'request_conflict' );
+            }
+        }
+        foreach ( $records['receipts'] as $receipt ) {
+            if ( isset( $receipt['request_ref'] ) && hash_equals( $receipt['request_ref'], $request_ref ) ) {
+                if ( ! isset( $receipt['request_hash'] ) || ! hash_equals( $receipt['request_hash'], $hash ) ) {
+                    return $this->abilities_v2_error( 'request_conflict' );
+                }
+                return 'completed' === $receipt['state'] ? $receipt['response'] : $this->abilities_v2_error( 'outcome_unknown' );
+            }
+        }
+        return null;
+    }
+
+    /** @return array */
+    private function abilities_v2_prepare_records() {
+        $records = $this->abilities_v2_normalize_records( $this->abilities_v2_read_records() );
+        if ( isset( $records['error'] ) ) {
+            return $records;
+        }
+        $cutoff  = $this->abilities_v2_now() - 604800;
+        foreach ( $records['operations'] as $key => $record ) {
+            if ( in_array( isset( $record['state'] ) ? $record['state'] : '', array( 'succeeded', 'failed', 'cancelled' ), true ) && isset( $record['updated_at'] ) && $record['updated_at'] < $cutoff ) {
+                unset( $records['operations'][ $key ] );
+            }
+        }
+        foreach ( $records['receipts'] as $key => $receipt ) {
+            if ( isset( $receipt['created_at'] ) && $receipt['created_at'] < $cutoff ) {
+                unset( $records['receipts'][ $key ] );
+            }
+        }
+        if ( count( $records['operations'] ) + count( $records['receipts'] ) >= 100 ) {
+            return $this->abilities_v2_error( 'operation_limit_reached' );
+        }
+        return $records;
+    }
+
+    /**
+     * @param array $records Records.
+     * @return array
+     */
+    private function abilities_v2_normalize_records( $records ) {
+        if ( array() === $records ) {
+            return array( 'operations' => array(), 'receipts' => array() );
+        }
+        if ( ! is_array( $records ) || array( 'operations', 'receipts' ) !== array_keys( $records ) || ! is_array( $records['operations'] ) || ! is_array( $records['receipts'] ) || count( $records['operations'] ) + count( $records['receipts'] ) > 100 ) {
+            return $this->abilities_v2_error( 'storage_failed' );
+        }
+        foreach ( $records['operations'] as $key => $record ) {
+            if ( ! is_string( $key ) || ! $this->abilities_v2_valid_operation_record( $record ) || ! hash_equals( $record['operation_ref'], $key ) ) {
+                return $this->abilities_v2_error( 'storage_failed' );
+            }
+        }
+        foreach ( $records['receipts'] as $key => $receipt ) {
+            if ( ! is_string( $key ) || ! $this->abilities_v2_valid_receipt( $receipt ) || ! hash_equals( $receipt['request_ref'], $key ) ) {
+                return $this->abilities_v2_error( 'storage_failed' );
+            }
+        }
+        return $records;
+    }
+
+    /**
+     * @param mixed $record Stored operation.
+     * @return bool
+     */
+    private function abilities_v2_valid_operation_record( $record ) {
+        $keys = array( 'operation_ref', 'request_ref', 'request_hash', 'kind', 'state', 'created_at', 'updated_at', 'progress', 'archive_ref', 'destination_ref', 'warnings', 'serial' );
+        if ( ! is_array( $record ) || $keys !== array_keys( $record ) || ! $this->abilities_v2_valid_ref( $record['operation_ref'] ) || ! $this->abilities_v2_valid_request_ref( $record['request_ref'] ) || ! is_string( $record['request_hash'] ) || 1 !== preg_match( '/^[a-f0-9]{64}$/D', $record['request_hash'] ) || ! in_array( $record['kind'], array( 'backup', 'scheduled_backup', 'transfer' ), true ) || ! in_array( $record['state'], array( 'queued', 'running', 'cancel_requested', 'succeeded', 'failed', 'cancelled', 'unknown' ), true ) || ! is_int( $record['created_at'] ) || $record['created_at'] < 0 || ! is_int( $record['updated_at'] ) || $record['updated_at'] < $record['created_at'] || ! is_int( $record['progress'] ) || $record['progress'] < 0 || $record['progress'] > 100 || ! is_string( $record['serial'] ) || 1 !== preg_match( '/^[a-f0-9]{10}$/D', $record['serial'] ) ) {
+            return false;
+        }
+        foreach ( array( 'archive_ref', 'destination_ref' ) as $key ) {
+            if ( null !== $record[ $key ] && ! $this->abilities_v2_valid_ref( $record[ $key ] ) ) {
+                return false;
+            }
+        }
+        if ( ! is_array( $record['warnings'] ) || count( $record['warnings'] ) > 10 || count( $record['warnings'] ) !== count( array_unique( $record['warnings'] ) ) ) {
+            return false;
+        }
+        foreach ( $record['warnings'] as $warning ) {
+            if ( ! in_array( $warning, array( 'retention_deleted_archives', 'remote_transfer_pending', 'cancel_not_immediate' ), true ) ) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * @param mixed $receipt Stored receipt.
+     * @return bool
+     */
+    private function abilities_v2_valid_receipt( $receipt ) {
+        $keys = array( 'request_ref', 'request_hash', 'created_at', 'state', 'response' );
+        if ( ! is_array( $receipt ) || $keys !== array_keys( $receipt ) || ! $this->abilities_v2_valid_request_ref( $receipt['request_ref'] ) || ! is_string( $receipt['request_hash'] ) || 1 !== preg_match( '/^[a-f0-9]{64}$/D', $receipt['request_hash'] ) || ! is_int( $receipt['created_at'] ) || $receipt['created_at'] < 0 || ! in_array( $receipt['state'], array( 'pending', 'completed' ), true ) ) {
+            return false;
+        }
+        if ( 'pending' === $receipt['state'] ) {
+            return null === $receipt['response'];
+        }
+        $response_keys = array( 'archive_ref', 'deleted', 'already_absent', 'auxiliary_records_removed' );
+        return is_array( $receipt['response'] ) && $response_keys === array_keys( $receipt['response'] ) && $this->abilities_v2_valid_ref( $receipt['response']['archive_ref'] ) && true === $receipt['response']['deleted'] && false === $receipt['response']['already_absent'] && is_int( $receipt['response']['auxiliary_records_removed'] ) && $receipt['response']['auxiliary_records_removed'] >= 0 && $receipt['response']['auxiliary_records_removed'] <= 10;
+    }
+
+    /**
+     * @param string      $request_ref Request reference.
+     * @param string      $hash Hash.
+     * @param string      $kind Kind.
+     * @param string|null $archive_ref Archive ref.
+     * @param string|null $destination_ref Destination ref.
+     * @return array
+     */
+    private function abilities_v2_new_operation( $request_ref, $hash, $kind, $archive_ref, $destination_ref ) {
+        $now = $this->abilities_v2_now();
+        return array(
+            'operation_ref'  => $this->abilities_v2_ref( 'op', $request_ref ),
+            'request_ref'    => $request_ref,
+            'request_hash'   => $hash,
+            'kind'           => $kind,
+            'state'          => 'queued',
+            'created_at'     => $now,
+            'updated_at'     => $now,
+            'progress'       => 0,
+            'archive_ref'    => $archive_ref,
+            'destination_ref'=> $destination_ref,
+            'warnings'       => array(),
+            'serial'         => substr( hash_hmac( 'sha256', 'serial' . "\0" . $request_ref, $this->abilities_v2_secret() ), 0, 10 ),
+        );
+    }
+
+    /**
+     * @param array $record Record.
+     * @return array
+     */
+    private function abilities_v2_public_operation( $record ) {
+        return array(
+            'operation_ref'  => $record['operation_ref'],
+            'kind'           => $record['kind'],
+            'state'          => $record['state'],
+            'created_at'     => (int) $record['created_at'],
+            'updated_at'     => (int) $record['updated_at'],
+            'progress_percent'=> isset( $record['progress'] ) ? $record['progress'] : null,
+            'archive_ref'    => isset( $record['archive_ref'] ) ? $record['archive_ref'] : null,
+            'destination_ref'=> isset( $record['destination_ref'] ) ? $record['destination_ref'] : null,
+            'warning_codes'  => isset( $record['warnings'] ) && is_array( $record['warnings'] ) ? array_values( $record['warnings'] ) : array(),
+        );
+    }
+
+    /**
+     * @param string $operation_ref Operation reference.
+     * @return array
+     */
+    private function abilities_v2_get_operation( $operation_ref ) {
+        if ( ! $this->abilities_v2_valid_ref( $operation_ref ) ) {
+            return $this->abilities_v2_error( 'invalid_request' );
+        }
+        $records = $this->abilities_v2_normalize_records( $this->abilities_v2_read_records() );
+        if ( isset( $records['error'] ) ) {
+            return $records;
+        }
+        if ( ! isset( $records['operations'][ $operation_ref ] ) || ! is_array( $records['operations'][ $operation_ref ] ) ) {
+            return $this->abilities_v2_error( 'not_found' );
+        }
+        $record = $this->abilities_v2_probe_operation( $records['operations'][ $operation_ref ] );
+        if ( ! $this->abilities_v2_valid_operation_record( $record ) ) {
+            return $this->abilities_v2_error( 'storage_failed' );
+        }
+        return array( 'operation' => $this->abilities_v2_public_operation( $record ) );
+    }
+
+    /**
+     * @param string $operation_ref Operation reference.
+     * @return array
+     */
+    private function abilities_v2_cancel_operation( $operation_ref ) {
+        if ( ! $this->abilities_v2_valid_ref( $operation_ref ) ) {
+            return $this->abilities_v2_error( 'invalid_request' );
+        }
+        $owner = $this->abilities_v2_acquire_effect_lock();
+        if ( false === $owner ) {
+            return $this->abilities_v2_error( 'lock_busy' );
+        }
+        $result = null;
+        try {
+            $records = $this->abilities_v2_normalize_records( $this->abilities_v2_read_records() );
+            if ( isset( $records['error'] ) ) {
+                $result = $records;
+            } elseif ( ! isset( $records['operations'][ $operation_ref ] ) ) {
+                $result = $this->abilities_v2_error( 'not_found' );
+            } else {
+                $record = $this->abilities_v2_probe_operation( $records['operations'][ $operation_ref ] );
+                if ( ! $this->abilities_v2_valid_operation_record( $record ) ) {
+                    $result = $this->abilities_v2_error( 'storage_failed' );
+                } elseif ( in_array( $record['state'], array( 'succeeded', 'failed', 'cancelled', 'cancel_requested' ), true ) ) {
+                    $result = array( 'operation' => $this->abilities_v2_public_operation( $record ) );
+                } elseif ( ! $this->abilities_v2_set_stop_signal( $record['serial'] ) ) {
+                    $result = $this->abilities_v2_error( 'effect_failed' );
+                } else {
+                    $record['state']      = 'cancel_requested';
+                    $record['updated_at'] = $this->abilities_v2_now();
+                    $record['warnings']   = array( 'cancel_not_immediate' );
+                    $records['operations'][ $operation_ref ] = $record;
+                    $result = $this->abilities_v2_write_records( $records ) ? array( 'operation' => $this->abilities_v2_public_operation( $record ) ) : $this->abilities_v2_error( 'storage_failed' );
+                }
+            }
+        } finally {
+            $released = $this->abilities_v2_release_effect_lock( $owner );
+        }
+        return $released ? $result : $this->abilities_v2_error( 'storage_failed' );
+    }
+
+    /**
+     * @param array $request Request.
+     * @return array
+     */
+    private function abilities_v2_delete_archive( $request ) {
+        if ( ! isset( $request['archive_ref'], $request['expected_size_bytes'], $request['expected_modified_at'], $request['request_ref'] ) || ! $this->abilities_v2_valid_ref( $request['archive_ref'] ) || ! is_int( $request['expected_size_bytes'] ) || $request['expected_size_bytes'] < 0 || ! is_int( $request['expected_modified_at'] ) || $request['expected_modified_at'] < 0 || ! $this->abilities_v2_valid_request_ref( $request['request_ref'] ) ) {
+            return $this->abilities_v2_error( 'invalid_request' );
+        }
+        $owner = $this->abilities_v2_acquire_effect_lock();
+        if ( false === $owner ) {
+            return $this->abilities_v2_error( 'lock_busy' );
+        }
+        $result = null;
+        try {
+            $replay = $this->abilities_v2_replay( $request['request_ref'], $request );
+            if ( null !== $replay ) {
+                $result = $replay;
+            } else {
+                $archive = $this->abilities_v2_resolve_archive( $request['archive_ref'] );
+                if ( is_array( $archive ) && isset( $archive['error'] ) ) {
+                    $result = $archive;
+                } elseif ( ! is_array( $archive ) ) {
+                    $result = $this->abilities_v2_error( 'not_found' );
+                } elseif ( $archive['size_bytes'] !== $request['expected_size_bytes'] || $archive['modified_at'] !== $request['expected_modified_at'] ) {
+                    $result = $this->abilities_v2_error( 'request_conflict' );
+                } else {
+                    $records = $this->abilities_v2_prepare_records();
+                    if ( isset( $records['error'] ) ) {
+                        $result = $records;
+                    } else {
+                        $receipt = array(
+                            'request_ref'  => $request['request_ref'],
+                            'request_hash' => $this->abilities_v2_request_hash( $request ),
+                            'created_at'   => $this->abilities_v2_now(),
+                            'state'        => 'pending',
+                            'response'     => null,
+                        );
+                        $records['receipts'][ $request['request_ref'] ] = $receipt;
+                        if ( ! $this->abilities_v2_write_records( $records ) ) {
+                            $result = $this->abilities_v2_error( 'storage_failed' );
+                        } else {
+                            $effect = $this->abilities_v2_delete_archive_effect( $archive );
+                            if ( ! is_array( $effect ) || empty( $effect['deleted'] ) || is_array( $this->abilities_v2_resolve_archive( $request['archive_ref'] ) ) ) {
+                                $result = $this->abilities_v2_error( 'outcome_unknown' );
+                            } else {
+                                $response = array(
+                                    'archive_ref'               => $request['archive_ref'],
+                                    'deleted'                   => true,
+                                    'already_absent'            => false,
+                                    'auxiliary_records_removed' => isset( $effect['auxiliary_records_removed'] ) ? min( 10, max( 0, (int) $effect['auxiliary_records_removed'] ) ) : 0,
+                                );
+                                $receipt['state']    = 'completed';
+                                $receipt['response'] = $response;
+                                $records['receipts'][ $request['request_ref'] ] = $receipt;
+                                $result = $this->abilities_v2_write_records( $records ) ? $response : $this->abilities_v2_error( 'outcome_unknown' );
+                            }
+                        }
+                    }
+                }
+            }
+        } finally {
+            $released = $this->abilities_v2_release_effect_lock( $owner );
+        }
+        return $released ? $result : $this->abilities_v2_error( 'storage_failed' );
+    }
+
+    /**
+     * @param array $request Request.
+     * @return array
+     */
+    private function abilities_v2_start_transfer( $request ) {
+        if ( ! isset( $request['archive_ref'], $request['destination_ref'], $request['request_ref'], $request['delete_local_after'] ) || false !== $request['delete_local_after'] || ! $this->abilities_v2_valid_ref( $request['archive_ref'] ) || ! $this->abilities_v2_valid_ref( $request['destination_ref'] ) || ! $this->abilities_v2_valid_request_ref( $request['request_ref'] ) ) {
+            return $this->abilities_v2_error( 'invalid_request' );
+        }
+        $owner = $this->abilities_v2_acquire_effect_lock();
+        if ( false === $owner ) {
+            return $this->abilities_v2_error( 'lock_busy' );
+        }
+        $result = null;
+        try {
+            $replay = $this->abilities_v2_replay( $request['request_ref'], $request );
+            if ( null !== $replay ) {
+                $result = $replay;
+            } else {
+                $archive     = $this->abilities_v2_resolve_archive( $request['archive_ref'] );
+                $destination = $this->abilities_v2_resolve_destination( $request['destination_ref'] );
+                if ( is_array( $archive ) && isset( $archive['error'] ) ) {
+                    $result = $archive;
+                } elseif ( ! is_array( $archive ) || null === $destination ) {
+                    $result = $this->abilities_v2_error( 'not_found' );
+                } else {
+                    $record  = $this->abilities_v2_new_operation( $request['request_ref'], $this->abilities_v2_request_hash( $request ), 'transfer', $request['archive_ref'], $request['destination_ref'] );
+                    $records = $this->abilities_v2_prepare_records();
+                    if ( isset( $records['error'] ) ) {
+                        $result = $records;
+                    } else {
+                        $records['operations'][ $record['operation_ref'] ] = $record;
+                        if ( ! $this->abilities_v2_write_records( $records ) ) {
+                            $result = $this->abilities_v2_error( 'storage_failed' );
+                        } elseif ( ! $this->abilities_v2_start_transfer_effect( $archive, $destination, $record['serial'] ) ) {
+                            $record['state']      = 'failed';
+                            $record['updated_at'] = $this->abilities_v2_now();
+                            $records['operations'][ $record['operation_ref'] ] = $record;
+                            $result = $this->abilities_v2_write_records( $records ) ? $this->abilities_v2_error( 'effect_failed' ) : $this->abilities_v2_error( 'outcome_unknown' );
+                        } else {
+                            $result = array( 'operation' => $this->abilities_v2_public_operation( $record ) );
+                        }
+                    }
+                }
+            }
+        } finally {
+            $released = $this->abilities_v2_release_effect_lock( $owner );
+        }
+        return $released ? $result : $this->abilities_v2_error( 'storage_failed' );
+    }
+
+    /**
+     * @param string $ref Archive ref.
+     * @return array|null
+     */
+    private function abilities_v2_resolve_archive( $ref ) {
+        $archives = $this->abilities_v2_archives();
+        if ( isset( $archives['error'] ) ) {
+            return $archives;
+        }
+        foreach ( $archives as $archive ) {
+            if ( hash_equals( $this->abilities_v2_ref( 'arc', $archive['internal_id'] ), $ref ) ) {
+                return $archive;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * @param string $ref Destination ref.
+     * @return string|null
+     */
+    private function abilities_v2_resolve_destination( $ref ) {
+        $options = $this->abilities_v2_read_options();
+        $items   = isset( $options['remote_destinations'] ) && is_array( $options['remote_destinations'] ) ? $options['remote_destinations'] : array();
+        foreach ( $items as $id => $destination ) {
+            if ( is_array( $destination ) && isset( $destination['type'] ) && is_string( $destination['type'] ) && $this->abilities_v2_destination_configured( strtolower( $destination['type'] ), $destination ) && hash_equals( $this->abilities_v2_ref( 'dst', (string) $id ), $ref ) ) {
+                return (string) $id;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * @param array  $profile Profile.
+     * @param string $serial Serial.
+     * @param array  $steps Steps.
+     * @return bool
+     */
+    protected function abilities_v2_start_backup_effect( $profile, $serial, $steps ) {
+        if ( ! class_exists( '\\pb_backupbuddy_backup' ) ) {
+            require_once \pb_backupbuddy::plugin_path() . '/classes/backup.php'; // NOSONAR - WP compatible.
+        }
+        $backup = new \pb_backupbuddy_backup();
+        return true === $backup->start_backup_process( $profile, 'manual', array(), $steps, '', $serial, array(), '', '' );
+    }
+
+    /**
+     * @param array $record Record.
+     * @return array
+     */
+    protected function abilities_v2_probe_operation( $record ) {
+        if ( ! class_exists( $this->backupbuddy_core_class ) ) {
+            return $record;
+        }
+        $prefix = 'transfer' === $record['kind'] ? 'send-mainwp-ability-' : '';
+        $file   = \backupbuddy_core::getLogDirectory() . 'fileoptions/' . $prefix . $record['serial'] . '.txt';
+        if ( ! file_exists( $file ) || ! class_exists( '\\pb_backupbuddy_fileoptions' ) ) {
+            return $record;
+        }
+        $options = new \pb_backupbuddy_fileoptions( $file, true );
+        if ( ! method_exists( $options, 'is_ok' ) || true !== $options->is_ok() || ! isset( $options->options ) || ! is_array( $options->options ) ) {
+            return $record;
+        }
+        $data = $options->options;
+        if ( 'transfer' === $record['kind'] ) {
+            if ( isset( $data['status'] ) && 'success' === $data['status'] && ! empty( $data['finish_time'] ) ) {
+                $record['state']    = 'succeeded';
+                $record['progress'] = 100;
+            } elseif ( isset( $data['status'] ) && in_array( $data['status'], array( 'failure', 'timeout', 'aborted' ), true ) ) {
+                $record['state'] = 'failed';
+            } elseif ( isset( $data['status'] ) && 'running' === $data['status'] ) {
+                $record['state'] = 'running';
+            }
+            return $record;
+        }
+        if ( ! empty( $data['finish_time'] ) && ! empty( $data['archive_file'] ) && file_exists( $data['archive_file'] ) ) {
+            $record['state']       = 'succeeded';
+            $record['progress']    = 100;
+            $record['archive_ref'] = $this->abilities_v2_ref( 'arc', basename( $data['archive_file'] ) );
+        } elseif ( ! empty( $data['error'] ) ) {
+            $record['state'] = 'failed';
+        } elseif ( 'queued' === $record['state'] ) {
+            $record['state'] = 'running';
+        }
+        return $record;
+    }
+
+    /**
+     * @param string $serial Serial.
+     * @return bool
+     */
+    protected function abilities_v2_set_stop_signal( $serial ) {
+        set_transient( 'pb_backupbuddy_stop_backup-' . $serial, true, DAY_IN_SECONDS );
+        return true === get_transient( 'pb_backupbuddy_stop_backup-' . $serial );
+    }
+
+    /**
+     * @param array $archive Archive.
+     * @return array
+     */
+    protected function abilities_v2_delete_archive_effect( $archive ) {
+        if ( ! isset( $archive['path'] ) || ! is_string( $archive['path'] ) || ! file_exists( $archive['path'] ) || is_link( $archive['path'] ) ) {
+            return array( 'deleted' => false, 'auxiliary_records_removed' => 0 );
+        }
+        if ( true !== wp_delete_file( $archive['path'] ) || file_exists( $archive['path'] ) ) {
+            return array( 'deleted' => false, 'auxiliary_records_removed' => 0 );
+        }
+        $removed = 0;
+        if ( class_exists( $this->backupbuddy_core_class ) && method_exists( $this->backupbuddy_core_class, 'get_serial_from_file' ) && method_exists( $this->backupbuddy_core_class, 'getLogDirectory' ) ) {
+            $serial = \backupbuddy_core::get_serial_from_file( $archive['internal_id'] );
+            foreach ( array( \backupbuddy_core::getLogDirectory() . 'fileoptions/' . $serial . '.txt', \backupbuddy_core::getLogDirectory() . 'fileoptions/' . $serial . '.txt.lock' ) as $auxiliary ) {
+                if ( file_exists( $auxiliary ) && true === wp_delete_file( $auxiliary ) && ! file_exists( $auxiliary ) ) {
+                    ++$removed;
+                }
+            }
+        }
+        return array( 'deleted' => true, 'auxiliary_records_removed' => $removed );
+    }
+
+    /**
+     * @param array  $archive Archive.
+     * @param string $destination Destination ID.
+     * @param string $serial Serial.
+     * @return bool
+     */
+    protected function abilities_v2_start_transfer_effect( $archive, $destination, $serial ) {
+        if ( ! class_exists( $this->backupbuddy_core_class ) || ! method_exists( $this->backupbuddy_core_class, 'schedule_single_event' ) ) {
+            return false;
+        }
+        return false !== \backupbuddy_core::schedule_single_event( $this->abilities_v2_now(), 'remote_send', array( $destination, $archive['path'], 'mainwp-ability-' . $serial, false, false ) );
     }
 
     /**

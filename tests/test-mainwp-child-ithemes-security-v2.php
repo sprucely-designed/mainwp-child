@@ -1,0 +1,292 @@
+<?php
+/**
+ * Solid Security abilities-v2 negotiation tests.
+ *
+ * @package MainWP_Child
+ */
+
+namespace MainWP\Child;
+
+use ReflectionClass;
+use WP_UnitTestCase;
+
+class Test_MainWP_Child_IThemes_Security_V2 extends WP_UnitTestCase {
+
+	/** @var MainWP_Child_IThemes_Security */
+	private $subject;
+
+	public function set_up(): void {
+		parent::set_up();
+		delete_site_option( 'itsec_temp_whitelist_ip' );
+		$reflection    = new ReflectionClass( MainWP_Child_IThemes_Security::class );
+		$this->subject = $reflection->newInstanceWithoutConstructor();
+	}
+
+	public function tear_down(): void {
+		delete_site_option( 'itsec_temp_whitelist_ip' );
+		parent::tear_down();
+	}
+
+	public function test_capabilities_are_closed_and_claim_no_unimplemented_operation() {
+		$result = $this->request( 'capabilities', array() );
+
+		$this->assertSame( array( 'protocol', 'operation', 'ok', 'operations', 'mutation_supported' ), array_keys( $result ) );
+		$this->assertSame( '2', $result['protocol'] );
+		$this->assertTrue( $result['ok'] );
+		$this->assertSame( array( 'ability_solid_file_permissions_v2', 'ability_solid_summary_v2', 'ability_solid_whitelist_v2' ), $result['operations'] );
+		$this->assertFalse( $result['mutation_supported'] );
+	}
+
+	public function test_summary_fails_closed_when_solid_is_unavailable() {
+		$result = $this->request( 'ability_solid_summary_v2', array() );
+
+		$this->assertSame( array( 'protocol', 'operation', 'ok', 'code' ), array_keys( $result ) );
+		$this->assertFalse( $result['ok'] );
+		$this->assertSame( 'plugin_unavailable', $result['code'] );
+	}
+
+	public function test_summary_projection_is_closed_bounded_and_redacted() {
+		$method = ( new ReflectionClass( MainWP_Child_IThemes_Security::class ) )->getMethod( 'abilities_v2_summary_response' );
+		$method->setAccessible( true );
+		$result = $method->invoke(
+			$this->subject,
+			2,
+			5,
+			array(
+				'status'       => 'clean',
+				'completed_at' => '2026-08-10T06:00:00Z',
+			),
+			true,
+			'2026-08-10T06:05:00Z'
+		);
+
+		$this->assertSame( array( 'protocol', 'operation', 'ok', 'complete', 'active_lockout_count', 'banned_count', 'latest_scan', 'observed_at', 'source_generation' ), array_keys( $result ) );
+		$this->assertTrue( $result['ok'] );
+		$this->assertTrue( $result['complete'] );
+		$this->assertSame( 2, $result['active_lockout_count'] );
+		$this->assertSame( 5, $result['banned_count'] );
+		$this->assertSame( array( 'status' => 'clean', 'completed_at' => '2026-08-10T06:00:00Z' ), $result['latest_scan'] );
+		$this->assertMatchesRegularExpression( '/^[a-f0-9]{64}$/', $result['source_generation'] );
+		$this->assertStringNotContainsString( 'description', wp_json_encode( $result ) );
+		$this->assertStringNotContainsString( 'lockout_id', wp_json_encode( $result ) );
+	}
+
+	public function test_summary_rejects_nonempty_payload() {
+		$result = $this->request( 'ability_solid_summary_v2', array( 'request_ref' => '123e4567-e89b-42d3-a456-426614174401' ) );
+
+		$this->assertFalse( $result['ok'] );
+		$this->assertSame( 'invalid_request', $result['code'] );
+	}
+
+	public function test_summary_scan_projection_is_coarse_and_fail_closed() {
+		$method = ( new ReflectionClass( MainWP_Child_IThemes_Security::class ) )->getMethod( 'abilities_v2_scan_projection' );
+		$method->setAccessible( true );
+
+		$complete = true;
+		$issues   = $method->invokeArgs(
+			$this->subject,
+			array(
+				array(
+					'status'      => 'issues_found',
+					'time'        => '2026-08-10T06:00:00Z',
+					'description' => 'secret finding and path',
+				),
+				&$complete,
+			)
+		);
+		$this->assertTrue( $complete );
+		$this->assertSame( array( 'status' => 'issues_found', 'completed_at' => '2026-08-10T06:00:00Z' ), $issues );
+		$this->assertStringNotContainsString( 'secret', wp_json_encode( $issues ) );
+
+		$complete = true;
+		$unknown  = $method->invokeArgs( $this->subject, array( array( 'status' => 'new-provider-state', 'time' => 1 ), &$complete ) );
+		$this->assertFalse( $complete );
+		$this->assertSame( 'unknown', $unknown['status'] );
+
+		$complete = true;
+		$malformed = $method->invokeArgs( $this->subject, array( array( 'status' => 'clean' ), &$complete ) );
+		$this->assertFalse( $complete );
+		$this->assertSame( array( 'status' => 'unknown', 'completed_at' => null ), $malformed );
+	}
+
+	public function test_temporary_whitelist_read_is_closed_and_redacted() {
+		$expires = time() + 3600;
+		update_site_option(
+			'itsec_temp_whitelist_ip',
+			array(
+				'ip'  => '192.0.2.10',
+				'exp' => $expires,
+			)
+		);
+
+		$result = $this->request( 'ability_solid_whitelist_v2', array() );
+
+		$this->assertSame( array( 'protocol', 'operation', 'ok', 'active', 'expires_at', 'address_family', 'revision' ), array_keys( $result ) );
+		$this->assertTrue( $result['ok'] );
+		$this->assertTrue( $result['active'] );
+		$this->assertSame( gmdate( 'Y-m-d\TH:i:s\Z', $expires ), $result['expires_at'] );
+		$this->assertSame( 'ipv4', $result['address_family'] );
+		$this->assertMatchesRegularExpression( '/^[a-f0-9]{64}$/', $result['revision'] );
+		$this->assertStringNotContainsString( '192.0.2.10', wp_json_encode( $result ) );
+
+		update_site_option(
+			'itsec_temp_whitelist_ip',
+			array(
+				'ip'  => '192.0.2.11',
+				'exp' => $expires,
+			)
+		);
+		$changed_address = $this->request( 'ability_solid_whitelist_v2', array() );
+		$this->assertNotSame( $result['revision'], $changed_address['revision'] );
+	}
+
+	public function test_temporary_whitelist_read_handles_absent_and_expired_without_writes() {
+		$absent = $this->request( 'ability_solid_whitelist_v2', array() );
+		$this->assertTrue( $absent['ok'] );
+		$this->assertFalse( $absent['active'] );
+		$this->assertNull( $absent['expires_at'] );
+		$this->assertNull( $absent['address_family'] );
+
+		$expired = array(
+			'ip'  => '2001:db8::10',
+			'exp' => time() - 60,
+		);
+		update_site_option( 'itsec_temp_whitelist_ip', $expired );
+		$result = $this->request( 'ability_solid_whitelist_v2', array() );
+
+		$this->assertTrue( $result['ok'] );
+		$this->assertFalse( $result['active'] );
+		$this->assertNull( $result['expires_at'] );
+		$this->assertNull( $result['address_family'] );
+		$this->assertSame( $expired, get_site_option( 'itsec_temp_whitelist_ip' ) );
+	}
+
+	public function test_temporary_whitelist_read_rejects_malformed_state_and_payload() {
+		update_site_option(
+			'itsec_temp_whitelist_ip',
+			array(
+				'ip'    => '192.0.2.10',
+				'exp'   => time() + 3600,
+				'extra' => true,
+			)
+		);
+
+		$result = $this->request( 'ability_solid_whitelist_v2', array() );
+		$this->assertFalse( $result['ok'] );
+		$this->assertSame( 'invalid_stored_state', $result['code'] );
+
+		$result = $this->request( 'ability_solid_whitelist_v2', array( 'request_ref' => '123e4567-e89b-42d3-a456-426614174401' ) );
+		$this->assertFalse( $result['ok'] );
+		$this->assertSame( 'invalid_request', $result['code'] );
+	}
+
+	public function test_file_permissions_are_closed_bounded_and_path_free() {
+		$result = $this->request( 'ability_solid_file_permissions_v2', array() );
+
+		$this->assertSame( array( 'protocol', 'operation', 'ok', 'targets', 'observed_at' ), array_keys( $result ) );
+		$this->assertTrue( $result['ok'] );
+		$this->assertCount( 10, $result['targets'] );
+		$this->assertSame(
+			array( 'wordpress_root', 'wp_includes', 'wp_admin', 'wp_admin_js', 'wp_content', 'themes', 'plugins', 'uploads', 'wp_config', 'server_config' ),
+			array_column( $result['targets'], 'target' )
+		);
+
+		foreach ( $result['targets'] as $target ) {
+			$this->assertSame( array( 'target', 'expected_mode', 'actual_mode', 'status' ), array_keys( $target ) );
+			$this->assertMatchesRegularExpression( '/^[0-7]{4}$/', $target['expected_mode'] );
+			$this->assertTrue( null === $target['actual_mode'] || 1 === preg_match( '/^[0-7]{4}$/', $target['actual_mode'] ) );
+			$this->assertContains( $target['status'], array( 'ok', 'warning', 'missing', 'unreadable' ) );
+		}
+
+		$encoded = wp_json_encode( $result );
+		$this->assertStringNotContainsString( ABSPATH, $encoded );
+		$this->assertMatchesRegularExpression( '/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/', $result['observed_at'] );
+	}
+
+	public function test_file_permissions_reject_nonempty_payload() {
+		$result = $this->request( 'ability_solid_file_permissions_v2', array( 'request_ref' => '123e4567-e89b-42d3-a456-426614174401' ) );
+		$this->assertFalse( $result['ok'] );
+		$this->assertSame( 'invalid_request', $result['code'] );
+	}
+
+	public function test_permission_projection_distinguishes_missing_warning_ok_and_symlink() {
+		$method = ( new ReflectionClass( MainWP_Child_IThemes_Security::class ) )->getMethod( 'abilities_v2_permission_target' );
+		$method->setAccessible( true );
+		$file = wp_tempnam( 'solid-permissions' );
+		$link = $file . '.link';
+
+		try {
+			$this->assertSame( 'missing', $method->invoke( $this->subject, 'wp_config', $file . '.missing', '0444' )['status'] );
+
+			chmod( $file, 0600 );
+			$this->assertSame( 'warning', $method->invoke( $this->subject, 'wp_config', $file, '0444' )['status'] );
+
+			chmod( $file, 0644 );
+			$actual = $method->invoke( $this->subject, 'wp_config', $file, '0644' );
+			$this->assertSame( 'ok', $actual['status'] );
+			$this->assertSame( '0644', $actual['actual_mode'] );
+
+			$this->assertTrue( symlink( $file, $link ) );
+			$this->assertSame( 'unreadable', $method->invoke( $this->subject, 'wp_config', $link, '0444' )['status'] );
+		} finally {
+			if ( is_link( $link ) ) {
+				unlink( $link );
+			}
+			if ( file_exists( $file ) ) {
+				unlink( $file );
+			}
+		}
+	}
+
+	public function test_malformed_unknown_and_alias_requests_fail_closed() {
+		$this->assertSame(
+			array(
+				'protocol'  => '2',
+				'operation' => 'unknown',
+				'ok'        => false,
+				'code'      => 'invalid_request',
+			),
+			$this->subject->abilities_v2( array() )
+		);
+
+		$unknown = $this->request( 'ability_solid_backup_v2', array() );
+		$this->assertFalse( $unknown['ok'] );
+		$this->assertSame( 'unsupported_operation', $unknown['code'] );
+
+		$alias = $this->subject->abilities_v2(
+			array(
+				'protocol'   => '2',
+				'operation'  => 'capabilities',
+				'payload'    => array(),
+				'request_id' => '123e4567-e89b-42d3-a456-426614174401',
+			)
+		);
+		$this->assertFalse( $alias['ok'] );
+		$this->assertSame( 'invalid_request', $alias['code'] );
+	}
+
+	public function test_reordered_envelope_is_accepted_but_extra_payload_is_not() {
+		$result = $this->subject->abilities_v2(
+			array(
+				'payload'   => array(),
+				'operation' => 'capabilities',
+				'protocol'  => '2',
+			)
+		);
+		$this->assertTrue( $result['ok'] );
+
+		$result = $this->request( 'capabilities', array( 'extra' => true ) );
+		$this->assertFalse( $result['ok'] );
+		$this->assertSame( 'unsupported_operation', $result['code'] );
+	}
+
+	private function request( $operation, $payload ) {
+		return $this->subject->abilities_v2(
+			array(
+				'protocol'  => '2',
+				'operation' => $operation,
+				'payload'   => $payload,
+			)
+		);
+	}
+}

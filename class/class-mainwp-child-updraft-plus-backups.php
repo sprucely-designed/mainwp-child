@@ -200,6 +200,9 @@ class MainWP_Child_Updraft_Plus_Backups { //phpcs:ignore -- NOSONAR - multi meth
                     case 'set_showhide':
                         $information = $this->set_showhide();
                         break;
+                    case 'abilities_v2':
+                        $information = $this->abilities_v2_action();
+                        break;
                     case 'save_settings':
                         $information = $this->save_settings();
                         break;
@@ -265,6 +268,88 @@ class MainWP_Child_Updraft_Plus_Backups { //phpcs:ignore -- NOSONAR - multi meth
             }
         }
         MainWP_Helper::write( $information );
+    }
+
+    /**
+     * Decode one additive UpdraftPlus abilities-v2 request.
+     *
+     * @return array Closed protocol response.
+     */
+    private function abilities_v2_action() {
+        // phpcs:ignore WordPress.Security.NonceVerification.Missing -- Authenticated MainWP Child callable.
+        if ( ! isset( $_POST['request'] ) || ! is_string( $_POST['request'] ) ) {
+            return $this->abilities_v2_error( 'unknown' );
+        }
+
+        // phpcs:ignore WordPress.Security.NonceVerification.Missing,WordPress.Security.ValidatedSanitizedInput.InputNotSanitized -- Closed JSON is validated below.
+        $raw = wp_unslash( $_POST['request'] );
+        if ( '' === $raw || 65536 < strlen( $raw ) ) {
+            return $this->abilities_v2_error( 'unknown' );
+        }
+
+        return $this->abilities_v2( json_decode( $raw, true ) );
+    }
+
+    /**
+     * Process the versioned UpdraftPlus negotiation request.
+     *
+     * No existing history, job, download, deletion, or restore method is
+     * advertised here because those legacy paths return raw HTML or lack the
+     * complete component generations required by the Ability contract.
+     *
+     * @param mixed $request Decoded request.
+     * @return array Closed protocol response.
+     */
+    public function abilities_v2( $request ) {
+        $operation = is_array( $request ) && isset( $request['operation'] ) && is_string( $request['operation'] ) ? $request['operation'] : 'unknown';
+        if ( ! is_array( $request ) || ! $this->abilities_v2_exact_keys( $request, array( 'protocol', 'operation', 'payload' ) ) || '2' !== $request['protocol'] || ! is_array( $request['payload'] ) || array() !== $request['payload'] ) {
+            return $this->abilities_v2_error( $operation );
+        }
+
+        if ( 'capabilities' === $operation ) {
+            return array(
+                'protocol'           => '2',
+                'operation'          => 'capabilities',
+                'ok'                 => true,
+                'operations'         => array(),
+                'mutation_supported' => false,
+            );
+        }
+
+        return $this->abilities_v2_error( $operation, 'unsupported_operation' );
+    }
+
+    /**
+     * Compare an exact object key set.
+     *
+     * @param mixed $value Value to inspect.
+     * @param array $keys Expected keys.
+     * @return bool Whether the keys match exactly.
+     */
+    private function abilities_v2_exact_keys( $value, $keys ) {
+        if ( ! is_array( $value ) ) {
+            return false;
+        }
+        $actual = array_keys( $value );
+        sort( $actual );
+        sort( $keys );
+        return $actual === $keys;
+    }
+
+    /**
+     * Return a stable non-reflective protocol error.
+     *
+     * @param string $operation Requested operation.
+     * @param string $code Stable error code.
+     * @return array Closed protocol response.
+     */
+    private function abilities_v2_error( $operation, $code = 'invalid_request' ) {
+        return array(
+            'protocol'  => '2',
+            'operation' => is_string( $operation ) && 1 === preg_match( '/^[a-z_]{1,32}$/D', $operation ) ? $operation : 'unknown',
+            'ok'        => false,
+            'code'      => $code,
+        );
     }
 
     /**

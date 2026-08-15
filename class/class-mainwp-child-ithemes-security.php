@@ -178,6 +178,17 @@ class MainWP_Child_IThemes_Security { //phpcs:ignore -- NOSONAR - multi methods.
      */
     public function action() {
         $information = array();
+
+        $mwp_action = MainWP_System::instance()->validate_params( 'mwp_action' );
+        if ( 'abilities_v2' === $mwp_action ) {
+            // phpcs:disable WordPress.Security.NonceVerification
+            $raw_request = isset( $_POST['request'] ) && is_string( $_POST['request'] ) ? wp_unslash( $_POST['request'] ) : '';
+            // phpcs:enable
+            $request = 4096 >= strlen( $raw_request ) ? json_decode( $raw_request, true ) : null;
+            MainWP_Helper::write( $this->abilities_v2( $request ) );
+            return;
+        }
+
         if ( ! class_exists( '\ITSEC_Core' ) || ! class_exists( '\ITSEC_Modules' ) ) {
             $information['error'] = 'NO_ITHEME';
             MainWP_Helper::write( $information );
@@ -192,7 +203,6 @@ class MainWP_Child_IThemes_Security { //phpcs:ignore -- NOSONAR - multi methods.
 
         $mainwp_itsec_modules_path = \ITSEC_Core::get_core_dir() . '/modules/';
 
-        $mwp_action = MainWP_System::instance()->validate_params( 'mwp_action' );
         if ( ! empty( $mwp_action ) ) {
             switch ( $mwp_action ) {
                 case 'set_showhide':
@@ -251,6 +261,400 @@ class MainWP_Child_IThemes_Security { //phpcs:ignore -- NOSONAR - multi methods.
             }
         }
         MainWP_Helper::write( $information );
+    }
+
+    /**
+     * Negotiate the additive Solid Security abilities protocol.
+     *
+     * Read operations are advertised only after their closed, privacy-safe
+     * projection tests pass. Mutations remain unavailable.
+     *
+     * @param mixed $request Decoded request object.
+     * @return array<string,mixed> Closed protocol response.
+     */
+    public function abilities_v2( $request ) {
+        $operation = is_array( $request ) && isset( $request['operation'] ) && is_string( $request['operation'] ) ? $request['operation'] : 'unknown';
+        if ( ! is_array( $request ) || ! $this->abilities_v2_exact_keys( $request, array( 'protocol', 'operation', 'payload' ) ) || '2' !== $request['protocol'] || ! is_array( $request['payload'] ) ) {
+            return $this->abilities_v2_error( 'unknown', 'invalid_request' );
+        }
+
+        if ( 'capabilities' === $operation && array() === $request['payload'] ) {
+            return array(
+                'protocol'           => '2',
+                'operation'          => 'capabilities',
+                'ok'                 => true,
+                'operations'         => array( 'ability_solid_file_permissions_v2', 'ability_solid_summary_v2', 'ability_solid_whitelist_v2' ),
+                'mutation_supported' => false,
+            );
+        }
+
+        if ( 'ability_solid_file_permissions_v2' === $operation ) {
+            if ( array() !== $request['payload'] ) {
+                return $this->abilities_v2_error( $operation, 'invalid_request' );
+            }
+
+            return $this->abilities_v2_file_permissions();
+        }
+
+        if ( 'ability_solid_summary_v2' === $operation ) {
+            if ( array() !== $request['payload'] ) {
+                return $this->abilities_v2_error( $operation, 'invalid_request' );
+            }
+
+            return $this->abilities_v2_summary();
+        }
+
+        if ( 'ability_solid_whitelist_v2' === $operation ) {
+            if ( array() !== $request['payload'] ) {
+                return $this->abilities_v2_error( $operation, 'invalid_request' );
+            }
+
+            return $this->abilities_v2_whitelist();
+        }
+
+        return $this->abilities_v2_error( $operation, 'unsupported_operation' );
+    }
+
+    /**
+     * Return bounded coarse Solid posture without identities or findings.
+     *
+     * @return array<string,mixed> Closed summary response.
+     */
+    private function abilities_v2_summary() { // phpcs:ignore Generic.Metrics.CyclomaticComplexity.TooHigh -- version-gated read projection.
+        if ( ! class_exists( '\ITSEC_Core' ) ) {
+            return $this->abilities_v2_error( 'ability_solid_summary_v2', 'plugin_unavailable' );
+        }
+
+        $complete      = true;
+        $lockout_count = null;
+        $banned_count  = null;
+        $latest_scan   = array(
+            'status'       => 'unknown',
+            'completed_at' => null,
+        );
+
+        global $itsec_lockout;
+        if ( is_object( $itsec_lockout ) && is_callable( array( $itsec_lockout, 'get_lockouts' ) ) ) {
+            try {
+                $lockouts = $itsec_lockout->get_lockouts(
+                    'all',
+                    array(
+                        'limit'   => 1001,
+                        'current' => true,
+                        'order'   => 'DESC',
+                        'orderby' => 'lockout_start',
+                    )
+                );
+                if ( is_array( $lockouts ) && count( $lockouts ) <= 1000 ) {
+                    $lockout_count = count( $lockouts );
+                } else {
+                    $complete = false;
+                }
+            } catch ( \Throwable $throwable ) { // NOSONAR - third-party version boundary.
+                $complete = false;
+            }
+        } else {
+            $complete = false;
+        }
+
+        if ( class_exists( '\iThemesSecurity\Ban_Users\Database_Repository' ) && class_exists( '\iThemesSecurity\Ban_Hosts\Filters' ) && is_callable( array( '\ITSEC_Modules', 'get_container' ) ) ) {
+            try {
+                $repository = \ITSEC_Modules::get_container()->get( \iThemesSecurity\Ban_Users\Database_Repository::class );
+                $count      = $repository->count_bans( new \iThemesSecurity\Ban_Hosts\Filters() );
+                if ( is_int( $count ) && $count >= 0 && $count <= 100000 ) {
+                    $banned_count = $count;
+                } else {
+                    $complete = false;
+                }
+            } catch ( \Throwable $throwable ) { // NOSONAR - third-party version boundary.
+                $complete = false;
+            }
+        } else {
+            $complete = false;
+        }
+
+        if ( class_exists( '\WP_REST_Request' ) ) {
+            try {
+                $request = new \WP_REST_Request( 'GET', '/ithemes-security/v1/site-scanner/scans' );
+                $now     = \ITSEC_Core::get_current_time_gmt();
+                $request->set_query_params(
+                    array(
+                        'after'  => \ITSEC_Lib::to_rest_date( strtotime( '-30 days', $now ) ),
+                        'before' => \ITSEC_Lib::to_rest_date( $now ),
+                    )
+                );
+                $response = rest_do_request( $request );
+                if ( ! is_wp_error( $response ) ) {
+                    $scans = rest_get_server()->response_to_data( $response, true );
+                    if ( is_array( $scans ) && array() === $scans ) {
+                        $latest_scan = array(
+                            'status'       => 'never_run',
+                            'completed_at' => null,
+                        );
+                    } elseif ( is_array( $scans ) && isset( $scans[0] ) && is_array( $scans[0] ) ) {
+                        $latest_scan = $this->abilities_v2_scan_projection( $scans[0], $complete );
+                    } else {
+                        $complete = false;
+                    }
+                } else {
+                    $complete = false;
+                }
+            } catch ( \Throwable $throwable ) { // NOSONAR - third-party REST boundary.
+                $complete = false;
+            }
+        } else {
+            $complete = false;
+        }
+
+        return $this->abilities_v2_summary_response( $lockout_count, $banned_count, $latest_scan, $complete, gmdate( 'Y-m-d\TH:i:s\Z' ) );
+    }
+
+    /**
+     * Normalize one latest-scan row to a closed coarse state.
+     *
+     * @param array $scan     Provider-owned scan row.
+     * @param bool  $complete Whether the whole summary remains complete.
+     * @return array<string,string|null> Coarse scan state.
+     */
+    private function abilities_v2_scan_projection( $scan, &$complete ) {
+        if ( ! isset( $scan['status'], $scan['time'] ) || ! is_string( $scan['status'] ) || ( ! is_string( $scan['time'] ) && ! is_int( $scan['time'] ) ) ) {
+            $complete = false;
+            return array(
+                'status'       => 'unknown',
+                'completed_at' => null,
+            );
+        }
+
+        $timestamp = is_int( $scan['time'] ) ? $scan['time'] : strtotime( $scan['time'] );
+        $status    = strtolower( $scan['status'] );
+        if ( false === $timestamp || $timestamp < 1 ) {
+            $complete = false;
+            return array(
+                'status'       => 'unknown',
+                'completed_at' => null,
+            );
+        }
+        if ( 'clean' === $status ) {
+            $coarse = 'clean';
+        } elseif ( in_array( $status, array( 'failed', 'error' ), true ) ) {
+            $coarse = 'failed';
+        } elseif ( in_array( $status, array( 'issues', 'issues_found', 'warning' ), true ) ) {
+            $coarse = 'issues_found';
+        } else {
+            $complete = false;
+            $coarse   = 'unknown';
+        }
+
+        return array(
+            'status'       => $coarse,
+            'completed_at' => gmdate( 'Y-m-d\TH:i:s\Z', $timestamp ),
+        );
+    }
+
+    /**
+     * Build the closed summary envelope and source generation.
+     *
+     * @param int|null $lockout_count Active lockout count.
+     * @param int|null $banned_count  Active ban count.
+     * @param array    $latest_scan   Coarse latest scan state.
+     * @param bool     $complete      Whether every source was complete.
+     * @param string   $observed_at   Observation timestamp.
+     * @return array<string,mixed> Closed summary response.
+     */
+    private function abilities_v2_summary_response( $lockout_count, $banned_count, $latest_scan, $complete, $observed_at ) {
+        $state = array(
+            'complete'             => (bool) $complete,
+            'active_lockout_count' => $lockout_count,
+            'banned_count'         => $banned_count,
+            'latest_scan'          => $latest_scan,
+            'observed_at'          => $observed_at,
+        );
+
+        return array(
+            'protocol'             => '2',
+            'operation'            => 'ability_solid_summary_v2',
+            'ok'                   => true,
+            'complete'             => $state['complete'],
+            'active_lockout_count' => $state['active_lockout_count'],
+            'banned_count'         => $state['banned_count'],
+            'latest_scan'          => $state['latest_scan'],
+            'observed_at'          => $state['observed_at'],
+            'source_generation'    => hash_hmac( 'sha256', 'mainwp-solid-summary-v1|' . wp_json_encode( $state ), wp_salt( 'auth' ) ),
+        );
+    }
+
+    /**
+     * Return permission posture for fixed WordPress targets without paths.
+     *
+     * @return array<string,mixed> Closed permission response.
+     */
+    private function abilities_v2_file_permissions() {
+        $upload     = wp_get_upload_dir();
+        $upload_dir = is_array( $upload ) && isset( $upload['basedir'] ) && is_string( $upload['basedir'] ) ? $upload['basedir'] : null;
+        $wp_config  = ABSPATH . 'wp-config.php';
+        if ( ! file_exists( $wp_config ) && ! is_link( $wp_config ) ) {
+            $parent_config = dirname( rtrim( ABSPATH, '/\\' ) ) . '/wp-config.php';
+            $wp_config     = file_exists( $parent_config ) || is_link( $parent_config ) ? $parent_config : $wp_config;
+        }
+        $server_config = ABSPATH . '.htaccess';
+        $web_config    = ABSPATH . 'web.config';
+        if ( ! file_exists( $server_config ) && ! is_link( $server_config ) && ( file_exists( $web_config ) || is_link( $web_config ) ) ) {
+            $server_config = $web_config;
+        }
+
+        $definitions = array(
+            array( 'wordpress_root', ABSPATH, '0755' ),
+            array( 'wp_includes', ABSPATH . WPINC, '0755' ),
+            array( 'wp_admin', ABSPATH . 'wp-admin', '0755' ),
+            array( 'wp_admin_js', ABSPATH . 'wp-admin/js', '0755' ),
+            array( 'wp_content', WP_CONTENT_DIR, '0755' ),
+            array( 'themes', get_theme_root(), '0755' ),
+            array( 'plugins', WP_PLUGIN_DIR, '0755' ),
+            array( 'uploads', $upload_dir, '0755' ),
+            array( 'wp_config', $wp_config, '0444' ),
+            array( 'server_config', $server_config, '0444' ),
+        );
+        $targets     = array();
+
+        foreach ( $definitions as $definition ) {
+            $targets[] = $this->abilities_v2_permission_target( $definition[0], $definition[1], $definition[2] );
+        }
+
+        return array(
+            'protocol'    => '2',
+            'operation'   => 'ability_solid_file_permissions_v2',
+            'ok'          => true,
+            'targets'     => $targets,
+            'observed_at' => gmdate( 'Y-m-d\TH:i:s\Z' ),
+        );
+    }
+
+    /**
+     * Project one fixed permission target without returning its path.
+     *
+     * @param string      $target        Logical target name.
+     * @param string|null $path          Server-owned fixed path.
+     * @param string      $expected_mode Expected four-digit mode.
+     * @return array<string,string|null>
+     */
+    private function abilities_v2_permission_target( $target, $path, $expected_mode ) {
+        $actual_mode = null;
+        $status      = 'missing';
+
+        if ( is_string( $path ) && '' !== $path && is_link( $path ) ) {
+            $status = 'unreadable';
+        } elseif ( is_string( $path ) && '' !== $path && file_exists( $path ) ) {
+            if ( ! is_readable( $path ) ) {
+                $status = 'unreadable';
+            } else {
+                $permissions = fileperms( $path );
+                if ( false === $permissions ) {
+                    $status = 'unreadable';
+                } else {
+                    $actual_mode = sprintf( '%04o', $permissions & 0777 );
+                    $status      = $expected_mode === $actual_mode ? 'ok' : 'warning';
+                }
+            }
+        }
+
+        return array(
+            'target'        => $target,
+            'expected_mode' => $expected_mode,
+            'actual_mode'   => $actual_mode,
+            'status'        => $status,
+        );
+    }
+
+    /**
+     * Return temporary-whitelist state without exposing the stored address.
+     *
+     * Expired state is projected as inactive without deleting the legacy
+     * option, keeping this protocol operation read-only.
+     *
+     * @return array<string,mixed> Closed whitelist response.
+     */
+    private function abilities_v2_whitelist() {
+        $operation = 'ability_solid_whitelist_v2';
+        $stored    = get_site_option( 'itsec_temp_whitelist_ip', false );
+        if ( false === $stored ) {
+            return $this->abilities_v2_whitelist_response( false, null, null, null );
+        }
+        if ( ! is_array( $stored ) || ! $this->abilities_v2_exact_keys( $stored, array( 'ip', 'exp' ) ) || ! is_string( $stored['ip'] ) || ! is_int( $stored['exp'] ) || $stored['exp'] < 1 ) {
+            return $this->abilities_v2_error( $operation, 'invalid_stored_state' );
+        }
+
+        $packed = inet_pton( $stored['ip'] );
+        if ( false === $packed ) {
+            return $this->abilities_v2_error( $operation, 'invalid_stored_state' );
+        }
+
+        if ( $stored['exp'] <= time() ) {
+            return $this->abilities_v2_whitelist_response( false, null, null, null );
+        }
+
+        $family = 4 === strlen( $packed ) ? 'ipv4' : 'ipv6';
+
+        return $this->abilities_v2_whitelist_response( true, $stored['exp'], $family, bin2hex( $packed ) );
+    }
+
+    /**
+     * Build a privacy-safe temporary-whitelist response and revision.
+     *
+     * @param bool        $active           Whether the stored entry is active.
+     * @param int|null    $expires_at       Expiry timestamp.
+     * @param string|null $family           Coarse address family.
+     * @param string|null $address_material Canonical address material for HMAC only.
+     * @return array<string,mixed> Closed whitelist response.
+     */
+    private function abilities_v2_whitelist_response( $active, $expires_at, $family, $address_material ) {
+        $state                              = array(
+            'active'         => $active,
+            'expires_at'     => null === $expires_at ? null : gmdate( 'Y-m-d\TH:i:s\Z', $expires_at ),
+            'address_family' => $family,
+        );
+        $revision_state                     = $state;
+        $revision_state['address_material'] = $address_material;
+
+        return array(
+            'protocol'       => '2',
+            'operation'      => 'ability_solid_whitelist_v2',
+            'ok'             => true,
+            'active'         => $state['active'],
+            'expires_at'     => $state['expires_at'],
+            'address_family' => $state['address_family'],
+            'revision'       => hash_hmac( 'sha256', 'mainwp-solid-whitelist-v1|' . wp_json_encode( $revision_state ), wp_salt( 'auth' ) ),
+        );
+    }
+
+    /**
+     * Check an exact associative-key set.
+     *
+     * @param array $value Input object.
+     * @param array $keys  Expected keys.
+     * @return bool
+     */
+    private function abilities_v2_exact_keys( $value, $keys ) {
+        $actual = array_keys( $value );
+        sort( $actual, SORT_STRING );
+        sort( $keys, SORT_STRING );
+
+        return $actual === $keys;
+    }
+
+    /**
+     * Build a closed abilities protocol error.
+     *
+     * @param string $operation Protocol operation.
+     * @param string $code      Stable error code.
+     * @return array<string,string|bool>
+     */
+    private function abilities_v2_error( $operation, $code ) {
+        return array(
+            'protocol'  => '2',
+            'operation' => $operation,
+            'ok'        => false,
+            'code'      => $code,
+        );
     }
 
 

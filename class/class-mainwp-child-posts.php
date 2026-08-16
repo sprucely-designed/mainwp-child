@@ -23,6 +23,12 @@ if ( ! defined( 'ABSPATH' ) ) {
  */
 class MainWP_Child_Posts { //phpcs:ignore -- NOSONAR - multi methods.
 
+    /** Maximum durable receipts retained for each content protocol. */
+    private const CONTENT_V2_MAX_RECORDS = 500;
+
+    /** Minimum terminal-receipt retention in seconds. */
+    private const CONTENT_V2_RETENTION = 7776000;
+
     /**
      * Public static variable to hold the single instance of MainWP_Child_Posts.
      *
@@ -361,14 +367,13 @@ class MainWP_Child_Posts { //phpcs:ignore -- NOSONAR - multi methods.
     /**
      * Negotiate the Post Dripper Child protocol.
      *
-     * Publishing and receipt status remain unavailable until their durable
-     * idempotency contract is implemented.
+     * Publishing and receipt status use a durable idempotency contract.
      *
      * @param mixed $request Decoded protocol request.
      * @return array Closed protocol response.
      */
     public function post_dripper_capabilities_v2( $request ) {
-        if ( ! is_array( $request ) || ! $this->posts_v2_exact_keys( $request, array( 'protocol', 'operation', 'payload' ) ) || '2' !== $request['protocol'] || ! is_string( $request['operation'] ) || ! is_array( $request['payload'] ) ) {
+        if ( ! is_array( $request ) || ! $this->posts_v2_exact_keys( $request, array( 'protocol', 'operation', 'payload' ) ) || '2' !== $request['protocol'] || ! is_string( $request['operation'] ) || 1 !== preg_match( '/^[a-z0-9_]{1,64}$/D', $request['operation'] ) || ! is_array( $request['payload'] ) ) {
             return $this->post_dripper_v2_error( 'unknown', 'invalid_request' );
         }
 
@@ -378,9 +383,15 @@ class MainWP_Child_Posts { //phpcs:ignore -- NOSONAR - multi methods.
                 'protocol'           => '2',
                 'operation'          => 'capabilities',
                 'ok'                 => true,
-                'operations'         => array(),
-                'mutation_supported' => false,
+                'operations'         => array( 'post_dripper_delivery_v2', 'post_dripper_status_v2' ),
+                'mutation_supported' => true,
             );
+        }
+        if ( 'post_dripper_delivery_v2' === $operation ) {
+            return $this->content_v2_mutate( 'post_dripper', $operation, $request['payload'] );
+        }
+        if ( 'post_dripper_status_v2' === $operation ) {
+            return $this->content_v2_status( 'post_dripper', $operation, $request['payload'], false );
         }
 
         return $this->post_dripper_v2_error( $operation, 'unsupported_operation' );
@@ -389,14 +400,13 @@ class MainWP_Child_Posts { //phpcs:ignore -- NOSONAR - multi methods.
     /**
      * Negotiate the Post Plus Child protocol.
      *
-     * Post creation and receipt status remain unavailable until their durable
-     * idempotency contract is implemented.
+     * Post creation and receipt status use a durable idempotency contract.
      *
      * @param mixed $request Decoded protocol request.
      * @return array Closed protocol response.
      */
     public function post_plus_capabilities_v2( $request ) {
-        if ( ! is_array( $request ) || ! $this->posts_v2_exact_keys( $request, array( 'protocol', 'operation', 'payload' ) ) || '2' !== $request['protocol'] || ! is_string( $request['operation'] ) || ! is_array( $request['payload'] ) ) {
+        if ( ! is_array( $request ) || ! $this->posts_v2_exact_keys( $request, array( 'protocol', 'operation', 'payload' ) ) || '2' !== $request['protocol'] || ! is_string( $request['operation'] ) || 1 !== preg_match( '/^[a-z0-9_]{1,64}$/D', $request['operation'] ) || ! is_array( $request['payload'] ) ) {
             return $this->post_plus_v2_error( 'unknown', 'invalid_request' );
         }
 
@@ -406,12 +416,918 @@ class MainWP_Child_Posts { //phpcs:ignore -- NOSONAR - multi methods.
                 'protocol'           => '2',
                 'operation'          => 'capabilities',
                 'ok'                 => true,
-                'operations'         => array(),
-                'mutation_supported' => false,
+                'operations'         => array( 'post_plus_newpost_v2', 'post_plus_status_v2', 'post_plus_readback_v2' ),
+                'mutation_supported' => true,
             );
+        }
+        if ( 'post_plus_newpost_v2' === $operation ) {
+            return $this->content_v2_mutate( 'post_plus', $operation, $request['payload'] );
+        }
+        if ( 'post_plus_status_v2' === $operation ) {
+            return $this->content_v2_status( 'post_plus', $operation, $request['payload'], false );
+        }
+        if ( 'post_plus_readback_v2' === $operation ) {
+            return $this->content_v2_status( 'post_plus', $operation, $request['payload'], true );
         }
 
         return $this->post_plus_v2_error( $operation, 'unsupported_operation' );
+    }
+
+    /**
+     * Reserve and apply one typed post creation or update exactly once.
+     *
+     * @param string $protocol  Closed protocol name.
+     * @param string $operation Closed operation name.
+     * @param array  $payload   Untrusted decoded payload.
+     * @return array Closed operation result.
+     */
+    private function content_v2_mutate( $protocol, $operation, $payload ) {
+        $normalized = $this->content_v2_normalize_mutation( $protocol, $payload );
+        if ( false === $normalized ) {
+            return $this->content_v2_error( $protocol, $operation, 'invalid_request' );
+        }
+
+        $effect_hash = hash( 'sha256', wp_json_encode( $normalized ) );
+        if ( ! $this->content_v2_begin_lock( $protocol ) ) {
+            return $this->content_v2_error( $protocol, $operation, 'lock_busy' );
+        }
+
+        try {
+            $records = $this->content_v2_records( $protocol );
+            if ( false === $records ) {
+                return $this->content_v2_error( $protocol, $operation, 'storage_unavailable' );
+            }
+            $records = $this->content_v2_prune_records( $protocol, $records );
+            if ( false === $records ) {
+                return $this->content_v2_error( $protocol, $operation, 'storage_unavailable' );
+            }
+
+            $operation_ref = $normalized['operation_ref'];
+            if ( isset( $records[ $operation_ref ] ) ) {
+                if ( ! hash_equals( $records[ $operation_ref ]['dashboard_ref'], $normalized['dashboard_ref'] ) || ! hash_equals( $records[ $operation_ref ]['effect_hash'], $effect_hash ) ) {
+                    return $this->content_v2_error( $protocol, $operation, 'request_conflict' );
+                }
+                if ( 'reserved' === $records[ $operation_ref ]['state'] ) {
+                    $record = $this->content_v2_reconcile_reserved( $protocol, $records[ $operation_ref ], $records, 'reserved' );
+                    if ( false === $record ) {
+                        return $this->content_v2_error( $protocol, $operation, 'storage_unavailable' );
+                    }
+                    if ( 'reserved' !== $record['state'] ) {
+                        return $this->content_v2_project( $protocol, $operation, $record );
+                    }
+                } elseif ( 'not_applied' === $records[ $operation_ref ]['state'] && $records[ $operation_ref ]['retryable'] ) {
+                    $records[ $operation_ref ]['state']      = 'reserved';
+                    $records[ $operation_ref ]['retryable']  = false;
+                    $records[ $operation_ref ]['updated_at'] = time();
+                    if ( ! $this->content_v2_write_records( $protocol, $records ) ) {
+                        return $this->content_v2_error( $protocol, $operation, 'storage_unavailable' );
+                    }
+                } else {
+                    return $this->content_v2_project( $protocol, $operation, $records[ $operation_ref ] );
+                }
+            } elseif ( $normalized['expires_at'] < time() - 60 ) {
+                return $this->content_v2_error( $protocol, $operation, 'expired_request' );
+            } elseif ( self::CONTENT_V2_MAX_RECORDS <= count( $records ) ) {
+                return $this->content_v2_error( $protocol, $operation, 'storage_unavailable' );
+            }
+
+            $target = null;
+            if ( 'update' === $normalized['mode'] ) {
+                $target = get_post( $normalized['target_post_id'] );
+                if ( ! $target instanceof \WP_Post || $target->post_type !== $normalized['post']['post_type'] ) {
+                    return $this->content_v2_error( $protocol, $operation, 'target_not_found' );
+                }
+                $current_revision = $this->content_v2_post_revision( $target->ID );
+                if ( false === $current_revision || ! hash_equals( $normalized['expected_revision'], $current_revision ) ) {
+                    return $this->content_v2_error( $protocol, $operation, 'stale_revision' );
+                }
+            }
+
+            if ( ! isset( $records[ $operation_ref ] ) ) {
+                $choices = 'post_plus' === $protocol ? $this->content_v2_random_choices( $normalized ) : array(
+                    'author_id'     => $target instanceof \WP_Post ? (int) $target->post_author : get_current_user_id(),
+                    'category_id'   => null,
+                    'post_date_gmt' => null,
+                );
+                if ( false === $choices ) {
+                    return $this->content_v2_error( $protocol, $operation, 'unsupported_content' );
+                }
+                if ( ! $this->content_v2_choices_available( $choices ) ) {
+                    return $this->content_v2_error( $protocol, $operation, 'unsupported_content' );
+                }
+                $now                       = time();
+                $records[ $operation_ref ] = array(
+                    'dashboard_ref'     => $normalized['dashboard_ref'],
+                    'operation_ref'     => $operation_ref,
+                    'effect_hash'       => $effect_hash,
+                    'content_digest'    => $normalized['content_digest'],
+                    'mode'              => $normalized['mode'],
+                    'target_post_id'    => $normalized['target_post_id'],
+                    'expected_revision' => $normalized['expected_revision'],
+                    'post_id'           => null,
+                    'state'             => 'reserved',
+                    'post_revision'     => null,
+                    'remote_post_ref'   => null,
+                    'retryable'         => false,
+                    'choices'           => $choices,
+                    'accepted_at'       => $now,
+                    'updated_at'        => $now,
+                );
+                if ( ! $this->content_v2_write_records( $protocol, $records ) ) {
+                    return $this->content_v2_error( $protocol, $operation, 'storage_unavailable' );
+                }
+            } else {
+                $choices = $records[ $operation_ref ]['choices'];
+            }
+
+            return $this->content_v2_apply( $protocol, $operation, $normalized, $records, $choices );
+        } finally {
+            $this->content_v2_end_lock( $protocol );
+        }
+    }
+
+    /**
+     * Return or repair one durable post-operation result.
+     *
+     * @param string $protocol  Closed protocol name.
+     * @param string $operation Closed operation name.
+     * @param array  $payload   Untrusted identity payload.
+     * @param bool   $readback  Whether to add current redacted readback.
+     * @return array Closed operation result.
+     */
+    private function content_v2_status( $protocol, $operation, $payload, $readback ) {
+        $dashboard_ref = $this->content_v2_dashboard_ref();
+        if ( ! is_array( $payload ) || ! $this->posts_v2_exact_keys( $payload, array( 'dashboard_ref', 'operation_ref' ) ) || ! $this->content_v2_hash( $payload['dashboard_ref'] ) || false === $dashboard_ref || ! hash_equals( $dashboard_ref, $payload['dashboard_ref'] ) || ! $this->content_v2_uuid( $payload['operation_ref'] ) ) {
+            return $this->content_v2_error( $protocol, $operation, 'invalid_request' );
+        }
+        if ( ! $this->content_v2_begin_lock( $protocol ) ) {
+            return $this->content_v2_error( $protocol, $operation, 'lock_busy' );
+        }
+
+        try {
+            $records = $this->content_v2_records( $protocol );
+            if ( false === $records ) {
+                return $this->content_v2_error( $protocol, $operation, 'storage_unavailable' );
+            }
+            $records = $this->content_v2_prune_records( $protocol, $records );
+            if ( false === $records ) {
+                return $this->content_v2_error( $protocol, $operation, 'storage_unavailable' );
+            }
+            if ( ! isset( $records[ $payload['operation_ref'] ] ) || ! hash_equals( $records[ $payload['operation_ref'] ]['dashboard_ref'], $payload['dashboard_ref'] ) ) {
+                return $this->content_v2_error( $protocol, $operation, 'operation_not_found' );
+            }
+
+            $record = $records[ $payload['operation_ref'] ];
+            if ( 'reserved' === $record['state'] ) {
+                $record = $this->content_v2_reconcile_reserved( $protocol, $record, $records, 'not_applied' );
+                if ( false === $record ) {
+                    return $this->content_v2_error( $protocol, $operation, 'storage_unavailable' );
+                }
+            }
+
+            return $this->content_v2_project( $protocol, $operation, $record, $readback );
+        } finally {
+            $this->content_v2_end_lock( $protocol );
+        }
+    }
+
+    /**
+     * Reconcile one durable reservation without repeating a proven effect.
+     *
+     * @param string $protocol   Closed protocol name.
+     * @param array  $record     Valid reservation.
+     * @param array  $records    Valid ledger, updated by reference.
+     * @param string $zero_state State used when no committed post exists.
+     * @return array|false Reconciled record or false on storage failure.
+     */
+    private function content_v2_reconcile_reserved( $protocol, $record, &$records, $zero_state ) {
+        $matches = get_posts(
+            array(
+                'post_type'      => array( 'post', 'page' ),
+                'post_status'    => array( 'publish', 'private', 'draft', 'pending', 'future', 'trash' ),
+                'meta_key'       => '_mainwp_child_content_operation_v2', // phpcs:ignore WordPress.DB.SlowDBQuery.slow_db_query_meta_key -- Bounded private reconciliation key.
+                'meta_value'     => $record['operation_ref'], // phpcs:ignore WordPress.DB.SlowDBQuery.slow_db_query_meta_value -- Exact operation receipt binding.
+                'posts_per_page' => 2,
+            )
+        );
+        if ( ! is_array( $matches ) || 2 < count( $matches ) ) {
+            return false;
+        }
+        $match_count = count( $matches );
+        if ( 1 === $match_count ) {
+            $revision = $this->content_v2_post_revision( $matches[0]->ID );
+            if ( false === $revision ) {
+                $record['state'] = 'unknown';
+            } else {
+                $record['post_id']         = $matches[0]->ID;
+                $record['state']           = 'applied';
+                $record['post_revision']   = $revision;
+                $record['remote_post_ref'] = $this->content_v2_remote_ref( $protocol, $record['dashboard_ref'], $matches[0]->ID );
+            }
+        } elseif ( 0 === $match_count && 'not_applied' === $zero_state ) {
+            $record['state']     = 'not_applied';
+            $record['retryable'] = true;
+        } elseif ( 0 === $match_count ) {
+            return $record;
+        } else {
+            $record['state'] = 'unknown';
+        }
+        if ( 'unknown' === $record['state'] ) {
+            $record['retryable'] = false;
+        }
+        $record['updated_at']                = time();
+        $records[ $record['operation_ref'] ] = $record;
+        return $this->content_v2_write_records( $protocol, $records ) ? $record : false;
+    }
+
+    /**
+     * Normalize one closed mutation payload and verify its caller digest.
+     *
+     * @param string $protocol Closed protocol name.
+     * @param mixed  $payload  Untrusted mutation payload.
+     * @return array|false Normalized payload or false.
+     */
+    private function content_v2_normalize_mutation( $protocol, $payload ) {
+        $keys = array( 'dashboard_ref', 'operation_ref', 'mode', 'target_post_id', 'expected_revision', 'content_digest', 'expires_at', 'post' );
+        if ( 'post_plus' === $protocol ) {
+            $keys[] = 'randomization';
+        }
+        $dashboard_ref = is_array( $payload ) && isset( $payload['dashboard_ref'] ) ? $this->content_v2_dashboard_ref() : false;
+        if ( ! is_array( $payload ) || ! $this->posts_v2_exact_keys( $payload, $keys ) || ! $this->content_v2_hash( $payload['dashboard_ref'] ) || false === $dashboard_ref || ! hash_equals( $dashboard_ref, $payload['dashboard_ref'] ) || ! $this->content_v2_uuid( $payload['operation_ref'] ) || ! in_array( $payload['mode'], array( 'create', 'update' ), true ) || ! $this->content_v2_hash( $payload['content_digest'] ) || ! is_int( $payload['expires_at'] ) || time() + DAY_IN_SECONDS < $payload['expires_at'] ) {
+            return false;
+        }
+        if ( ( 'create' === $payload['mode'] && ( null !== $payload['target_post_id'] || null !== $payload['expected_revision'] ) ) || ( 'update' === $payload['mode'] && ( ! is_int( $payload['target_post_id'] ) || 1 > $payload['target_post_id'] || ! $this->content_v2_hash( $payload['expected_revision'] ) ) ) ) {
+            return false;
+        }
+
+        $post = $this->content_v2_normalize_post( $payload['post'] );
+        if ( false === $post ) {
+            return false;
+        }
+        $randomization = null;
+        if ( 'post_plus' === $protocol ) {
+            $randomization = $this->content_v2_normalize_randomization( $payload['randomization'] );
+            if ( false === $randomization || ( 'page' === $post['post_type'] && $randomization['random_category'] ) ) {
+                return false;
+            }
+        }
+        $digest_value = 'post_plus' === $protocol ? array( $post, $randomization ) : $post;
+        if ( ! hash_equals( $payload['content_digest'], hash( 'sha256', wp_json_encode( $digest_value ) ) ) ) {
+            return false;
+        }
+
+        $normalized = array(
+            'dashboard_ref'     => $payload['dashboard_ref'],
+            'operation_ref'     => strtolower( $payload['operation_ref'] ),
+            'mode'              => $payload['mode'],
+            'target_post_id'    => $payload['target_post_id'],
+            'expected_revision' => $payload['expected_revision'],
+            'content_digest'    => $payload['content_digest'],
+            'expires_at'        => $payload['expires_at'],
+            'post'              => $post,
+        );
+        if ( 'post_plus' === $protocol ) {
+            $normalized['randomization'] = $randomization;
+        }
+        return $normalized;
+    }
+
+    /**
+     * Normalize one bounded core post payload.
+     *
+     * @param mixed $post Untrusted post payload.
+     * @return array|false Normalized payload or false.
+     */
+    private function content_v2_normalize_post( $post ) {
+        $keys = array( 'post_type', 'status', 'title', 'content', 'excerpt', 'slug', 'comment_status', 'ping_status', 'categories', 'tags' );
+        if ( ! is_array( $post ) || ! $this->posts_v2_exact_keys( $post, $keys ) || ! in_array( $post['post_type'], array( 'post', 'page' ), true ) || ! in_array( $post['status'], array( 'draft', 'publish' ), true ) || ! in_array( $post['comment_status'], array( 'open', 'closed' ), true ) || ! in_array( $post['ping_status'], array( 'open', 'closed' ), true ) ) {
+            return false;
+        }
+        foreach (
+            array(
+                'title'   => 512,
+                'content' => 200000,
+                'excerpt' => 5000,
+                'slug'    => 200,
+            ) as $key => $limit
+        ) {
+            if ( ! $this->content_v2_bounded_string( $post[ $key ], $limit ) ) {
+                return false;
+            }
+        }
+        if ( '' !== $post['slug'] && sanitize_title( $post['slug'] ) !== $post['slug'] ) {
+            return false;
+        }
+        $categories = $this->content_v2_slug_list( $post['categories'] );
+        $tags       = $this->content_v2_slug_list( $post['tags'] );
+        if ( false === $categories || false === $tags ) {
+            return false;
+        }
+        if ( 'page' === $post['post_type'] && ( ! empty( $categories ) || ! empty( $tags ) ) ) {
+            return false;
+        }
+        $post['categories'] = $categories;
+        $post['tags']       = $tags;
+        return $post;
+    }
+
+    /**
+     * Normalize Post Plus randomization without making a choice.
+     *
+     * @param mixed $randomization Untrusted randomization payload.
+     * @return array|false Normalized randomization or false.
+     */
+    private function content_v2_normalize_randomization( $randomization ) {
+        if ( ! is_array( $randomization ) || ! $this->posts_v2_exact_keys( $randomization, array( 'roles', 'random_category', 'date_from', 'date_to', 'timezone' ) ) || ! is_array( $randomization['roles'] ) || 4 < count( $randomization['roles'] ) || ! is_bool( $randomization['random_category'] ) || ! is_string( $randomization['timezone'] ) || '' === $randomization['timezone'] || 64 < strlen( $randomization['timezone'] ) ) {
+            return false;
+        }
+        $roles = array_values( array_unique( $randomization['roles'] ) );
+        sort( $roles, SORT_STRING );
+        if ( count( $roles ) !== count( $randomization['roles'] ) || array_diff( $roles, array( 'administrator', 'editor', 'author', 'contributor' ) ) ) {
+            return false;
+        }
+        try {
+            $timezone = new \DateTimeZone( $randomization['timezone'] );
+        } catch ( \Exception $error ) {
+            unset( $error );
+            return false;
+        }
+        $from = $this->content_v2_date( $randomization['date_from'], $timezone );
+        $to   = $this->content_v2_date( $randomization['date_to'], $timezone );
+        if ( false === $from || false === $to || ( null === $from ) !== ( null === $to ) || ( null !== $from && ( $to < $from || 366 < (int) $from->diff( $to )->format( '%a' ) ) ) ) {
+            return false;
+        }
+        return array(
+            'roles'           => $roles,
+            'random_category' => $randomization['random_category'],
+            'date_from'       => null === $from ? null : $from->format( 'Y-m-d' ),
+            'date_to'         => null === $to ? null : $to->format( 'Y-m-d' ),
+            'timezone'        => $timezone->getName(),
+        );
+    }
+
+    /**
+     * Resolve and freeze deterministic Post Plus author/category/date choices.
+     *
+     * @param array $normalized Valid normalized mutation.
+     * @return array|false Frozen choices or false.
+     */
+    private function content_v2_random_choices( $normalized ) {
+        $randomization = $normalized['randomization'];
+        $seed          = hash( 'sha256', $normalized['dashboard_ref'] . '|' . $normalized['operation_ref'] . '|' . $normalized['content_digest'] );
+        $author_ids    = array();
+        if ( empty( $randomization['roles'] ) ) {
+            $author_ids[] = get_current_user_id();
+        } else {
+            $users = get_users(
+                array(
+                    'role__in' => $randomization['roles'],
+                    'fields'   => 'ids',
+                    'number'   => 1001,
+                )
+            );
+            if ( ! is_array( $users ) || 1000 < count( $users ) ) {
+                return false;
+            }
+            foreach ( $users as $user_id ) {
+                if ( is_int( $user_id ) && 1 <= $user_id ) {
+                    $author_ids[] = $user_id;
+                } elseif ( is_string( $user_id ) && 1 === preg_match( '/^[1-9][0-9]*$/D', $user_id ) && PHP_INT_MAX >= (float) $user_id ) {
+                    $author_ids[] = (int) $user_id;
+                }
+            }
+        }
+        $author_ids = array_values( array_unique( $author_ids ) );
+        sort( $author_ids, SORT_NUMERIC );
+        if ( empty( $author_ids ) ) {
+            return false;
+        }
+
+        $category_id = null;
+        if ( $randomization['random_category'] ) {
+            $categories = get_categories(
+                array(
+                    'hide_empty' => false,
+                    'number'     => 1001,
+                    'fields'     => 'ids',
+                )
+            );
+            if ( ! is_array( $categories ) || empty( $categories ) || 1000 < count( $categories ) ) {
+                return false;
+            }
+            $categories = array_values( array_unique( array_map( 'intval', $categories ) ) );
+            if (
+                array_filter(
+                    $categories,
+                    static function ( $category_id ) {
+                        return 1 > $category_id;
+                    }
+                )
+            ) {
+                return false;
+            }
+            sort( $categories, SORT_NUMERIC );
+            $category_id = $categories[ hexdec( substr( $seed, 8, 8 ) ) % count( $categories ) ];
+        }
+
+        $post_date_gmt = null;
+        if ( null !== $randomization['date_from'] ) {
+            $timezone      = new \DateTimeZone( $randomization['timezone'] );
+            $from          = new \DateTimeImmutable( $randomization['date_from'] . ' 00:00:00', $timezone );
+            $to            = new \DateTimeImmutable( $randomization['date_to'] . ' 23:59:59', $timezone );
+            $seconds       = $to->getTimestamp() - $from->getTimestamp();
+            $chosen        = $from->getTimestamp() + ( hexdec( substr( $seed, 16, 8 ) ) % ( $seconds + 1 ) );
+            $post_date_gmt = gmdate( 'Y-m-d H:i:s', $chosen );
+        }
+
+        return array(
+            'author_id'     => $author_ids[ hexdec( substr( $seed, 0, 8 ) ) % count( $author_ids ) ],
+            'category_id'   => $category_id,
+            'post_date_gmt' => $post_date_gmt,
+        );
+    }
+
+    /**
+     * Apply one reserved operation inside a checked database transaction.
+     *
+     * @param string $protocol   Closed protocol name.
+     * @param string $operation  Closed operation name.
+     * @param array  $normalized Valid normalized mutation.
+     * @param array  $records    Valid durable ledger.
+     * @param array  $choices    Frozen deterministic choices.
+     * @return array Closed operation result.
+     */
+    private function content_v2_apply( $protocol, $operation, $normalized, $records, $choices ) {
+        global $wpdb;
+
+        $record = $records[ $normalized['operation_ref'] ];
+        if ( ! $this->content_v2_choices_available( $choices ) ) {
+            return $this->content_v2_error( $protocol, $operation, 'unsupported_content' );
+        }
+        $old_post   = 'update' === $normalized['mode'] ? get_post( $normalized['target_post_id'] ) : null;
+        $old_status = $old_post instanceof \WP_Post ? $old_post->post_status : '';
+        if ( false === $wpdb->query( 'START TRANSACTION' ) ) { // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+            return $this->content_v2_error( $protocol, $operation, 'storage_unavailable' );
+        }
+
+        $postarr = array(
+            'post_type'      => $normalized['post']['post_type'],
+            'post_status'    => $normalized['post']['status'],
+            'post_title'     => $normalized['post']['title'],
+            'post_content'   => $normalized['post']['content'],
+            'post_excerpt'   => $normalized['post']['excerpt'],
+            'post_name'      => $normalized['post']['slug'],
+            'comment_status' => $normalized['post']['comment_status'],
+            'ping_status'    => $normalized['post']['ping_status'],
+            'post_author'    => $choices['author_id'],
+            'meta_input'     => array(
+                '_mainwp_child_content_operation_v2' => $normalized['operation_ref'],
+                '_mainwp_child_content_digest_v2'    => $normalized['content_digest'],
+            ),
+        );
+        if ( null !== $choices['post_date_gmt'] ) {
+            $postarr['post_date_gmt'] = $choices['post_date_gmt'];
+            $postarr['post_date']     = get_date_from_gmt( $choices['post_date_gmt'] );
+        }
+        if ( 'update' === $normalized['mode'] ) {
+            $postarr['ID'] = $normalized['target_post_id'];
+        }
+
+        $hook_post = $postarr;
+        unset( $hook_post['meta_input'] );
+        do_action(
+            'mainwp_before_post_update',
+            $hook_post,
+            array(),
+            implode( ',', $normalized['post']['categories'] ),
+            implode( ',', $normalized['post']['tags'] ),
+            array()
+        );
+
+        $post_id = wp_insert_post( wp_slash( $postarr ), true );
+        if ( is_wp_error( $post_id ) || ! is_int( $post_id ) || 1 > $post_id ) {
+            $wpdb->query( 'ROLLBACK' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+            return $this->content_v2_error( $protocol, $operation, 'mutation_failed' );
+        }
+        if ( ! empty( $normalized['post']['categories'] ) ) {
+            $category_ids = $this->content_v2_category_ids( $normalized['post']['categories'] );
+            $terms        = false === $category_ids ? false : wp_set_post_categories( $post_id, $category_ids, false );
+            if ( false === $terms || is_wp_error( $terms ) ) {
+                $wpdb->query( 'ROLLBACK' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+                return $this->content_v2_error( $protocol, $operation, 'mutation_failed' );
+            }
+        }
+        if ( null !== $choices['category_id'] ) {
+            $terms = wp_set_post_categories( $post_id, array( $choices['category_id'] ), true );
+            if ( is_wp_error( $terms ) ) {
+                $wpdb->query( 'ROLLBACK' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+                return $this->content_v2_error( $protocol, $operation, 'mutation_failed' );
+            }
+        }
+        if ( ! empty( $normalized['post']['tags'] ) ) {
+            $terms = wp_set_post_terms( $post_id, $normalized['post']['tags'], 'post_tag', false );
+            if ( is_wp_error( $terms ) ) {
+                $wpdb->query( 'ROLLBACK' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+                return $this->content_v2_error( $protocol, $operation, 'mutation_failed' );
+            }
+        }
+
+        $revision = $this->content_v2_post_revision( $post_id );
+        if ( false === $revision ) {
+            $wpdb->query( 'ROLLBACK' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+            return $this->content_v2_error( $protocol, $operation, 'outcome_unknown' );
+        }
+        $record['post_id']                   = $post_id;
+        $record['state']                     = 'applied';
+        $record['post_revision']             = $revision;
+        $record['remote_post_ref']           = $this->content_v2_remote_ref( $protocol, $record['dashboard_ref'], $post_id );
+        $record['updated_at']                = time();
+        $records[ $record['operation_ref'] ] = $record;
+        if ( ! $this->content_v2_write_records( $protocol, $records ) || false === $wpdb->query( 'COMMIT' ) ) { // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+            $wpdb->query( 'ROLLBACK' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+            wp_cache_delete( $this->content_v2_option( $protocol ), 'options' );
+            return $this->content_v2_error( $protocol, $operation, 'outcome_unknown' );
+        }
+
+        $post = get_post( $post_id );
+        do_action(
+            'mainwp_child_after_newpost',
+            array(
+                'success'       => true,
+                'link'          => get_permalink( $post_id ),
+                'added_id'      => $post_id,
+                'new_post_data' => $post instanceof \WP_Post ? array(
+                    'post_id'       => $post_id,
+                    'post_type'     => $post->post_type,
+                    'post_title'    => $post->post_title,
+                    'post_date'     => $post->post_date,
+                    'post_date_gmt' => $post->post_date_gmt,
+                    'new_status'    => $post->post_status,
+                    'old_status'    => $old_status,
+                    'singular_name' => strtolower( $this->get_post_type_name( $post->post_type ) ),
+                    'is_editing'    => 'update' === $normalized['mode'] ? 1 : 0,
+                ) : array(),
+            )
+        );
+        return $this->content_v2_project( $protocol, $operation, $record );
+    }
+
+    /**
+     * Return one canonical revision for the actual stored post fields.
+     *
+     * @param int $post_id Positive post ID.
+     * @return string|false Revision or false.
+     */
+    private function content_v2_post_revision( $post_id ) {
+        $post = get_post( $post_id );
+        if ( ! $post instanceof \WP_Post || ! in_array( $post->post_type, array( 'post', 'page' ), true ) ) {
+            return false;
+        }
+        $categories = wp_get_post_terms( $post->ID, 'category', array( 'fields' => 'slugs' ) );
+        $tags       = wp_get_post_terms( $post->ID, 'post_tag', array( 'fields' => 'slugs' ) );
+        if ( is_wp_error( $categories ) || is_wp_error( $tags ) || ! is_array( $categories ) || ! is_array( $tags ) ) {
+            return false;
+        }
+        sort( $categories, SORT_STRING );
+        sort( $tags, SORT_STRING );
+        return hash(
+            'sha256',
+            wp_json_encode(
+                array(
+                    'post_type'      => $post->post_type,
+                    'status'         => $post->post_status,
+                    'title'          => $post->post_title,
+                    'content'        => $post->post_content,
+                    'excerpt'        => $post->post_excerpt,
+                    'slug'           => $post->post_name,
+                    'comment_status' => $post->comment_status,
+                    'ping_status'    => $post->ping_status,
+                    'author_id'      => (int) $post->post_author,
+                    'post_date_gmt'  => $post->post_date_gmt,
+                    'categories'     => $categories,
+                    'tags'           => $tags,
+                )
+            )
+        );
+    }
+
+    /**
+     * Return one redacted operation response, optionally with current readback.
+     *
+     * @param string $protocol  Closed protocol name.
+     * @param string $operation Closed operation name.
+     * @param array  $record    Valid operation record.
+     * @param bool   $readback  Whether to add current readback.
+     * @return array Closed response.
+     */
+    private function content_v2_project( $protocol, $operation, $record, $readback = false ) {
+        $response = array(
+            'protocol'        => '2',
+            'operation'       => $operation,
+            'ok'              => true,
+            'state'           => $record['state'],
+            'operation_ref'   => $record['operation_ref'],
+            'content_digest'  => $record['content_digest'],
+            'post_revision'   => $record['post_revision'],
+            'remote_post_ref' => $record['remote_post_ref'],
+            'retryable'       => $record['retryable'],
+            'updated_at'      => $record['updated_at'],
+        );
+        if ( $readback ) {
+            $post     = is_int( $record['post_id'] ) ? get_post( $record['post_id'] ) : null;
+            $revision = $post instanceof \WP_Post ? $this->content_v2_post_revision( $post->ID ) : false;
+            if ( ! $post instanceof \WP_Post || false === $revision ) {
+                return $this->content_v2_error( $protocol, $operation, 'readback_unavailable' );
+            }
+            $response['readback'] = array(
+                'post_type' => $post->post_type,
+                'status'    => $post->post_status,
+                'revision'  => $revision,
+            );
+        }
+        return $response;
+    }
+
+    /**
+     * Load and strictly validate one bounded private operation ledger.
+     *
+     * @param string $protocol Closed protocol name.
+     * @return array|false Valid ledger or false.
+     */
+    private function content_v2_records( $protocol ) {
+        $records = get_option( $this->content_v2_option( $protocol ), array() );
+        if ( ! is_array( $records ) || self::CONTENT_V2_MAX_RECORDS < count( $records ) ) {
+            return false;
+        }
+        foreach ( $records as $operation_ref => $record ) {
+            if ( ! is_string( $operation_ref ) || ! $this->content_v2_record( $record ) || ! hash_equals( $operation_ref, $record['operation_ref'] ) ) {
+                return false;
+            }
+        }
+        return $records;
+    }
+
+    /**
+     * Remove only receipts older than the required retry-retention window.
+     *
+     * @param string $protocol Closed protocol name.
+     * @param array  $records  Valid durable ledger.
+     * @return array|false Pruned ledger or false.
+     */
+    private function content_v2_prune_records( $protocol, $records ) {
+        $minimum = time() - self::CONTENT_V2_RETENTION;
+        $changed = false;
+        foreach ( $records as $operation_ref => $record ) {
+            if ( $record['updated_at'] < $minimum ) {
+                unset( $records[ $operation_ref ] );
+                $changed = true;
+            }
+        }
+        return ( ! $changed || $this->content_v2_write_records( $protocol, $records ) ) ? $records : false;
+    }
+
+    /**
+     * Validate one closed durable content-operation record.
+     *
+     * @param mixed $record Candidate record.
+     * @return bool Whether the record is valid.
+     */
+    private function content_v2_record( $record ) {
+        $keys = array( 'dashboard_ref', 'operation_ref', 'effect_hash', 'content_digest', 'mode', 'target_post_id', 'expected_revision', 'post_id', 'state', 'post_revision', 'remote_post_ref', 'retryable', 'choices', 'accepted_at', 'updated_at' );
+        if ( ! is_array( $record ) || array_keys( $record ) !== $keys || ! $this->content_v2_hash( $record['dashboard_ref'] ) || ! $this->content_v2_uuid( $record['operation_ref'] ) || ! $this->content_v2_hash( $record['effect_hash'] ) || ! $this->content_v2_hash( $record['content_digest'] ) || ! in_array( $record['mode'], array( 'create', 'update' ), true ) || ! in_array( $record['state'], array( 'reserved', 'applied', 'not_applied', 'unknown' ), true ) || ! is_bool( $record['retryable'] ) || ! is_int( $record['accepted_at'] ) || 1 > $record['accepted_at'] || ! is_int( $record['updated_at'] ) || $record['updated_at'] < $record['accepted_at'] ) {
+            return false;
+        }
+        if ( ( 'create' === $record['mode'] && ( null !== $record['target_post_id'] || null !== $record['expected_revision'] ) ) || ( 'update' === $record['mode'] && ( ! is_int( $record['target_post_id'] ) || 1 > $record['target_post_id'] || ! $this->content_v2_hash( $record['expected_revision'] ) ) ) ) {
+            return false;
+        }
+        if ( ! $this->content_v2_choice_shape( $record['choices'] ) ) {
+            return false;
+        }
+        if ( 'applied' === $record['state'] ) {
+            return is_int( $record['post_id'] ) && 1 <= $record['post_id'] && $this->content_v2_hash( $record['post_revision'] ) && $this->content_v2_hash( $record['remote_post_ref'] ) && false === $record['retryable'];
+        }
+        return null === $record['post_id'] && null === $record['post_revision'] && null === $record['remote_post_ref'] && ( ( 'not_applied' === $record['state'] ) === $record['retryable'] );
+    }
+
+    /**
+     * Validate one persisted deterministic-choice tuple.
+     *
+     * @param mixed $choices Candidate choices.
+     * @return bool Whether the choices are valid.
+     */
+    private function content_v2_choice_shape( $choices ) {
+        return is_array( $choices ) && array_keys( $choices ) === array( 'author_id', 'category_id', 'post_date_gmt' ) && is_int( $choices['author_id'] ) && 1 <= $choices['author_id'] && ( null === $choices['category_id'] || ( is_int( $choices['category_id'] ) && 1 <= $choices['category_id'] ) ) && ( null === $choices['post_date_gmt'] || ( is_string( $choices['post_date_gmt'] ) && 1 === preg_match( '/^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}$/D', $choices['post_date_gmt'] ) ) );
+    }
+
+    /**
+     * Prove that frozen author/category choices still resolve before mutation.
+     *
+     * @param mixed $choices Candidate choices.
+     * @return bool Whether all choices resolve.
+     */
+    private function content_v2_choices_available( $choices ) {
+        if ( ! $this->content_v2_choice_shape( $choices ) || ! get_userdata( $choices['author_id'] ) instanceof \WP_User ) {
+            return false;
+        }
+        if ( null === $choices['category_id'] ) {
+            return true;
+        }
+        $category = get_term( $choices['category_id'], 'category' );
+        return $category instanceof \WP_Term;
+    }
+
+    /**
+     * Persist one changed operation ledger with nonautoloaded checked readback.
+     *
+     * @param string $protocol Closed protocol name.
+     * @param array  $records  Valid changed ledger.
+     * @return bool Whether exact persistence was proven.
+     */
+    private function content_v2_write_records( $protocol, $records ) {
+        $option = $this->content_v2_option( $protocol );
+        $wrote  = update_option( $option, $records, false );
+        $stored = get_option( $option, null );
+        return ( $wrote || $stored === $records ) && $stored === $records;
+    }
+
+    /**
+     * Acquire the protocol's cross-request mutation lock.
+     *
+     * @param string $protocol Closed protocol name.
+     * @return bool Whether the lock is held.
+     */
+    private function content_v2_begin_lock( $protocol ) {
+        global $wpdb;
+        $wpdb->last_error = '';
+        $locked           = $wpdb->get_var( $wpdb->prepare( 'SELECT GET_LOCK(%s,0)', 'mainwp_child_' . $protocol . '_v2' ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+        return empty( $wpdb->last_error ) && '1' === (string) $locked;
+    }
+
+    /**
+     * Release the protocol lock and forget any unproved ownership.
+     *
+     * @param string $protocol Closed protocol name.
+     * @return bool Whether release was proven.
+     */
+    private function content_v2_end_lock( $protocol ) {
+        global $wpdb;
+        $wpdb->last_error = '';
+        $released         = $wpdb->get_var( $wpdb->prepare( 'SELECT RELEASE_LOCK(%s)', 'mainwp_child_' . $protocol . '_v2' ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+        return empty( $wpdb->last_error ) && '1' === (string) $released;
+    }
+
+    /**
+     * Return the closed option name for one protocol.
+     *
+     * @param string $protocol Closed protocol name.
+     * @return string Private option name.
+     */
+    private function content_v2_option( $protocol ) {
+        return 'post_plus' === $protocol ? 'mainwp_child_post_plus_operations_v2' : 'mainwp_child_post_dripper_operations_v2';
+    }
+
+    /** Return the current connected Dashboard's canonical local identity digest. */
+    private function content_v2_dashboard_ref() {
+        $server = MainWP_Child_Keys_Manager::get_encrypted_option( 'mainwp_child_server', '' );
+        if ( ! is_string( $server ) || '' === $server || 2048 < strlen( $server ) ) {
+            return false;
+        }
+        $parts = wp_parse_url( $server );
+        if ( ! is_array( $parts ) || ! isset( $parts['scheme'], $parts['host'] ) || ! in_array( strtolower( $parts['scheme'] ), array( 'http', 'https' ), true ) || isset( $parts['user'] ) || isset( $parts['pass'] ) || isset( $parts['query'] ) || isset( $parts['fragment'] ) ) {
+            return false;
+        }
+        $port = isset( $parts['port'] ) && is_int( $parts['port'] ) && 1 <= $parts['port'] && 65535 >= $parts['port'] ? ':' . $parts['port'] : '';
+        $path = isset( $parts['path'] ) && is_string( $parts['path'] ) ? '/' . trim( $parts['path'], '/' ) : '';
+        return hash( 'sha256', strtolower( $parts['scheme'] ) . '://' . strtolower( $parts['host'] ) . $port . rtrim( $path, '/' ) );
+    }
+
+    /**
+     * Return one installation-bound opaque remote post reference.
+     *
+     * @param string $protocol      Closed protocol name.
+     * @param string $dashboard_ref Current Dashboard digest.
+     * @param int    $post_id       Positive post ID.
+     * @return string Opaque post reference.
+     */
+    private function content_v2_remote_ref( $protocol, $dashboard_ref, $post_id ) {
+        return hash_hmac( 'sha256', $protocol . '|' . $dashboard_ref . '|' . $post_id, wp_salt( 'auth' ) );
+    }
+
+    /**
+     * Parse one exact calendar date without accepting PHP normalization.
+     *
+     * @param mixed         $value    Candidate date.
+     * @param \DateTimeZone $timezone Valid timezone.
+     * @return \DateTimeImmutable|null|false Exact date, null, or false.
+     */
+    private function content_v2_date( $value, $timezone ) {
+        if ( null === $value ) {
+            return null;
+        }
+        if ( ! is_string( $value ) || 1 !== preg_match( '/^[0-9]{4}-[0-9]{2}-[0-9]{2}$/D', $value ) ) {
+            return false;
+        }
+        $date   = \DateTimeImmutable::createFromFormat( '!Y-m-d', $value, $timezone );
+        $errors = \DateTimeImmutable::getLastErrors();
+        return false === $date || ( is_array( $errors ) && ( 0 !== $errors['warning_count'] || 0 !== $errors['error_count'] ) ) || $date->format( 'Y-m-d' ) !== $value ? false : $date;
+    }
+
+    /**
+     * Normalize one unique bounded taxonomy-slug list.
+     *
+     * @param mixed $values Candidate list.
+     * @return array|false Normalized list or false.
+     */
+    private function content_v2_slug_list( $values ) {
+        if ( ! is_array( $values ) || 100 < count( $values ) ) {
+            return false;
+        }
+        $out = array();
+        foreach ( $values as $value ) {
+            if ( ! is_string( $value ) || '' === $value || 200 < strlen( $value ) || sanitize_title( $value ) !== $value || isset( $out[ $value ] ) ) {
+                return false;
+            }
+            $out[ $value ] = true;
+        }
+        $values = array_keys( $out );
+        sort( $values, SORT_STRING );
+        return $values;
+    }
+
+    /**
+     * Resolve or create bounded category slugs as positive term IDs.
+     *
+     * @param array $slugs Valid canonical category slugs.
+     * @return array|false Positive IDs or false.
+     */
+    private function content_v2_category_ids( $slugs ) {
+        $ids = array();
+        foreach ( $slugs as $slug ) {
+            $term = get_term_by( 'slug', $slug, 'category' );
+            if ( false === $term ) {
+                $created = wp_insert_term( $slug, 'category', array( 'slug' => $slug ) );
+                if ( is_wp_error( $created ) ) {
+                    if ( 'term_exists' !== $created->get_error_code() || ! is_int( $created->get_error_data() ) ) {
+                        return false;
+                    }
+                    $term_id = $created->get_error_data();
+                } elseif ( ! is_array( $created ) || ! isset( $created['term_id'] ) || ! is_int( $created['term_id'] ) ) {
+                    return false;
+                } else {
+                    $term_id = $created['term_id'];
+                }
+            } else {
+                $term_id = $term instanceof \WP_Term ? (int) $term->term_id : 0;
+            }
+            if ( 1 > $term_id ) {
+                return false;
+            }
+            $ids[] = $term_id;
+        }
+        return $ids;
+    }
+
+    /**
+     * Validate one bounded UTF-8 string with no NUL byte.
+     *
+     * @param mixed $value Candidate string.
+     * @param int   $max   Maximum bytes.
+     * @return bool Whether the string is valid.
+     */
+    private function content_v2_bounded_string( $value, $max ) {
+        return is_string( $value ) && $max >= strlen( $value ) && false === strpos( $value, "\0" ) && wp_check_invalid_utf8( $value ) === $value;
+    }
+
+    /**
+     * Validate one SHA-256 hexadecimal value.
+     *
+     * @param mixed $value Candidate digest.
+     * @return bool Whether the digest is valid.
+     */
+    private function content_v2_hash( $value ) {
+        return is_string( $value ) && 1 === preg_match( '/^[a-f0-9]{64}$/D', $value );
+    }
+
+    /**
+     * Validate one canonical RFC 4122 UUID.
+     *
+     * @param mixed $value Candidate reference.
+     * @return bool Whether the reference is valid.
+     */
+    private function content_v2_uuid( $value ) {
+        return is_string( $value ) && 1 === preg_match( '/^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/D', $value );
+    }
+
+    /**
+     * Build one closed content-protocol error.
+     *
+     * @param string $protocol  Closed protocol name.
+     * @param string $operation Closed operation name.
+     * @param string $code      Stable error code.
+     * @return array Closed error.
+     */
+    private function content_v2_error( $protocol, $operation, $code ) {
+        return 'post_plus' === $protocol ? $this->post_plus_v2_error( $operation, $code ) : $this->post_dripper_v2_error( $operation, $code );
     }
 
     /**

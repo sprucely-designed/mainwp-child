@@ -247,6 +247,22 @@ class Test_MainWP_Child_Back_WP_Up_Abilities_V2 extends WP_UnitTestCase {
 		);
 		$this->assertTrue( $reordered['ok'] );
 
+		$wire = $this->invoke_v2(
+			array(
+				'operation'    => 'abort_backup',
+				'payload_json' => '{}',
+			),
+			new Test_MainWP_Child_Back_WP_Up_V2_Fixture(
+				array(),
+				array( 'abort_backup' => array( 'abort_requested' => false, 'state' => 'not_running', 'message' => 'No backup is running.' ) )
+			)
+		);
+		$this->assertTrue( $wire['ok'] );
+
+		$malformed_wire = $this->invoke_v2( array( 'operation' => 'diagnostics', 'payload_json' => '[]' ) );
+		$this->assertFalse( $malformed_wire['ok'] );
+		$this->assertSame( 'invalid_request', $malformed_wire['error']['code'] );
+
 		$extra = $this->invoke_v2( array( 'operation' => 'diagnostics', 'payload' => array(), 'extra' => true ) );
 		$this->assertFalse( $extra['ok'] );
 		$this->assertSame( 'invalid_request', $extra['error']['code'] );
@@ -336,6 +352,39 @@ class Test_MainWP_Child_Back_WP_Up_Abilities_V2 extends WP_UnitTestCase {
 	}
 
 	/**
+	 * Current BackWPup frequency plus cron storage is projected exactly.
+	 */
+	public function test_get_job_schedule_projects_current_frequency_storage() {
+		$fixture = $this->option_fixture(
+			array(
+				7 => array(
+					'activetype' => 'wpcron',
+					'cronselect' => 'basic',
+					'frequency'  => 'monthly',
+					'cron'       => '0 0 1 * *',
+				),
+			)
+		);
+
+		$result = $this->invoke_v2(
+			array(
+				'operation' => 'get_job_schedule',
+				'payload'   => array( 'job_id' => 7 ),
+			),
+			$fixture
+		);
+
+		$this->assertTrue( $result['ok'] );
+		$this->assertSame(
+			array(
+				'job_id'   => 7,
+				'schedule' => array( 'mode' => 'monthly', 'day' => 1, 'hour' => 0, 'minute' => 0 ),
+			),
+			$result['data']
+		);
+	}
+
+	/**
 	 * Schedule updates preserve unrelated provider settings and verify a no-op.
 	 */
 	public function test_update_job_schedule_preserves_unrelated_settings() {
@@ -363,6 +412,7 @@ class Test_MainWP_Child_Back_WP_Up_Abilities_V2 extends WP_UnitTestCase {
 		$this->assertSame( 'wpcron', $fixture->fixture_options[7]['activetype'] );
 		$this->assertSame( 'basic', $fixture->fixture_options[7]['cronselect'] );
 		$this->assertSame( 'day', $fixture->fixture_options[7]['cronbtype'] );
+		$this->assertSame( 'daily', $fixture->fixture_options[7]['frequency'] );
 		$this->assertSame( '15 3 * * *', $fixture->fixture_options[7]['cron'] );
 
 		$replayed = $this->invoke_v2( $request, $fixture );
@@ -498,6 +548,7 @@ class Test_MainWP_Child_Back_WP_Up_Abilities_V2 extends WP_UnitTestCase {
 		$this->assertTrue( $result['ok'] );
 		$this->assertSame( $fixture->provider_results['abort_backup'], $result['data'] );
 		$this->assertSame( array( array( 'abort_backup' ) ), $fixture->provider_calls );
+
 	}
 
 	/**

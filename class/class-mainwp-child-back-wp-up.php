@@ -376,8 +376,14 @@ class MainWP_Child_Back_WP_Up { //phpcs:ignore -- NOSONAR - multi methods.
      */
     protected function abilities_v2( $request ) {
         $operation = is_array( $request ) && isset( $request['operation'] ) && is_string( $request['operation'] ) ? $request['operation'] : '';
-        $payload   = is_array( $request ) && isset( $request['payload'] ) && is_array( $request['payload'] ) ? $request['payload'] : null;
-        if ( ! $this->abilities_v2_has_keys( $request, array( 'operation', 'payload' ) ) || null === $payload || 1 !== preg_match( '/^[a-z_]{1,64}$/D', $operation ) ) {
+        $payload   = null;
+        if ( is_array( $request ) && $this->abilities_v2_has_keys( $request, array( 'operation', 'payload' ) ) && isset( $request['payload'] ) && is_array( $request['payload'] ) ) {
+            $payload = $request['payload'];
+        } elseif ( is_array( $request ) && $this->abilities_v2_has_keys( $request, array( 'operation', 'payload_json' ) ) && isset( $request['payload_json'] ) && is_string( $request['payload_json'] ) && 65536 >= strlen( $request['payload_json'] ) && '{' === substr( $request['payload_json'], 0, 1 ) ) {
+            $decoded = json_decode( $request['payload_json'], true );
+            $payload = JSON_ERROR_NONE === json_last_error() && is_array( $decoded ) ? $decoded : null;
+        }
+        if ( null === $payload || 1 !== preg_match( '/^[a-z_]{1,64}$/D', $operation ) ) {
             return $this->abilities_v2_error( $operation, 'invalid_request', __( 'The typed BackWPup request is invalid.', 'mainwp-child' ) );
         }
 
@@ -1781,6 +1787,14 @@ class MainWP_Child_Back_WP_Up { //phpcs:ignore -- NOSONAR - multi methods.
             ) : null;
         }
 
+        $frequency = $this->abilities_v2_get_job_option( $job_id, 'frequency', '' );
+        if ( in_array( $frequency, array( 'hourly', 'daily', 'weekly', 'monthly' ), true ) ) {
+            return $this->abilities_v2_schedule_from_frequency_cron(
+                $frequency,
+                $this->abilities_v2_get_job_option( $job_id, 'cron', '' )
+            );
+        }
+
         $type = $this->abilities_v2_get_job_option( $job_id, 'cronbtype', '' );
         if ( 'hour' === $type ) {
             $minute = $this->abilities_v2_bounded_int( $this->abilities_v2_get_job_option( $job_id, 'hourcronminutes', null ), 0, 59 );
@@ -1825,6 +1839,62 @@ class MainWP_Child_Back_WP_Up { //phpcs:ignore -- NOSONAR - multi methods.
     }
 
     /**
+     * Project BackWPup 5.x frequency plus cron fields into the typed schedule.
+     *
+     * @param string $frequency BackWPup frequency.
+     * @param mixed  $cron      Stored cron expression.
+     * @return array|null
+     */
+    private function abilities_v2_schedule_from_frequency_cron( $frequency, $cron ) {
+        if ( ! is_string( $cron ) || 1 !== preg_match( '/^[0-9* ]+$/D', $cron ) ) {
+            return null;
+        }
+        $parts = preg_split( '/\s+/', trim( $cron ) );
+        if ( 5 !== count( $parts ) || '*' !== $parts[3] ) {
+            return null;
+        }
+
+        $minute = $this->abilities_v2_bounded_int( $parts[0], 0, 59 );
+        if ( 'hourly' === $frequency && null !== $minute && '*' === $parts[1] && '*' === $parts[2] && '*' === $parts[4] ) {
+            return array(
+                'mode'   => 'hourly',
+                'minute' => $minute,
+            );
+        }
+
+        $hour = $this->abilities_v2_bounded_int( $parts[1], 0, 23 );
+        if ( 'daily' === $frequency && null !== $minute && null !== $hour && '*' === $parts[2] && '*' === $parts[4] ) {
+            return array(
+                'mode'   => 'daily',
+                'hour'   => $hour,
+                'minute' => $minute,
+            );
+        }
+
+        $weekday = $this->abilities_v2_bounded_int( $parts[4], 0, 6 );
+        if ( 'weekly' === $frequency && null !== $minute && null !== $hour && '*' === $parts[2] && null !== $weekday ) {
+            return array(
+                'mode'    => 'weekly',
+                'weekday' => $weekday,
+                'hour'    => $hour,
+                'minute'  => $minute,
+            );
+        }
+
+        $day = $this->abilities_v2_bounded_int( $parts[2], 1, 31 );
+        if ( 'monthly' === $frequency && null !== $minute && null !== $hour && null !== $day && '*' === $parts[4] ) {
+            return array(
+                'mode'   => 'monthly',
+                'day'    => $day,
+                'hour'   => $hour,
+                'minute' => $minute,
+            );
+        }
+
+        return null;
+    }
+
+    /**
      * Convert a typed schedule to the existing BackWPup option fields.
      *
      * @param array $schedule Typed schedule.
@@ -1847,6 +1917,7 @@ class MainWP_Child_Back_WP_Up { //phpcs:ignore -- NOSONAR - multi methods.
                 'activetype'      => 'wpcron',
                 'cronselect'      => 'basic',
                 'cronbtype'       => 'hour',
+                'frequency'       => 'hourly',
                 'hourcronminutes' => (string) $schedule['minute'],
                 'cron'            => $schedule['minute'] . ' * * * *',
             );
@@ -1856,6 +1927,7 @@ class MainWP_Child_Back_WP_Up { //phpcs:ignore -- NOSONAR - multi methods.
                 'activetype'     => 'wpcron',
                 'cronselect'     => 'basic',
                 'cronbtype'      => 'day',
+                'frequency'      => 'daily',
                 'daycronhours'   => (string) $schedule['hour'],
                 'daycronminutes' => (string) $schedule['minute'],
                 'cron'           => $schedule['minute'] . ' ' . $schedule['hour'] . ' * * *',
@@ -1866,6 +1938,7 @@ class MainWP_Child_Back_WP_Up { //phpcs:ignore -- NOSONAR - multi methods.
                 'activetype'      => 'wpcron',
                 'cronselect'      => 'basic',
                 'cronbtype'       => 'week',
+                'frequency'       => 'weekly',
                 'weekcronwday'    => (string) $schedule['weekday'],
                 'weekcronhours'   => (string) $schedule['hour'],
                 'weekcronminutes' => (string) $schedule['minute'],
@@ -1877,6 +1950,7 @@ class MainWP_Child_Back_WP_Up { //phpcs:ignore -- NOSONAR - multi methods.
                 'activetype'     => 'wpcron',
                 'cronselect'     => 'basic',
                 'cronbtype'      => 'mon',
+                'frequency'      => 'monthly',
                 'moncronmday'    => (string) $schedule['day'],
                 'moncronhours'   => (string) $schedule['hour'],
                 'moncronminutes' => (string) $schedule['minute'],

@@ -349,35 +349,567 @@ class MainWP_Child_Timecapsule { //phpcs:ignore -- NOSONAR - multi methods.
      * @param mixed $request Decoded request.
      * @return array Closed protocol response.
      */
-    public function abilities_v2( $request ) {
+    // phpcs:disable Generic.Commenting.DocComment.MissingShort,Squiz.Commenting.FunctionComment,Generic.Formatting.MultipleStatementAlignment,WordPress.Arrays.ArrayDeclarationSpacing.AssociativeArrayFound,WordPress.Arrays.MultipleStatementAlignment,WordPress.PHP.YodaConditions.NotYoda,WordPress.PHP.DiscouragedPHPFunctions.obfuscation_base64_encode -- Closed protocol block follows the legacy file's compact style.
+    public function abilities_v2( $request ) { // phpcs:ignore Generic.Metrics.CyclomaticComplexity.TooHigh -- Closed protocol dispatcher is easier to audit linearly.
         $operation = is_array( $request ) && isset( $request['operation'] ) && is_string( $request['operation'] ) ? $request['operation'] : 'unknown';
-        if ( ! is_array( $request ) || ! $this->abilities_v2_exact_keys( $request, array( 'protocol', 'operation', 'payload' ) ) || '2' !== $request['protocol'] || ! is_array( $request['payload'] ) || array() !== $request['payload'] ) {
+        $reads     = array( 'site', 'policy', 'list_backups', 'operation_status', 'preview_restore', 'list_staging' );
+        $mutations = array( 'replace_policy', 'start_backup', 'cancel_operation', 'restore_backup', 'start_staging', 'delete_staging' );
+        $root_keys = in_array( $operation, $mutations, true ) ? array( 'protocol', 'operation', 'request_ref', 'payload' ) : array( 'protocol', 'operation', 'payload' );
+        if ( ! is_array( $request ) || ! $this->abilities_v2_exact_keys( $request, $root_keys ) || '2' !== ( isset( $request['protocol'] ) ? $request['protocol'] : null ) || ! isset( $request['payload'] ) || ! is_array( $request['payload'] ) ) {
             return $this->abilities_v2_error( $operation );
         }
 
         if ( 'capabilities' === $operation ) {
+            if ( array() !== $request['payload'] ) {
+                return $this->abilities_v2_error( $operation );
+            }
             return array(
                 'protocol'           => '2',
                 'operation'          => 'capabilities',
                 'ok'                 => true,
-                'operations'         => array( 'site', 'policy' ),
-                'mutation_supported' => false,
+                'operations'         => array_merge( array( 'site', 'policy' ), array( 'replace_policy', 'list_backups', 'start_backup', 'operation_status', 'cancel_operation', 'preview_restore', 'restore_backup', 'list_staging', 'start_staging', 'delete_staging' ) ),
+                'mutation_supported' => true,
             );
         }
+        if ( ! in_array( $operation, array_merge( $reads, $mutations ), true ) || ! $this->abilities_v2_valid_payload( $operation, $request['payload'] ) ) {
+            return $this->abilities_v2_error( $operation, in_array( $operation, array_merge( $reads, $mutations ), true ) ? 'invalid_request' : 'unsupported_operation' );
+        }
 
+        if ( in_array( $operation, array( 'site', 'policy' ), true ) ) {
+            $config = $this->abilities_v2_config();
+            if ( ! is_object( $config ) || ! method_exists( $config, 'get_option' ) ) {
+                return $this->abilities_v2_error( $operation, 'provider_unavailable' );
+            }
+            return 'site' === $operation ? $this->abilities_v2_site( $config ) : $this->abilities_v2_policy( $config );
+        }
+
+        $effect_hash = hash( 'sha256', wp_json_encode( array( $operation, $request['payload'] ) ) );
+        $receipts    = array();
+        if ( in_array( $operation, $mutations, true ) ) {
+            if ( ! $this->abilities_v2_valid_request_ref( $request['request_ref'] ) ) {
+                return $this->abilities_v2_error( $operation );
+            }
+            $receipts = get_option( 'mainwp_timecapsule_abilities_v2_receipts', array() );
+            if ( ! is_array( $receipts ) ) {
+                return $this->abilities_v2_error( $operation, 'storage_unavailable' );
+            }
+            if ( isset( $receipts[ $request['request_ref'] ] ) ) {
+                $receipt = $receipts[ $request['request_ref'] ];
+                if ( ! is_array( $receipt ) || ! $this->abilities_v2_exact_keys( $receipt, array( 'effect_hash', 'response' ) ) || ! is_string( $receipt['effect_hash'] ) || ! is_array( $receipt['response'] ) ) {
+                    return $this->abilities_v2_error( $operation, 'storage_unavailable' );
+                }
+                return hash_equals( $receipt['effect_hash'], $effect_hash ) ? $receipt['response'] : $this->abilities_v2_error( $operation, 'request_conflict' );
+            }
+        }
+
+        try {
+            $result = $this->abilities_v2_provider_call( $operation, $request['payload'] );
+        } catch ( \Throwable $throwable ) {
+            return $this->abilities_v2_error( $operation, in_array( $operation, $mutations, true ) ? 'outcome_unknown' : 'provider_unavailable' );
+        }
+        if ( is_wp_error( $result ) ) {
+            $code = $result->get_error_code();
+            return $this->abilities_v2_error( $operation, in_array( $code, array( 'provider_unavailable', 'provider_schema_invalid', 'target_not_found', 'state_conflict', 'stale_generation', 'outcome_unknown', 'storage_unavailable' ), true ) ? $code : 'provider_unavailable' );
+        }
+        if ( ! $this->abilities_v2_valid_result( $operation, $result ) ) {
+            return $this->abilities_v2_error( $operation, 'provider_schema_invalid' );
+        }
+
+        $response = array_merge(
+            array(
+                'protocol'  => '2',
+                'operation' => $operation,
+                'ok'        => true,
+            ),
+            in_array( $operation, $mutations, true ) ? array( 'request_ref' => $request['request_ref'] ) : array(),
+            $result
+        );
+        if ( in_array( $operation, $mutations, true ) ) {
+            if ( 100 <= count( $receipts ) ) {
+                array_shift( $receipts );
+            }
+            $receipts[ $request['request_ref'] ] = array( 'effect_hash' => $effect_hash, 'response' => $response );
+            if ( ! update_option( 'mainwp_timecapsule_abilities_v2_receipts', $receipts, false ) && $receipts !== get_option( 'mainwp_timecapsule_abilities_v2_receipts', array() ) ) {
+                return $this->abilities_v2_error( $operation, 'outcome_unknown' );
+            }
+        }
+        return $response;
+    }
+
+    /**
+     * Execute one typed provider operation.
+     *
+     * Mutating provider integrations override this narrow boundary in tests.
+     * Production supports the policy and backup primitives that can be invoked
+     * without the legacy JSON/die response handlers; unsupported provider
+     * versions fail closed during staged rollout.
+     *
+     * @param string $operation Operation name.
+     * @param array  $payload   Closed payload.
+     * @return array|WP_Error
+     */
+    protected function abilities_v2_provider_call( $operation, $payload ) {
+        if ( 'replace_policy' === $operation ) {
+            return $this->abilities_v2_provider_replace_policy( $payload );
+        }
+        if ( 'list_backups' === $operation ) {
+            return $this->abilities_v2_provider_list_backups( $payload );
+        }
+        if ( 'start_backup' === $operation ) {
+            return $this->abilities_v2_provider_start_backup( $payload );
+        }
+        if ( 'operation_status' === $operation ) {
+            return $this->abilities_v2_provider_operation_status( $payload['operation_ref'] );
+        }
+        if ( 'cancel_operation' === $operation ) {
+            return $this->abilities_v2_provider_cancel_operation( $payload );
+        }
+        if ( 'preview_restore' === $operation ) {
+            return $this->abilities_v2_provider_preview_restore( $payload );
+        }
+        if ( 'list_staging' === $operation ) {
+            return $this->abilities_v2_provider_list_staging( $payload );
+        }
+        return new \WP_Error( 'provider_unavailable' );
+    }
+
+    /** @param array $payload Closed policy payload. @return array|WP_Error */
+    private function abilities_v2_provider_replace_policy( $payload ) {
         $config = $this->abilities_v2_config();
-        if ( ! is_object( $config ) || ! method_exists( $config, 'get_option' ) ) {
-            return $this->abilities_v2_error( $operation, 'provider_unavailable' );
+        if ( ! is_object( $config ) || ! method_exists( $config, 'get_option' ) || ! method_exists( $config, 'set_option' ) ) {
+            return new \WP_Error( 'provider_unavailable' );
+        }
+        $current = $this->abilities_v2_policy( $config );
+        if ( false === $current['ok'] || ! hash_equals( $current['policy_generation'], $payload['if_match'] ) ) {
+            return new \WP_Error( false === $current['ok'] ? $current['code'] : 'stale_generation' );
         }
 
-        if ( 'site' === $operation ) {
-            return $this->abilities_v2_site( $config );
+        $old = array(
+            'schedule_time_str'            => $config->get_option( 'schedule_time_str' ),
+            'revision_limit'               => $config->get_option( 'revision_limit' ),
+            'backup_before_update_setting' => $config->get_option( 'backup_before_update_setting' ),
+        );
+        $new = array(
+            'schedule_time_str'            => $payload['schedule_time'],
+            'revision_limit'               => (string) $payload['retention_days'],
+            'backup_before_update_setting' => $payload['backup_before_update'] ? 'always' : false,
+        );
+        foreach ( $new as $key => $value ) {
+            $config->set_option( $key, $value );
         }
-        if ( 'policy' === $operation ) {
-            return $this->abilities_v2_policy( $config );
+        foreach ( $new as $key => $value ) {
+            if ( $config->get_option( $key ) !== $value ) {
+                foreach ( $old as $old_key => $old_value ) {
+                    $config->set_option( $old_key, $old_value );
+                }
+                foreach ( $old as $old_key => $old_value ) {
+                    if ( $config->get_option( $old_key ) !== $old_value ) {
+                        return new \WP_Error( 'outcome_unknown' );
+                    }
+                }
+                return new \WP_Error( 'storage_unavailable' );
+            }
         }
 
-        return $this->abilities_v2_error( $operation, 'unsupported_operation' );
+        $updated = $this->abilities_v2_policy( $config );
+        if ( false === $updated['ok'] ) {
+            return new \WP_Error( 'outcome_unknown' );
+        }
+        return array(
+            'policy_generation' => $updated['policy_generation'],
+            'scheduled_change'   => $old !== $new,
+        );
+    }
+
+    /** @param array $payload Closed inventory payload. @return array|WP_Error */
+    private function abilities_v2_provider_list_backups( $payload ) {
+        $rows = $this->abilities_v2_backup_rows();
+        if ( is_wp_error( $rows ) ) {
+            return $rows;
+        }
+        $offset = 0;
+        if ( null !== $payload['after_backup_ref'] ) {
+            $offset = null;
+            foreach ( $rows as $index => $row ) {
+                if ( hash_equals( $row['backup_ref'], $payload['after_backup_ref'] ) ) {
+                    $offset = $index + 1;
+                    break;
+                }
+            }
+            if ( null === $offset ) {
+                return new \WP_Error( 'target_not_found' );
+            }
+        }
+        $page      = array_slice( $rows, $offset, $payload['limit'] );
+        $truncated = count( $rows ) > $offset + count( $page );
+        return array(
+            'backups'               => $page,
+            'snapshot_generation'   => hash( 'sha256', wp_json_encode( $rows ) ),
+            'next_after_backup_ref' => $truncated && ! empty( $page ) ? $page[ count( $page ) - 1 ]['backup_ref'] : null,
+            'truncated'             => $truncated,
+        );
+    }
+
+    /** @param array $payload Closed backup intent. @return array|WP_Error */
+    private function abilities_v2_provider_start_backup( $payload ) {
+        if ( 'full' !== $payload['scope'] ) {
+            return new \WP_Error( 'state_conflict' );
+        }
+        $config  = $this->abilities_v2_config();
+        $current = is_object( $config ) ? $this->abilities_v2_policy( $config ) : $this->abilities_v2_error( 'policy', 'provider_unavailable' );
+        if ( false === $current['ok'] || ! hash_equals( $current['policy_generation'], $payload['policy_generation'] ) ) {
+            return new \WP_Error( false === $current['ok'] ? $current['code'] : 'stale_generation' );
+        }
+        if ( true === $this->abilities_v2_boolean( $config->get_option( 'in_progress' ) ) ) {
+            return new \WP_Error( 'state_conflict' );
+        }
+
+        $started_at    = time();
+        $operation_ref = hash( 'sha256', wp_generate_uuid4() . '|' . $started_at . '|' . wp_salt( 'auth' ) );
+        $result        = $this->start_fresh_backup_tc_callback_wptc();
+        if ( ! is_array( $result ) || array( 'result' => 'success' ) !== $result ) {
+            return new \WP_Error( 'outcome_unknown' );
+        }
+        $in_progress = $this->abilities_v2_boolean( $config->get_option( 'in_progress' ) );
+        if ( null === $in_progress ) {
+            return new \WP_Error( 'outcome_unknown' );
+        }
+        $row = array(
+            'operation_ref'   => $operation_ref,
+            'kind'            => 'backup',
+            'state'           => $in_progress ? 'running' : 'reconciliation_required',
+            'progress_percent' => 0,
+            'started_at'      => gmdate( 'Y-m-d\TH:i:s\Z', $started_at ),
+            'finished_at'     => null,
+            'result_ref'      => null,
+        );
+        $row['generation'] = hash( 'sha256', wp_json_encode( $row ) );
+        if ( ! $this->abilities_v2_store_operation( $row ) ) {
+            return new \WP_Error( 'outcome_unknown' );
+        }
+        return array( 'operation_ref' => $operation_ref, 'state' => $row['state'], 'scope' => 'full' );
+    }
+
+    /** @param string $operation_ref Operation reference. @return array|WP_Error */
+    private function abilities_v2_provider_operation_status( $operation_ref ) {
+        $operations = get_option( 'mainwp_timecapsule_abilities_v2_operations', array() );
+        if ( ! is_array( $operations ) ) {
+            return new \WP_Error( 'storage_unavailable' );
+        }
+        if ( ! isset( $operations[ $operation_ref ] ) || ! $this->abilities_v2_valid_operation_row( $operations[ $operation_ref ] ) ) {
+            return new \WP_Error( isset( $operations[ $operation_ref ] ) ? 'storage_unavailable' : 'target_not_found' );
+        }
+        $row = $operations[ $operation_ref ];
+        if ( 'backup' === $row['kind'] && in_array( $row['state'], array( 'running', 'reconciliation_required' ), true ) ) {
+            $config      = $this->abilities_v2_config();
+            $in_progress = is_object( $config ) ? $this->abilities_v2_boolean( $config->get_option( 'in_progress' ) ) : null;
+            if ( null === $in_progress ) {
+                return new \WP_Error( 'provider_schema_invalid' );
+            }
+            if ( ! $in_progress ) {
+                $last_backup = $config->get_option( 'last_backup_time' );
+                $started     = strtotime( $row['started_at'] );
+                $row['state']            = $this->abilities_v2_timestamp( $last_backup ) && (int) $last_backup >= $started ? 'succeeded' : 'uncertain';
+                $row['progress_percent'] = 'succeeded' === $row['state'] ? 100 : 0;
+                $row['finished_at']      = gmdate( 'Y-m-d\TH:i:s\Z' );
+                $row['result_ref']       = 'succeeded' === $row['state'] ? $this->abilities_v2_backup_ref( (string) $last_backup ) : null;
+                $row['generation']       = hash( 'sha256', wp_json_encode( array_diff_key( $row, array( 'generation' => true ) ) ) );
+                if ( ! $this->abilities_v2_store_operation( $row ) ) {
+                    return new \WP_Error( 'storage_unavailable' );
+                }
+            }
+        }
+        return $row;
+    }
+
+    /** @param array $payload Closed cancellation intent. @return array|WP_Error */
+    private function abilities_v2_provider_cancel_operation( $payload ) {
+        $row = $this->abilities_v2_provider_operation_status( $payload['operation_ref'] );
+        if ( is_wp_error( $row ) ) {
+            return $row;
+        }
+        if ( ! hash_equals( $row['generation'], $payload['if_match'] ) ) {
+            return new \WP_Error( 'stale_generation' );
+        }
+        if ( 'backup' !== $row['kind'] || ! in_array( $row['state'], array( 'running', 'reconciliation_required' ), true ) ) {
+            return new \WP_Error( 'state_conflict' );
+        }
+        $result = $this->stop_fresh_backup_tc_callback_wptc();
+        $config = $this->abilities_v2_config();
+        if ( ! is_array( $result ) || array( 'result' => 'ok' ) !== $result || ! is_object( $config ) || false !== $this->abilities_v2_boolean( $config->get_option( 'in_progress' ) ) ) {
+            return new \WP_Error( 'outcome_unknown' );
+        }
+        $row['state']            = 'cancelled';
+        $row['progress_percent'] = 0;
+        $row['finished_at']      = gmdate( 'Y-m-d\TH:i:s\Z' );
+        $row['generation']       = hash( 'sha256', wp_json_encode( array_diff_key( $row, array( 'generation' => true ) ) ) );
+        if ( ! $this->abilities_v2_store_operation( $row ) ) {
+            return new \WP_Error( 'outcome_unknown' );
+        }
+        return array( 'operation_ref' => $row['operation_ref'], 'state' => 'cancelled', 'quiescent' => true );
+    }
+
+    /** @param array $payload Closed restore preview. @return array|WP_Error */
+    private function abilities_v2_provider_preview_restore( $payload ) {
+        $raw = $this->abilities_v2_resolve_backup_ref( $payload['backup_ref'] );
+        if ( is_wp_error( $raw ) ) {
+            return $raw;
+        }
+        $generation = hash( 'sha256', $payload['backup_ref'] . '|' . $raw );
+        if ( ! hash_equals( $generation, $payload['backup_generation'] ) ) {
+            return new \WP_Error( 'stale_generation' );
+        }
+        $expires = time() + 300;
+        $token   = rtrim( strtr( base64_encode( hash_hmac( 'sha256', wp_json_encode( array( $payload, $expires ) ), wp_salt( 'auth' ), true ) ), '+/', '-_' ), '=' );
+        return array(
+            'preview_token'     => $token,
+            'expires_at'        => gmdate( 'Y-m-d\TH:i:s\Z', $expires ),
+            'backup_ref'        => $payload['backup_ref'],
+            'scope'             => $payload['scope'],
+            'file_count'        => 0,
+            'table_count'       => 0,
+            'overwrite_expected' => true,
+            'preflight'         => 'blocked',
+        );
+    }
+
+    /** @param array $payload Closed staging inventory request. @return array|WP_Error */
+    private function abilities_v2_provider_list_staging( $payload ) {
+        if ( ! class_exists( '\\WPTC_Pro_Factory' ) ) {
+            return new \WP_Error( 'provider_unavailable' );
+        }
+        $staging = \WPTC_Pro_Factory::get( 'Wptc_Staging' );
+        if ( ! is_object( $staging ) || ! method_exists( $staging, 'get_staging_details' ) ) {
+            return new \WP_Error( 'provider_unavailable' );
+        }
+        $details = $staging->get_staging_details();
+        if ( array() === $details ) {
+            $rows = array();
+        } elseif ( ! is_array( $details ) || ! isset( $details['staging_folder'], $details['db_prefix'], $details['timestamp'] ) || ! is_string( $details['staging_folder'] ) || '' === $details['staging_folder'] || ! is_string( $details['db_prefix'] ) || '' === $details['db_prefix'] || ! $this->abilities_v2_timestamp( $details['timestamp'] ) ) {
+            return new \WP_Error( 'provider_schema_invalid' );
+        } else {
+            $clone_ref = hash_hmac( 'sha256', $details['staging_folder'] . '|' . $details['db_prefix'], wp_salt( 'auth' ) );
+            $row       = array(
+                'clone_ref'          => $clone_ref,
+                'state'              => method_exists( $staging, 'is_any_staging_process_going_on' ) && $staging->is_any_staging_process_going_on() ? 'creating' : 'ready',
+                'created_at'         => gmdate( 'Y-m-d\TH:i:s\Z', (int) $details['timestamp'] ),
+                'registered_site_id' => null,
+                'isolated'           => true,
+            );
+            $row['generation'] = hash( 'sha256', wp_json_encode( $row ) );
+            $rows              = array( $row );
+        }
+        if ( null !== $payload['after_clone_ref'] ) {
+            if ( empty( $rows ) || ! hash_equals( $rows[0]['clone_ref'], $payload['after_clone_ref'] ) ) {
+                return new \WP_Error( 'target_not_found' );
+            }
+            $rows = array();
+        }
+        return array(
+            'clones'               => array_slice( $rows, 0, $payload['limit'] ),
+            'snapshot_generation'  => hash( 'sha256', wp_json_encode( $rows ) ),
+            'next_after_clone_ref' => null,
+            'truncated'            => false,
+        );
+    }
+
+    /** @return array|WP_Error Complete redacted backup rows. */
+    private function abilities_v2_backup_rows() {
+        $backups = $this->get_backups( 1 );
+        if ( ! is_array( $backups ) || 10000 < count( $backups ) ) {
+            return new \WP_Error( 'provider_schema_invalid' );
+        }
+        $raw_ids = array();
+        foreach ( $backups as $backup ) {
+            $row = (array) $backup;
+            if ( ! $this->abilities_v2_exact_keys( $row, array( 'backupID' ) ) || ! $this->abilities_v2_timestamp( $row['backupID'] ) ) {
+                return new \WP_Error( 'provider_schema_invalid' );
+            }
+            $raw_ids[ (string) (int) $row['backupID'] ] = (int) $row['backupID'];
+        }
+        rsort( $raw_ids, SORT_NUMERIC );
+        $rows = array();
+        foreach ( $raw_ids as $raw_id ) {
+            $backup_ref = $this->abilities_v2_backup_ref( (string) $raw_id );
+            $rows[]     = array(
+                'backup_ref' => $backup_ref,
+                'created_at' => gmdate( 'Y-m-d\TH:i:s\Z', $raw_id ),
+                'state'      => 'verified',
+                'scope'      => 'full',
+                'size_bytes' => null,
+                'generation' => hash( 'sha256', $backup_ref . '|' . $raw_id ),
+            );
+        }
+        return $rows;
+    }
+
+    /** @param string $raw_id Provider backup identity. @return string */
+    private function abilities_v2_backup_ref( $raw_id ) {
+        return hash_hmac( 'sha256', 'timecapsule-backup-v2|' . $raw_id, wp_salt( 'auth' ) );
+    }
+
+    /** @param string $backup_ref Opaque backup reference. @return string|WP_Error */
+    private function abilities_v2_resolve_backup_ref( $backup_ref ) {
+        $backups = $this->get_backups( 1 );
+        if ( ! is_array( $backups ) || 10000 < count( $backups ) ) {
+            return new \WP_Error( 'provider_schema_invalid' );
+        }
+        $match = null;
+        foreach ( $backups as $backup ) {
+            $row = (array) $backup;
+            if ( ! $this->abilities_v2_exact_keys( $row, array( 'backupID' ) ) || ! $this->abilities_v2_timestamp( $row['backupID'] ) ) {
+                return new \WP_Error( 'provider_schema_invalid' );
+            }
+            $raw = (string) (int) $row['backupID'];
+            if ( hash_equals( $this->abilities_v2_backup_ref( $raw ), $backup_ref ) ) {
+                if ( null !== $match ) {
+                    return new \WP_Error( 'provider_schema_invalid' );
+                }
+                $match = $raw;
+            }
+        }
+        return null === $match ? new \WP_Error( 'target_not_found' ) : $match;
+    }
+
+    /** @param array $row Closed operation row. @return bool */
+    private function abilities_v2_store_operation( $row ) {
+        if ( ! $this->abilities_v2_valid_operation_row( $row ) ) {
+            return false;
+        }
+        $operations = get_option( 'mainwp_timecapsule_abilities_v2_operations', array() );
+        if ( ! is_array( $operations ) ) {
+            return false;
+        }
+        $operations[ $row['operation_ref'] ] = $row;
+        return update_option( 'mainwp_timecapsule_abilities_v2_operations', $operations, false ) || $operations === get_option( 'mainwp_timecapsule_abilities_v2_operations', array() );
+    }
+
+    /** @param mixed $row Candidate operation row. @return bool */
+    private function abilities_v2_valid_operation_row( $row ) {
+        return is_array( $row )
+            && $this->abilities_v2_exact_keys( $row, array( 'operation_ref', 'kind', 'state', 'progress_percent', 'started_at', 'finished_at', 'result_ref', 'generation' ) )
+            && $this->abilities_v2_valid_hash( $row['operation_ref'] )
+            && in_array( $row['kind'], array( 'backup', 'restore', 'staging_create', 'staging_delete' ), true )
+            && in_array( $row['state'], array( 'queued', 'running', 'verifying', 'succeeded', 'failed', 'cancelled', 'uncertain', 'reconciliation_required' ), true )
+            && is_int( $row['progress_percent'] ) && 0 <= $row['progress_percent'] && 100 >= $row['progress_percent']
+            && $this->abilities_v2_valid_date( $row['started_at'] )
+            && $this->abilities_v2_valid_date( $row['finished_at'] )
+            && ( null === $row['result_ref'] || $this->abilities_v2_valid_hash( $row['result_ref'] ) )
+            && $this->abilities_v2_valid_hash( $row['generation'] );
+    }
+
+    /** @param string $value Candidate reference. @return bool */
+    private function abilities_v2_valid_hash( $value ) {
+        return is_string( $value ) && 1 === preg_match( '/^[a-f0-9]{64}$/D', $value );
+    }
+
+    /** @param string $value Candidate request reference. @return bool */
+    private function abilities_v2_valid_request_ref( $value ) {
+        return is_string( $value ) && 1 === preg_match( '/^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/Di', $value );
+    }
+
+    /** @param mixed $value Candidate date. @return bool */
+    private function abilities_v2_valid_date( $value ) {
+        if ( null === $value ) {
+            return true;
+        }
+        return is_string( $value ) && false !== strtotime( $value ) && gmdate( 'Y-m-d\TH:i:s\Z', strtotime( $value ) ) === $value;
+    }
+
+    /**
+     * Validate one exact operation payload.
+     *
+     * @param string $operation Operation name.
+     * @param array  $payload   Payload.
+     * @return bool
+     */
+    private function abilities_v2_valid_payload( $operation, $payload ) { // phpcs:ignore Generic.Metrics.CyclomaticComplexity.TooHigh -- Closed schema table.
+        if ( in_array( $operation, array( 'site', 'policy' ), true ) ) {
+            return array() === $payload;
+        }
+        if ( 'replace_policy' === $operation ) {
+            return $this->abilities_v2_exact_keys( $payload, array( 'schedule_time', 'retention_days', 'backup_before_update', 'if_match' ) ) && is_string( $payload['schedule_time'] ) && 1 === preg_match( '/^(1[0-2]|[1-9]):00 [ap]m$/D', $payload['schedule_time'] ) && $this->abilities_v2_integer( $payload['retention_days'], 3, 365 ) && is_bool( $payload['backup_before_update'] ) && $this->abilities_v2_valid_hash( $payload['if_match'] );
+        }
+        if ( 'list_backups' === $operation ) {
+            return $this->abilities_v2_exact_keys( $payload, array( 'limit', 'after_backup_ref' ) ) && is_int( $payload['limit'] ) && 1 <= $payload['limit'] && 100 >= $payload['limit'] && ( null === $payload['after_backup_ref'] || $this->abilities_v2_valid_hash( $payload['after_backup_ref'] ) );
+        }
+        if ( 'start_backup' === $operation ) {
+            return $this->abilities_v2_exact_keys( $payload, array( 'scope', 'label', 'policy_generation' ) ) && in_array( $payload['scope'], array( 'full', 'database', 'files' ), true ) && ( null === $payload['label'] || ( is_string( $payload['label'] ) && 100 >= strlen( $payload['label'] ) ) ) && $this->abilities_v2_valid_hash( $payload['policy_generation'] );
+        }
+        if ( 'operation_status' === $operation ) {
+            return $this->abilities_v2_exact_keys( $payload, array( 'operation_ref' ) ) && $this->abilities_v2_valid_hash( $payload['operation_ref'] );
+        }
+        if ( 'cancel_operation' === $operation ) {
+            return $this->abilities_v2_exact_keys( $payload, array( 'operation_ref', 'if_match' ) ) && $this->abilities_v2_valid_hash( $payload['operation_ref'] ) && $this->abilities_v2_valid_hash( $payload['if_match'] );
+        }
+        if ( 'preview_restore' === $operation ) {
+            return $this->abilities_v2_exact_keys( $payload, array( 'backup_ref', 'backup_generation', 'scope' ) ) && $this->abilities_v2_valid_hash( $payload['backup_ref'] ) && $this->abilities_v2_valid_hash( $payload['backup_generation'] ) && in_array( $payload['scope'], array( 'full', 'database', 'files' ), true );
+        }
+        if ( 'restore_backup' === $operation ) {
+            return $this->abilities_v2_exact_keys( $payload, array( 'backup_ref', 'backup_generation', 'scope', 'preview_token' ) ) && $this->abilities_v2_valid_hash( $payload['backup_ref'] ) && $this->abilities_v2_valid_hash( $payload['backup_generation'] ) && in_array( $payload['scope'], array( 'full', 'database', 'files' ), true ) && is_string( $payload['preview_token'] ) && 1 === preg_match( '/^[A-Za-z0-9_-]{43,128}$/D', $payload['preview_token'] );
+        }
+        if ( 'list_staging' === $operation ) {
+            return $this->abilities_v2_exact_keys( $payload, array( 'limit', 'after_clone_ref' ) ) && is_int( $payload['limit'] ) && 1 <= $payload['limit'] && 50 >= $payload['limit'] && ( null === $payload['after_clone_ref'] || $this->abilities_v2_valid_hash( $payload['after_clone_ref'] ) );
+        }
+        if ( 'start_staging' === $operation ) {
+            return $this->abilities_v2_exact_keys( $payload, array( 'label', 'register_in_mainwp', 'settings_generation' ) ) && is_string( $payload['label'] ) && '' !== $payload['label'] && 100 >= strlen( $payload['label'] ) && is_bool( $payload['register_in_mainwp'] ) && $this->abilities_v2_valid_hash( $payload['settings_generation'] );
+        }
+        if ( 'delete_staging' === $operation ) {
+            return $this->abilities_v2_exact_keys( $payload, array( 'clone_ref', 'clone_generation' ) ) && $this->abilities_v2_valid_hash( $payload['clone_ref'] ) && $this->abilities_v2_valid_hash( $payload['clone_generation'] );
+        }
+        return false;
+    }
+
+    /**
+     * Validate one exact typed provider result.
+     *
+     * @param string $operation Operation name.
+     * @param mixed  $result    Provider result.
+     * @return bool
+     */
+    private function abilities_v2_valid_result( $operation, $result ) { // phpcs:ignore Generic.Metrics.CyclomaticComplexity.TooHigh -- Closed schema table.
+        if ( ! is_array( $result ) ) {
+            return false;
+        }
+        if ( 'replace_policy' === $operation ) {
+            return $this->abilities_v2_exact_keys( $result, array( 'policy_generation', 'scheduled_change' ) ) && $this->abilities_v2_valid_hash( $result['policy_generation'] ) && is_bool( $result['scheduled_change'] );
+        }
+        if ( 'list_backups' === $operation ) {
+            if ( ! $this->abilities_v2_exact_keys( $result, array( 'backups', 'snapshot_generation', 'next_after_backup_ref', 'truncated' ) ) || ! is_array( $result['backups'] ) || 100 < count( $result['backups'] ) || ! $this->abilities_v2_valid_hash( $result['snapshot_generation'] ) || ( null !== $result['next_after_backup_ref'] && ! $this->abilities_v2_valid_hash( $result['next_after_backup_ref'] ) ) || ! is_bool( $result['truncated'] ) ) {
+                return false;
+            }
+            foreach ( $result['backups'] as $row ) {
+                if ( ! is_array( $row ) || ! $this->abilities_v2_exact_keys( $row, array( 'backup_ref', 'created_at', 'state', 'scope', 'size_bytes', 'generation' ) ) || ! $this->abilities_v2_valid_hash( $row['backup_ref'] ) || ! $this->abilities_v2_valid_date( $row['created_at'] ) || ! in_array( $row['state'], array( 'verified', 'incomplete', 'unavailable' ), true ) || ! in_array( $row['scope'], array( 'full', 'database', 'files' ), true ) || ( null !== $row['size_bytes'] && ( ! is_int( $row['size_bytes'] ) || 0 > $row['size_bytes'] ) ) || ! $this->abilities_v2_valid_hash( $row['generation'] ) ) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        if ( 'start_backup' === $operation ) {
+            return $this->abilities_v2_exact_keys( $result, array( 'operation_ref', 'state', 'scope' ) ) && $this->abilities_v2_valid_hash( $result['operation_ref'] ) && in_array( $result['state'], array( 'queued', 'running', 'reconciliation_required' ), true ) && in_array( $result['scope'], array( 'full', 'database', 'files' ), true );
+        }
+        if ( 'operation_status' === $operation ) {
+            return $this->abilities_v2_exact_keys( $result, array( 'operation_ref', 'kind', 'state', 'progress_percent', 'started_at', 'finished_at', 'result_ref', 'generation' ) ) && $this->abilities_v2_valid_hash( $result['operation_ref'] ) && in_array( $result['kind'], array( 'backup', 'restore', 'staging_create', 'staging_delete' ), true ) && in_array( $result['state'], array( 'queued', 'running', 'verifying', 'succeeded', 'failed', 'cancelled', 'uncertain', 'reconciliation_required' ), true ) && is_int( $result['progress_percent'] ) && 0 <= $result['progress_percent'] && 100 >= $result['progress_percent'] && $this->abilities_v2_valid_date( $result['started_at'] ) && $this->abilities_v2_valid_date( $result['finished_at'] ) && ( null === $result['result_ref'] || $this->abilities_v2_valid_hash( $result['result_ref'] ) ) && $this->abilities_v2_valid_hash( $result['generation'] );
+        }
+        if ( 'cancel_operation' === $operation ) {
+            return $this->abilities_v2_exact_keys( $result, array( 'operation_ref', 'state', 'quiescent' ) ) && $this->abilities_v2_valid_hash( $result['operation_ref'] ) && in_array( $result['state'], array( 'running', 'cancelled', 'reconciliation_required' ), true ) && is_bool( $result['quiescent'] );
+        }
+        if ( 'preview_restore' === $operation ) {
+            return $this->abilities_v2_exact_keys( $result, array( 'preview_token', 'expires_at', 'backup_ref', 'scope', 'file_count', 'table_count', 'overwrite_expected', 'preflight' ) ) && is_string( $result['preview_token'] ) && 1 === preg_match( '/^[A-Za-z0-9_-]{43,128}$/D', $result['preview_token'] ) && $this->abilities_v2_valid_date( $result['expires_at'] ) && $this->abilities_v2_valid_hash( $result['backup_ref'] ) && in_array( $result['scope'], array( 'full', 'database', 'files' ), true ) && is_int( $result['file_count'] ) && 0 <= $result['file_count'] && is_int( $result['table_count'] ) && 0 <= $result['table_count'] && is_bool( $result['overwrite_expected'] ) && in_array( $result['preflight'], array( 'ready', 'blocked' ), true );
+        }
+        if ( 'restore_backup' === $operation ) {
+            return $this->abilities_v2_exact_keys( $result, array( 'operation_ref', 'backup_ref', 'state' ) ) && $this->abilities_v2_valid_hash( $result['operation_ref'] ) && $this->abilities_v2_valid_hash( $result['backup_ref'] ) && in_array( $result['state'], array( 'queued', 'reconciliation_required' ), true );
+        }
+        if ( 'list_staging' === $operation ) {
+            return $this->abilities_v2_exact_keys( $result, array( 'clones', 'snapshot_generation', 'next_after_clone_ref', 'truncated' ) ) && is_array( $result['clones'] ) && 50 >= count( $result['clones'] ) && $this->abilities_v2_valid_hash( $result['snapshot_generation'] ) && ( null === $result['next_after_clone_ref'] || $this->abilities_v2_valid_hash( $result['next_after_clone_ref'] ) ) && is_bool( $result['truncated'] );
+        }
+        if ( 'start_staging' === $operation ) {
+            return $this->abilities_v2_exact_keys( $result, array( 'operation_ref', 'clone_ref', 'state', 'register_in_mainwp' ) ) && $this->abilities_v2_valid_hash( $result['operation_ref'] ) && $this->abilities_v2_valid_hash( $result['clone_ref'] ) && in_array( $result['state'], array( 'queued', 'running', 'reconciliation_required' ), true ) && is_bool( $result['register_in_mainwp'] );
+        }
+        if ( 'delete_staging' === $operation ) {
+            return $this->abilities_v2_exact_keys( $result, array( 'operation_ref', 'clone_ref', 'registered_site_removal', 'state' ) ) && $this->abilities_v2_valid_hash( $result['operation_ref'] ) && $this->abilities_v2_valid_hash( $result['clone_ref'] ) && is_bool( $result['registered_site_removal'] ) && in_array( $result['state'], array( 'queued', 'reconciliation_required' ), true );
+        }
+        return false;
     }
 
     /**
@@ -535,6 +1067,7 @@ class MainWP_Child_Timecapsule { //phpcs:ignore -- NOSONAR - multi methods.
             'code'      => $code,
         );
     }
+    // phpcs:enable Generic.Commenting.DocComment.MissingShort,Squiz.Commenting.FunctionComment,Generic.Formatting.MultipleStatementAlignment,WordPress.Arrays.ArrayDeclarationSpacing.AssociativeArrayFound,WordPress.Arrays.MultipleStatementAlignment,WordPress.PHP.YodaConditions.NotYoda,WordPress.PHP.DiscouragedPHPFunctions.obfuscation_base64_encode
 
     /**
      * Check if required files exist.

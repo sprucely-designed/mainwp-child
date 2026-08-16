@@ -109,6 +109,15 @@ class Test_MainWP_Child_Back_WP_Up_V2_Fixture extends MainWP_Child_Back_WP_Up {
 	}
 
 	/**
+	 * @param array $target Internal target.
+	 * @return mixed
+	 */
+	protected function abilities_v2_provider_redeem_backup_download( $target ) {
+		$this->provider_calls[] = array( 'redeem_backup_download', $target );
+		return $this->provider_results['redeem_backup_download'];
+	}
+
+	/**
 	 * @param string $scope Scope.
 	 * @return mixed
 	 */
@@ -528,6 +537,40 @@ class Test_MainWP_Child_Back_WP_Up_Abilities_V2 extends WP_UnitTestCase {
 		$wrong_action = $this->invoke_v2( array( 'operation' => 'delete_backup', 'payload' => array( 'delete_token' => $row['download_token'] ) ), $fixture );
 		$this->assertFalse( $wrong_action['ok'] );
 		$this->assertSame( 'target_not_found', $wrong_action['error']['code'] );
+	}
+
+	/**
+	 * Download redemption keeps the provider target private and action-bound.
+	 */
+	public function test_redeem_backup_download_returns_only_a_bounded_internal_url() {
+		$internal = array( 'destination_key' => '7_FOLDER', 'file' => '/private/provider/archive.zip' );
+		$fixture  = new Test_MainWP_Child_Back_WP_Up_V2_Fixture(
+			array(),
+			array(
+				'list_backups'           => array(
+					array( 'job_id' => 7, 'destination' => 'FOLDER', 'file_name' => 'archive.zip', 'created_at' => 200, 'size_bytes' => 24, 'target' => $internal ),
+				),
+				'redeem_backup_download' => array( 'download_url' => 'https://child.example/wp-content/uploads/backwpup/archive.zip', 'size_bytes' => 24 ),
+			)
+		);
+
+		$list  = $this->invoke_v2( array( 'operation' => 'list_backups', 'payload' => array( 'page' => 1, 'per_page' => 25, 'scope' => 'all' ) ), $fixture );
+		$token = $list['data']['backups'][0]['download_token'];
+		$result = $this->invoke_v2( array( 'operation' => 'redeem_backup_download', 'payload' => array( 'download_token' => $token ) ), $fixture );
+
+		$this->assertTrue( $result['ok'] );
+		$this->assertSame( array( 'download_url' => 'https://child.example/wp-content/uploads/backwpup/archive.zip', 'size_bytes' => 24 ), $result['data'] );
+		$this->assertSame( array( 'redeem_backup_download', $internal ), $fixture->provider_calls[1] );
+		$this->assertStringNotContainsString( '/private/', wp_json_encode( $result ) );
+
+		$wrong_action = $this->invoke_v2( array( 'operation' => 'redeem_backup_download', 'payload' => array( 'download_token' => str_repeat( 'x', 43 ) ) ), $fixture );
+		$this->assertFalse( $wrong_action['ok'] );
+		$this->assertSame( 'target_not_found', $wrong_action['error']['code'] );
+
+		$fixture->provider_results['redeem_backup_download'] = array( 'download_url' => 'file:///private/provider/archive.zip', 'size_bytes' => 24 );
+		$malformed = $this->invoke_v2( array( 'operation' => 'redeem_backup_download', 'payload' => array( 'download_token' => $token ) ), $fixture );
+		$this->assertFalse( $malformed['ok'] );
+		$this->assertSame( 'operation_failed', $malformed['error']['code'] );
 	}
 
 	/**

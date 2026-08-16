@@ -24,6 +24,12 @@ class Test_MainWP_Child_Staging_V2_Fixture extends MainWP_Child_Staging {
 	/** @var int */
 	public $settings_writes = 0;
 
+	/** @var array */
+	public $operation_results = array();
+
+	/** @var array */
+	public $operation_calls = array();
+
 	/** Avoid installed-plugin lookup. */
 	public function __construct() {
 		$this->is_plugin_installed = true;
@@ -65,6 +71,12 @@ class Test_MainWP_Child_Staging_V2_Fixture extends MainWP_Child_Staging {
 		return true;
 	}
 
+	/** @return array|WP_Error */
+	protected function abilities_v2_provider_operation( $operation, $payload ) {
+		$this->operation_calls[] = array( $operation, $payload );
+		return isset( $this->operation_results[ $operation ] ) ? $this->operation_results[ $operation ] : new WP_Error( 'provider_unavailable' );
+	}
+
 	/** @return array|false */
 	public function fixture_inventory_rows() {
 		return $this->abilities_v2_inventory_rows();
@@ -84,6 +96,7 @@ class Test_MainWP_Child_Staging_V2 extends WP_UnitTestCase {
 	public function setUp(): void {
 		parent::setUp();
 		delete_option( 'mainwp_staging_abilities_v2_receipts' );
+		delete_option( 'mainwp_staging_abilities_v2_operation_receipts' );
 		$this->clone_path = WP_CONTENT_DIR;
 		$this->staging         = new Test_MainWP_Child_Staging_V2_Fixture();
 		$this->staging->clones = array(
@@ -103,6 +116,7 @@ class Test_MainWP_Child_Staging_V2 extends WP_UnitTestCase {
 
 	/** Finish the fixture. */
 	public function tearDown(): void {
+		delete_option( 'mainwp_staging_abilities_v2_operation_receipts' );
 		parent::tearDown();
 	}
 
@@ -111,7 +125,7 @@ class Test_MainWP_Child_Staging_V2 extends WP_UnitTestCase {
 		$result = $this->invoke_v2( 'capabilities', array() );
 
 		$this->assertSame( array( 'protocol', 'operation', 'ok', 'operations', 'mutation_supported', 'wp_staging_version' ), array_keys( $result ) );
-		$this->assertSame( array( 'inventory', 'settings', 'preview', 'replace_settings' ), $result['operations'] );
+		$this->assertSame( array( 'inventory', 'settings', 'preview', 'replace_settings', 'create_clone', 'update_clone', 'delete_clone', 'operation_status', 'cancel_operation', 'reconcile_operation' ), $result['operations'] );
 		$this->assertTrue( $result['mutation_supported'] );
 		$this->assertSame( '5.5.0', $result['wp_staging_version'] );
 		$this->assertSame( 0, $this->staging->preview_calls );
@@ -267,6 +281,65 @@ class Test_MainWP_Child_Staging_V2 extends WP_UnitTestCase {
 		$this->assertFalse( $conflict['ok'] );
 		$this->assertSame( 'request_conflict', $conflict['error_code'] );
 		$this->assertSame( 1, $this->staging->settings_writes );
+	}
+
+	/** Clone mutations use MCP-safe request references and exact receipt replay. */
+	public function test_clone_mutation_contract_is_typed_and_replay_safe() {
+		$this->staging->operation_results['create_clone'] = array(
+			'operation_ref' => '123e4567-e89b-42d3-a456-426614174931',
+			'clone_ref'     => null,
+			'status'        => 'queued',
+		);
+		$request = array(
+			'protocol'    => '2',
+			'operation'   => 'create_clone',
+			'request_ref' => '123e4567-e89b-42d3-a456-426614174932',
+			'payload'     => array( 'inventory_revision' => str_repeat( 'a', 64 ) ),
+		);
+		$result = $this->staging->abilities_v2( $request );
+		$this->assertTrue( $result['ok'] );
+		$this->assertSame( $request['request_ref'], $result['request_ref'] );
+		$this->assertSame( $result, $this->staging->abilities_v2( $request ) );
+		$this->assertCount( 1, $this->staging->operation_calls );
+
+		$request['payload']['inventory_revision'] = str_repeat( 'b', 64 );
+		$this->assertSame( 'request_conflict', $this->staging->abilities_v2( $request )['error_code'] );
+		unset( $request['request_ref'] );
+		$request['request_id'] = '123e4567-e89b-42d3-a456-426614174933';
+		$this->assertSame( 'invalid_request', $this->staging->abilities_v2( $request )['error_code'] );
+	}
+
+	/** Status and reconciliation shapes reject raw or over-broad provider data. */
+	public function test_operation_status_and_reconciliation_results_are_closed() {
+		$operation_ref = '123e4567-e89b-42d3-a456-426614174934';
+		$this->staging->operation_results['operation_status'] = array(
+			'operation_ref'   => $operation_ref,
+			'kind'            => 'update',
+			'status'          => 'running',
+			'progress_percent' => 40,
+			'current_step'    => 'files',
+			'generation'      => str_repeat( 'c', 64 ),
+		);
+		$status = $this->invoke_v2( 'operation_status', array( 'operation_ref' => $operation_ref ) );
+		$this->assertTrue( $status['ok'] );
+		$this->assertSame( 40, $status['progress_percent'] );
+
+		$this->staging->operation_results['reconcile_operation'] = array(
+			'operation_ref' => $operation_ref,
+			'status'        => 'queued',
+			'affected_steps' => 2,
+			'generation'    => str_repeat( 'd', 64 ),
+		);
+		$reconcile = $this->staging->abilities_v2(
+			array(
+				'protocol'    => '2',
+				'operation'   => 'reconcile_operation',
+				'request_ref' => '123e4567-e89b-42d3-a456-426614174935',
+				'payload'     => array( 'operation_ref' => $operation_ref, 'if_match' => str_repeat( 'c', 64 ) ),
+			)
+		);
+		$this->assertTrue( $reconcile['ok'] );
+		$this->assertSame( 2, $reconcile['affected_steps'] );
 	}
 
 	/** Legacy action names remain available. */

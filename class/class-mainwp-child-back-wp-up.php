@@ -402,6 +402,9 @@ class MainWP_Child_Back_WP_Up { //phpcs:ignore -- NOSONAR - multi methods.
         if ( 'list_backups' === $operation ) {
             return $this->abilities_v2_list_backups( $operation, $payload );
         }
+        if ( 'redeem_backup_download' === $operation ) {
+            return $this->abilities_v2_redeem_backup_download( $operation, $payload );
+        }
         if ( 'delete_backup' === $operation ) {
             return $this->abilities_v2_delete_backup( $operation, $payload );
         }
@@ -736,6 +739,39 @@ class MainWP_Child_Back_WP_Up { //phpcs:ignore -- NOSONAR - multi methods.
     }
 
     /**
+     * Resolve one exact download token into a bounded private download URL.
+     *
+     * The authenticated Dashboard transport is the only consumer of this
+     * response. The Dashboard keeps the URL inside its one-use gateway claim;
+     * no Ability result exposes it to callers.
+     *
+     * @param string $operation Operation name.
+     * @param array  $payload   Typed payload.
+     * @return array
+     */
+    private function abilities_v2_redeem_backup_download( $operation, $payload ) {
+        if ( ! $this->abilities_v2_has_keys( $payload, array( 'download_token' ) ) || ! is_string( $payload['download_token'] ) ) {
+            return $this->abilities_v2_error( $operation, 'invalid_input', __( 'The backup download request is invalid.', 'mainwp-child' ) );
+        }
+        $target = $this->abilities_v2_resolve_target_token( $payload['download_token'], 'download_backup' );
+        if ( ! is_array( $target ) ) {
+            return $this->abilities_v2_error( $operation, 'target_not_found', __( 'The backup download token is missing or expired.', 'mainwp-child' ) );
+        }
+        try {
+            $result = $this->abilities_v2_provider_redeem_backup_download( $target );
+        } catch ( \Throwable $e ) {
+            return $this->abilities_v2_error( $operation, 'operation_failed', __( 'The backup download could not be prepared.', 'mainwp-child' ) );
+        }
+        if ( is_wp_error( $result ) ) {
+            return $this->abilities_v2_from_provider_error( $operation, $result );
+        }
+        if ( ! is_array( $result ) || ! $this->abilities_v2_has_keys( $result, array( 'download_url', 'size_bytes' ) ) || ! $this->abilities_v2_valid_download_url( $result['download_url'] ) || ! $this->abilities_v2_is_bounded_int( $result['size_bytes'], 0, PHP_INT_MAX ) ) {
+            return $this->abilities_v2_error( $operation, 'operation_failed', __( 'The backup download result is invalid.', 'mainwp-child' ) );
+        }
+        return $this->abilities_v2_success( $operation, $result );
+    }
+
+    /**
      * Delete one exact token-bound backup.
      *
      * @param string $operation Operation name.
@@ -1056,6 +1092,20 @@ class MainWP_Child_Back_WP_Up { //phpcs:ignore -- NOSONAR - multi methods.
     }
 
     /**
+     * Validate a bounded HTTP(S) URL for the private Dashboard gateway.
+     *
+     * @param mixed $url Candidate URL.
+     * @return bool
+     */
+    private function abilities_v2_valid_download_url( $url ) {
+        if ( ! is_string( $url ) || '' === $url || 2048 < strlen( $url ) || preg_match( '/[\x00-\x1F\x7F]/', $url ) ) {
+            return false;
+        }
+        $parts = wp_parse_url( $url );
+        return is_array( $parts ) && isset( $parts['scheme'], $parts['host'] ) && in_array( strtolower( $parts['scheme'] ), array( 'http', 'https' ), true ) && '' !== $parts['host'] && ! isset( $parts['user'] ) && ! isset( $parts['pass'] ) && ! isset( $parts['fragment'] );
+    }
+
+    /**
      * Issue an opaque five-minute target token.
      *
      * @param string $action Action binding.
@@ -1349,6 +1399,41 @@ class MainWP_Child_Back_WP_Up { //phpcs:ignore -- NOSONAR - multi methods.
             }
         }
         return 'deleted';
+    }
+
+    /**
+     * Resolve the current provider download URL for one exact hidden target.
+     *
+     * @param array $target Internal target.
+     * @return array|WP_Error
+     */
+    protected function abilities_v2_provider_redeem_backup_download( $target ) {
+        if ( ! $this->abilities_v2_has_keys( $target, array( 'destination_key', 'file' ) ) || ! is_string( $target['destination_key'] ) || 1 !== preg_match( '/^[1-9][0-9]*_[A-Z0-9_-]{1,64}$/D', $target['destination_key'] ) || ! is_string( $target['file'] ) || '' === $target['file'] || 4096 < strlen( $target['file'] ) ) {
+            return new \WP_Error( 'not_found' );
+        }
+        list( , $destination ) = explode( '_', $target['destination_key'], 2 );
+        $provider              = $this->abilities_v2_get_destination( $destination );
+        if ( ! is_object( $provider ) || ! method_exists( $provider, 'file_get_list' ) ) {
+            return new \WP_Error( 'operation_failed' );
+        }
+        $files = $provider->file_get_list( $target['destination_key'] );
+        if ( ! is_array( $files ) || count( $files ) > 10000 ) {
+            return new \WP_Error( 'operation_failed' );
+        }
+        foreach ( $files as $file ) {
+            if ( ! is_array( $file ) || ! isset( $file['file'] ) || ! is_string( $file['file'] ) || ! hash_equals( $target['file'], $file['file'] ) ) {
+                continue;
+            }
+            $size = isset( $file['filesize'] ) ? $file['filesize'] : ( isset( $file['size'] ) ? $file['size'] : 0 );
+            if ( ! isset( $file['downloadurl'] ) || ! is_string( $file['downloadurl'] ) || ! is_numeric( $size ) || 0 > (int) $size ) {
+                return new \WP_Error( 'operation_failed' );
+            }
+            return array(
+                'download_url' => $file['downloadurl'],
+                'size_bytes'   => (int) $size,
+            );
+        }
+        return new \WP_Error( 'not_found' );
     }
 
     /**

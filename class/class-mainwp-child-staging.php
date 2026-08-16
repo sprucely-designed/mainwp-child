@@ -420,6 +420,7 @@ class MainWP_Child_Staging { //phpcs:ignore -- NOSONAR - multi methods.
      * @param mixed $request Decoded request.
      * @return array Closed protocol response.
      */
+    // phpcs:disable Generic.Commenting.DocComment.MissingShort,Squiz.Commenting.FunctionComment,Generic.Formatting.MultipleStatementAlignment,WordPress.Arrays.ArrayDeclarationSpacing.AssociativeArrayFound,WordPress.Arrays.MultipleStatementAlignment,WordPress.PHP.YodaConditions.NotYoda -- Closed protocol block follows the legacy file's compact style.
     public function abilities_v2( $request ) {
         $operation = is_array( $request ) && isset( $request['operation'] ) && is_string( $request['operation'] ) ? $request['operation'] : 'unknown';
         if ( ! is_array( $request ) || ! isset( $request['protocol'] ) || '2' !== $request['protocol'] ) {
@@ -435,7 +436,7 @@ class MainWP_Child_Staging { //phpcs:ignore -- NOSONAR - multi methods.
                 'protocol'           => '2',
                 'operation'          => 'capabilities',
                 'ok'                 => true,
-                'operations'         => array( 'inventory', 'settings', 'preview', 'replace_settings' ),
+                'operations'         => array( 'inventory', 'settings', 'preview', 'replace_settings', 'create_clone', 'update_clone', 'delete_clone', 'operation_status', 'cancel_operation', 'reconcile_operation' ),
                 'mutation_supported' => $this->abilities_v2_provider_supports_mutation(),
                 'wp_staging_version' => $this->abilities_v2_plugin_version(),
             );
@@ -443,6 +444,10 @@ class MainWP_Child_Staging { //phpcs:ignore -- NOSONAR - multi methods.
 
         if ( 'replace_settings' === $operation ) {
             return $this->abilities_v2_replace_settings( $request );
+        }
+
+        if ( in_array( $operation, array( 'create_clone', 'update_clone', 'delete_clone', 'cancel_operation', 'reconcile_operation' ), true ) ) {
+            return $this->abilities_v2_mutation( $operation, $request );
         }
 
         if ( ! $this->abilities_v2_exact_keys( $request, array( 'protocol', 'operation', 'payload' ) ) || ! is_array( $request['payload'] ) ) {
@@ -461,6 +466,13 @@ class MainWP_Child_Staging { //phpcs:ignore -- NOSONAR - multi methods.
                 return $this->abilities_v2_error( $operation );
             }
             return $this->abilities_v2_settings();
+        }
+
+        if ( 'operation_status' === $operation ) {
+            if ( ! $this->abilities_v2_exact_keys( $request['payload'], array( 'operation_ref' ) ) || ! $this->abilities_v2_valid_operation_ref( $request['payload']['operation_ref'] ) ) {
+                return $this->abilities_v2_error( $operation );
+            }
+            return $this->abilities_v2_provider_result( $operation, $request['payload'] );
         }
 
         if ( 'preview' !== $operation || ! $this->abilities_v2_exact_keys( $request['payload'], array( 'kind', 'clone_ref' ) ) ) {
@@ -497,6 +509,112 @@ class MainWP_Child_Staging { //phpcs:ignore -- NOSONAR - multi methods.
             ),
             $preview
         );
+    }
+
+    /**
+     * Execute one receipt-bound typed clone mutation.
+     *
+     * @param string $operation Operation name.
+     * @param array  $request Closed request.
+     * @return array
+     */
+    private function abilities_v2_mutation( $operation, $request ) {
+        if ( ! $this->abilities_v2_exact_keys( $request, array( 'protocol', 'operation', 'request_ref', 'payload' ) ) || ! $this->abilities_v2_valid_request_ref( $request['request_ref'] ) || ! $this->abilities_v2_valid_mutation_payload( $operation, $request['payload'] ) ) {
+            return $this->abilities_v2_error( $operation );
+        }
+        $effect_hash = hash( 'sha256', wp_json_encode( array( $operation, $request['payload'] ) ) );
+        $receipts    = get_option( 'mainwp_staging_abilities_v2_operation_receipts', array() );
+        if ( ! is_array( $receipts ) ) {
+            return $this->abilities_v2_error( $operation, 'storage_unavailable' );
+        }
+        if ( isset( $receipts[ $request['request_ref'] ] ) ) {
+            $receipt = $receipts[ $request['request_ref'] ];
+            if ( ! is_array( $receipt ) || ! $this->abilities_v2_exact_keys( $receipt, array( 'effect_hash', 'response' ) ) || ! is_string( $receipt['effect_hash'] ) || ! is_array( $receipt['response'] ) ) {
+                return $this->abilities_v2_error( $operation, 'storage_unavailable' );
+            }
+            return hash_equals( $receipt['effect_hash'], $effect_hash ) ? $receipt['response'] : $this->abilities_v2_error( $operation, 'request_conflict' );
+        }
+
+        $result = $this->abilities_v2_provider_result( $operation, $request['payload'] );
+        if ( empty( $result['ok'] ) ) {
+            return $result;
+        }
+        $result['request_ref'] = $request['request_ref'];
+        $result                = array_merge( array_intersect_key( $result, array( 'protocol' => true, 'operation' => true, 'ok' => true ) ), array( 'request_ref' => $request['request_ref'] ), array_diff_key( $result, array( 'protocol' => true, 'operation' => true, 'ok' => true, 'request_ref' => true ) ) );
+        if ( 100 <= count( $receipts ) ) {
+            array_shift( $receipts );
+        }
+        $receipts[ $request['request_ref'] ] = array( 'effect_hash' => $effect_hash, 'response' => $result );
+        if ( ! update_option( 'mainwp_staging_abilities_v2_operation_receipts', $receipts, false ) && $receipts !== get_option( 'mainwp_staging_abilities_v2_operation_receipts', array() ) ) {
+            return $this->abilities_v2_error( $operation, 'outcome_unknown' );
+        }
+        return $result;
+    }
+
+    /** @param string $operation Operation. @param array $payload Payload. @return array */
+    private function abilities_v2_provider_result( $operation, $payload ) {
+        if ( ! $this->abilities_v2_provider_supports_mutation() && 'operation_status' !== $operation ) {
+            return $this->abilities_v2_error( $operation, 'provider_unavailable' );
+        }
+        try {
+            $result = $this->abilities_v2_provider_operation( $operation, $payload );
+        } catch ( \Throwable $throwable ) {
+            return $this->abilities_v2_error( $operation, 'outcome_unknown' );
+        }
+        if ( is_wp_error( $result ) ) {
+            $code = $result->get_error_code();
+            return $this->abilities_v2_error( $operation, in_array( $code, array( 'provider_unavailable', 'provider_schema_invalid', 'clone_not_found', 'operation_not_found', 'stale_revision', 'state_conflict', 'outcome_unknown', 'storage_unavailable' ), true ) ? $code : 'provider_unavailable' );
+        }
+        if ( ! $this->abilities_v2_valid_operation_result( $operation, $result ) ) {
+            return $this->abilities_v2_error( $operation, 'provider_schema_invalid' );
+        }
+        return array_merge( array( 'protocol' => '2', 'operation' => $operation, 'ok' => true ), $result );
+    }
+
+    /**
+     * Provider-specific durable step boundary.
+     *
+     * Supported versions override this seam only after they can bind every
+     * step to immutable path/table tokens. The base integration fails closed.
+     *
+     * @param string $operation Operation.
+     * @param array  $payload Payload.
+     * @return array|WP_Error
+     */
+    protected function abilities_v2_provider_operation( $operation, $payload ) {
+        unset( $operation, $payload );
+        return new \WP_Error( 'provider_unavailable' );
+    }
+
+    /** @param string $operation Operation. @param mixed $payload Payload. @return bool */
+    private function abilities_v2_valid_mutation_payload( $operation, $payload ) {
+        if ( ! is_array( $payload ) ) {
+            return false;
+        }
+        if ( 'create_clone' === $operation ) {
+            return $this->abilities_v2_exact_keys( $payload, array( 'inventory_revision' ) ) && $this->abilities_v2_valid_hash( $payload['inventory_revision'] );
+        }
+        if ( 'update_clone' === $operation ) {
+            return $this->abilities_v2_exact_keys( $payload, array( 'clone_ref', 'inventory_revision' ) ) && $this->abilities_v2_valid_hash( $payload['clone_ref'] ) && $this->abilities_v2_valid_hash( $payload['inventory_revision'] );
+        }
+        if ( 'delete_clone' === $operation ) {
+            return $this->abilities_v2_exact_keys( $payload, array( 'clone_ref', 'if_match' ) ) && $this->abilities_v2_valid_hash( $payload['clone_ref'] ) && $this->abilities_v2_valid_hash( $payload['if_match'] );
+        }
+        return in_array( $operation, array( 'cancel_operation', 'reconcile_operation' ), true ) && $this->abilities_v2_exact_keys( $payload, array( 'operation_ref', 'if_match' ) ) && $this->abilities_v2_valid_operation_ref( $payload['operation_ref'] ) && $this->abilities_v2_valid_hash( $payload['if_match'] );
+    }
+
+    /** @param string $operation Operation. @param mixed $result Result. @return bool */
+    private function abilities_v2_valid_operation_result( $operation, $result ) {
+        if ( ! is_array( $result ) ) {
+            return false;
+        }
+        if ( in_array( $operation, array( 'create_clone', 'update_clone', 'delete_clone' ), true ) ) {
+            return $this->abilities_v2_exact_keys( $result, array( 'operation_ref', 'clone_ref', 'status' ) ) && $this->abilities_v2_valid_operation_ref( $result['operation_ref'] ) && ( null === $result['clone_ref'] || $this->abilities_v2_valid_hash( $result['clone_ref'] ) ) && in_array( $result['status'], array( 'queued', 'running', 'reconciliation_required' ), true );
+        }
+        if ( 'operation_status' === $operation ) {
+            return $this->abilities_v2_exact_keys( $result, array( 'operation_ref', 'kind', 'status', 'progress_percent', 'current_step', 'generation' ) ) && $this->abilities_v2_valid_operation_ref( $result['operation_ref'] ) && in_array( $result['kind'], array( 'create', 'update', 'delete', 'reconcile' ), true ) && in_array( $result['status'], array( 'queued', 'running', 'verifying', 'succeeded', 'failed', 'cancelled', 'unknown', 'reconciliation_required' ), true ) && is_int( $result['progress_percent'] ) && 0 <= $result['progress_percent'] && 100 >= $result['progress_percent'] && ( null === $result['current_step'] || in_array( $result['current_step'], array( 'scan', 'database', 'directories', 'files', 'replace', 'finish', 'delete', 'verify' ), true ) ) && $this->abilities_v2_valid_hash( $result['generation'] );
+        }
+        return in_array( $operation, array( 'cancel_operation', 'reconcile_operation' ), true ) && $this->abilities_v2_exact_keys( $result, array( 'operation_ref', 'status', 'affected_steps', 'generation' ) ) && $this->abilities_v2_valid_operation_ref( $result['operation_ref'] ) && in_array( $result['status'], array( 'running', 'cancelling', 'cancelled', 'queued', 'reconciliation_required' ), true ) && is_int( $result['affected_steps'] ) && 0 <= $result['affected_steps'] && 100000 >= $result['affected_steps'] && $this->abilities_v2_valid_hash( $result['generation'] );
     }
 
     /**
@@ -852,6 +970,11 @@ class MainWP_Child_Staging { //phpcs:ignore -- NOSONAR - multi methods.
         return is_string( $value ) && 1 === preg_match( '/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/D', $value );
     }
 
+    /** @param mixed $value Value. @return bool */
+    private function abilities_v2_valid_operation_ref( $value ) {
+        return $this->abilities_v2_valid_request_ref( $value );
+    }
+
     /** @param mixed $value Value. @param array $keys Expected keys. @return bool */
     private function abilities_v2_exact_keys( $value, $keys ) {
         if ( ! is_array( $value ) ) {
@@ -872,6 +995,7 @@ class MainWP_Child_Staging { //phpcs:ignore -- NOSONAR - multi methods.
             'error_code' => $code,
         );
     }
+    // phpcs:enable Generic.Commenting.DocComment.MissingShort,Squiz.Commenting.FunctionComment,Generic.Formatting.MultipleStatementAlignment,WordPress.Arrays.ArrayDeclarationSpacing.AssociativeArrayFound,WordPress.Arrays.MultipleStatementAlignment,WordPress.PHP.YodaConditions.NotYoda
 
     /**
      * Get WP Staging Jobs.

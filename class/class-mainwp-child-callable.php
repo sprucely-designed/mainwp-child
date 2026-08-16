@@ -23,6 +23,9 @@ if ( ! defined( 'ABSPATH' ) ) {
  */
 class MainWP_Child_Callable { //phpcs:ignore -- NOSONAR - multi methods.
 
+    /** Maximum serialized Post Dripper v2 request, including 200 KB content. */
+    const POST_DRIPPER_REQUEST_MAX_BYTES = 262144;
+
     /**
      * Public static variable to hold the single instance of the class.
      *
@@ -443,7 +446,7 @@ class MainWP_Child_Callable { //phpcs:ignore -- NOSONAR - multi methods.
 
         // phpcs:ignore WordPress.Security.NonceVerification.Missing,WordPress.Security.ValidatedSanitizedInput.InputNotSanitized -- Closed JSON is validated by the handler.
         $raw = wp_unslash( $_POST['request'] );
-        if ( '' === $raw || 4096 < strlen( $raw ) ) {
+        if ( '' === $raw || self::POST_DRIPPER_REQUEST_MAX_BYTES < strlen( $raw ) ) {
             MainWP_Helper::write( MainWP_Child_Posts::get_instance()->post_dripper_capabilities_v2( null ) );
         }
 

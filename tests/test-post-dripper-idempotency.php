@@ -35,6 +35,7 @@ class Test_Post_Dripper_Idempotency extends WP_UnitTestCase {
 
 	public function test_capability_callable_advertises_the_closed_delivery_contract() {
 		$this->assertTrue( MainWP_Child_Callable::get_instance()->is_callable_function( 'post_dripper_capabilities_v2' ) );
+		$this->assertSame( 262144, MainWP_Child_Callable::POST_DRIPPER_REQUEST_MAX_BYTES );
 
 		$result = $this->request( 'capabilities', array() );
 		$this->assertSame( array( 'protocol', 'operation', 'ok', 'operations', 'mutation_supported' ), array_keys( $result ) );

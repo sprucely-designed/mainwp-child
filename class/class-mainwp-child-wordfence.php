@@ -799,28 +799,389 @@ class MainWP_Child_Wordfence { //phpcs:ignore -- NOSONAR - multi methods.
     }
 
     /**
-     * Execute one closed Wordfence protocol-v2 negotiation request.
+     * Execute one closed Wordfence protocol-v2 request.
      *
      * @param mixed $request Decoded request object.
      * @return array<string,mixed> Closed response.
      */
-    public function abilities_v2( $request ) {
-        $operation = is_array( $request ) && isset( $request['operation'] ) && is_string( $request['operation'] ) ? $request['operation'] : 'unknown';
-        if ( ! is_array( $request ) || ! $this->abilities_v2_exact_keys( $request, array( 'protocol', 'operation', 'payload' ) ) || '2' !== $request['protocol'] || ! is_array( $request['payload'] ) ) {
+    public function abilities_v2( $request ) { // phpcs:ignore Generic.Metrics.CyclomaticComplexity.TooHigh -- Closed operation table is intentionally linear.
+        $operation     = is_array( $request ) && isset( $request['operation'] ) && is_string( $request['operation'] ) ? $request['operation'] : 'unknown';
+        $reads         = array( 'site_v2', 'scan_v2_status', 'findings_v2', 'firewall_v2_get', 'blocks_v2_list', 'operation_v2_status' );
+        $bound_reads   = array( 'file_v2_prepare' );
+        $mutations     = array( 'scan_v2_start', 'scan_v2_cancel', 'finding_v2_classify', 'file_v2_repair', 'firewall_v2_replace', 'blocks_v2_replace' );
+        $request_bound = in_array( $operation, array_merge( $bound_reads, $mutations ), true );
+        $root_keys     = $request_bound ? array( 'protocol', 'operation', 'request_ref', 'payload' ) : array( 'protocol', 'operation', 'payload' );
+
+        if ( ! is_array( $request ) || ! $this->abilities_v2_exact_keys( $request, $root_keys ) || '2' !== $request['protocol'] || ! is_array( $request['payload'] ) ) {
             return $this->abilities_v2_error( 'unknown', 'invalid_request' );
         }
-
-        if ( 'capabilities' === $operation && array() === $request['payload'] ) {
+        if ( 'capabilities' === $operation ) {
+            if ( array() !== $request['payload'] ) {
+                return $this->abilities_v2_error( $operation, 'invalid_request' );
+            }
             return array(
                 'protocol'           => '2',
                 'operation'          => 'capabilities',
                 'ok'                 => true,
-                'operations'         => array(),
-                'mutation_supported' => false,
+                'operations'         => array_merge( $reads, $bound_reads, $mutations ),
+                'mutation_supported' => $this->abilities_v2_provider_supports_mutation(),
             );
         }
+        if ( ! in_array( $operation, array_merge( $reads, $bound_reads, $mutations ), true ) ) {
+            return $this->abilities_v2_error( $operation, 'unsupported_operation' );
+        }
+        if ( ( $request_bound && ! $this->abilities_v2_valid_request_ref( $request['request_ref'] ) ) || ! $this->abilities_v2_valid_payload( $operation, $request['payload'] ) ) {
+            return $this->abilities_v2_error( $operation, 'invalid_request' );
+        }
 
-        return $this->abilities_v2_error( $operation, 'unsupported_operation' );
+        $request_ref = $request_bound ? strtolower( $request['request_ref'] ) : null;
+        $effect_hash = hash( 'sha256', wp_json_encode( array( $operation, $request['payload'] ) ) );
+        $receipts    = array();
+        if ( in_array( $operation, $mutations, true ) ) {
+            $receipts = get_option( 'mainwp_wordfence_abilities_v2_receipts', array() );
+            if ( ! is_array( $receipts ) ) {
+                return $this->abilities_v2_error( $operation, 'storage_unavailable' );
+            }
+            if ( isset( $receipts[ $request_ref ] ) ) {
+                $receipt = $receipts[ $request_ref ];
+                if ( ! is_array( $receipt ) || ! $this->abilities_v2_exact_keys( $receipt, array( 'effect_hash', 'response' ) ) || ! $this->abilities_v2_valid_hash( $receipt['effect_hash'] ) || ! $this->abilities_v2_valid_receipt_response( $operation, $request_ref, $receipt['response'] ) ) {
+                    return $this->abilities_v2_error( $operation, 'storage_unavailable' );
+                }
+                return hash_equals( $receipt['effect_hash'], $effect_hash ) ? $receipt['response'] : $this->abilities_v2_error( $operation, 'request_conflict' );
+            }
+            if ( ! $this->abilities_v2_provider_supports_mutation() ) {
+                return $this->abilities_v2_error( $operation, 'provider_unavailable' );
+            }
+        }
+
+        try {
+            $result = $this->abilities_v2_provider_operation( $operation, $request['payload'], $request_ref );
+        } catch ( \Throwable $throwable ) {
+            return $this->abilities_v2_error( $operation, in_array( $operation, $mutations, true ) ? 'outcome_unknown' : 'provider_unavailable' );
+        }
+        if ( is_wp_error( $result ) ) {
+            $code = $result->get_error_code();
+            $safe = array( 'provider_unavailable', 'provider_schema_invalid', 'target_not_found', 'state_conflict', 'stale_generation', 'unsafe_target', 'verification_failed', 'outcome_unknown', 'storage_unavailable' );
+            return $this->abilities_v2_error( $operation, in_array( $code, $safe, true ) ? $code : 'provider_unavailable' );
+        }
+        if ( ! $this->abilities_v2_valid_result( $operation, $result ) ) {
+            return $this->abilities_v2_error( $operation, 'provider_schema_invalid' );
+        }
+
+        $response = array_merge(
+            array(
+                'protocol'  => '2',
+                'operation' => $operation,
+                'ok'        => true,
+            ),
+            $request_bound ? array( 'request_ref' => $request_ref ) : array(),
+            $result
+        );
+        if ( in_array( $operation, $mutations, true ) ) {
+            if ( 100 <= count( $receipts ) ) {
+                array_shift( $receipts );
+            }
+            $receipts[ $request_ref ] = array(
+                'effect_hash' => $effect_hash,
+                'response'    => $response,
+            );
+            if ( ! update_option( 'mainwp_wordfence_abilities_v2_receipts', $receipts, false ) && get_option( 'mainwp_wordfence_abilities_v2_receipts', array() ) !== $receipts ) {
+                return $this->abilities_v2_error( $operation, 'outcome_unknown' );
+            }
+        }
+        return $response;
+    }
+
+    /**
+     * Validate a stored mutation receipt response.
+     *
+     * @param string $operation   Operation name.
+     * @param string $request_ref Request reference.
+     * @param mixed  $response    Stored response.
+     * @return bool
+     */
+    private function abilities_v2_valid_receipt_response( $operation, $request_ref, $response ) {
+        if ( ! is_array( $response ) || ! isset( $response['protocol'], $response['operation'], $response['ok'], $response['request_ref'] ) || '2' !== $response['protocol'] || ! is_string( $response['operation'] ) || ! hash_equals( $operation, $response['operation'] ) || true !== $response['ok'] || ! is_string( $response['request_ref'] ) || ! hash_equals( $request_ref, strtolower( $response['request_ref'] ) ) ) {
+            return false;
+        }
+        $result = $response;
+        unset( $result['protocol'], $result['operation'], $result['ok'], $result['request_ref'] );
+        return $this->abilities_v2_valid_result( $operation, $result );
+    }
+
+    /**
+     * Check whether the installed Wordfence version has a typed mutation adapter.
+     *
+     * @return bool
+     */
+    protected function abilities_v2_provider_supports_mutation() {
+        return false;
+    }
+
+    /**
+     * Execute one provider-specific typed operation.
+     *
+     * Supported Wordfence versions override this narrow seam only after all
+     * returned values can satisfy the closed protocol validators below.
+     *
+     * @param string      $operation   Operation name.
+     * @param array       $payload     Closed operation payload.
+     * @param string|null $request_ref Optional caller request reference.
+     * @return array|WP_Error
+     */
+    protected function abilities_v2_provider_operation( $operation, $payload, $request_ref ) {
+        unset( $operation, $payload, $request_ref );
+        return new \WP_Error( 'provider_unavailable' );
+    }
+
+    /**
+     * Validate one operation payload.
+     *
+     * @param string $operation Operation name.
+     * @param array  $payload   Operation payload.
+     * @return bool
+     */
+    private function abilities_v2_valid_payload( $operation, $payload ) { // phpcs:ignore Generic.Metrics.CyclomaticComplexity.TooHigh -- Closed schemas are easier to audit linearly.
+        if ( in_array( $operation, array( 'site_v2', 'firewall_v2_get' ), true ) ) {
+            return array() === $payload;
+        }
+        if ( in_array( $operation, array( 'scan_v2_status', 'findings_v2' ), true ) ) {
+            $keys = 'scan_v2_status' === $operation ? array( 'scan_ref' ) : array( 'scan_ref', 'limit', 'after_ref' );
+            return $this->abilities_v2_exact_keys( $payload, $keys ) && $this->abilities_v2_valid_hash( $payload['scan_ref'] ) && ( 'scan_v2_status' === $operation || ( is_int( $payload['limit'] ) && 1 <= $payload['limit'] && 100 >= $payload['limit'] && ( null === $payload['after_ref'] || $this->abilities_v2_valid_hash( $payload['after_ref'] ) ) ) );
+        }
+        if ( 'blocks_v2_list' === $operation ) {
+            return $this->abilities_v2_exact_keys( $payload, array( 'limit', 'after_ref' ) ) && is_int( $payload['limit'] ) && 1 <= $payload['limit'] && 100 >= $payload['limit'] && ( null === $payload['after_ref'] || $this->abilities_v2_valid_hash( $payload['after_ref'] ) );
+        }
+        if ( 'operation_v2_status' === $operation ) {
+            return $this->abilities_v2_exact_keys( $payload, array( 'operation_ref' ) ) && $this->abilities_v2_valid_hash( $payload['operation_ref'] );
+        }
+        if ( 'scan_v2_start' === $operation ) {
+            return $this->abilities_v2_exact_keys( $payload, array( 'config_generation', 'definitions_generation' ) ) && $this->abilities_v2_valid_hash( $payload['config_generation'] ) && $this->abilities_v2_valid_hash( $payload['definitions_generation'] );
+        }
+        if ( 'scan_v2_cancel' === $operation ) {
+            return $this->abilities_v2_exact_keys( $payload, array( 'scan_ref' ) ) && $this->abilities_v2_valid_hash( $payload['scan_ref'] );
+        }
+        if ( 'finding_v2_classify' === $operation ) {
+            return $this->abilities_v2_exact_keys( $payload, array( 'finding_ref', 'finding_generation', 'status' ) ) && $this->abilities_v2_valid_hash( $payload['finding_ref'] ) && $this->abilities_v2_valid_hash( $payload['finding_generation'] ) && in_array( $payload['status'], array( 'active', 'ignored', 'fixed_claimed' ), true );
+        }
+        if ( in_array( $operation, array( 'file_v2_prepare', 'file_v2_repair' ), true ) ) {
+            $keys = 'file_v2_prepare' === $operation ? array( 'finding_ref', 'finding_generation', 'expected_hash', 'site_fingerprint' ) : array( 'finding_ref', 'finding_generation', 'expected_hash', 'preparation_generation', 'site_fingerprint' );
+            if ( ! $this->abilities_v2_exact_keys( $payload, $keys ) ) {
+                return false;
+            }
+            foreach ( $keys as $key ) {
+                if ( ! $this->abilities_v2_valid_hash( $payload[ $key ] ) ) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        if ( 'firewall_v2_replace' === $operation ) {
+            return $this->abilities_v2_exact_keys( $payload, array( 'if_match', 'policy' ) ) && $this->abilities_v2_valid_hash( $payload['if_match'] ) && $this->abilities_v2_valid_firewall_policy( $payload['policy'] );
+        }
+        return 'blocks_v2_replace' === $operation && $this->abilities_v2_exact_keys( $payload, array( 'if_match', 'blocks' ) ) && $this->abilities_v2_valid_hash( $payload['if_match'] ) && $this->abilities_v2_valid_block_inputs( $payload['blocks'] );
+    }
+
+    /**
+     * Validate one provider result.
+     *
+     * @param string $operation Operation name.
+     * @param mixed  $result    Provider result.
+     * @return bool
+     */
+    private function abilities_v2_valid_result( $operation, $result ) { // phpcs:ignore Generic.Metrics.CyclomaticComplexity.TooHigh -- Closed result matrix.
+        if ( ! is_array( $result ) ) {
+            return false;
+        }
+        $keys = array(
+            'site_v2'             => array( 'plugin_version', 'state', 'definitions_generation', 'config_generation', 'scan_ref', 'scan_state', 'finding_count', 'firewall_mode', 'blocked_attack_count', 'observed_at', 'generation' ),
+            'scan_v2_start'       => array( 'operation_ref', 'scan_ref', 'state', 'config_generation' ),
+            'scan_v2_cancel'      => array( 'operation_ref', 'scan_ref', 'state' ),
+            'scan_v2_status'      => array( 'scan_ref', 'state', 'progress', 'finding_count', 'complete', 'definitions_generation', 'generation' ),
+            'findings_v2'         => array( 'scan_ref', 'findings', 'next_after_ref', 'truncated', 'generation' ),
+            'finding_v2_classify' => array( 'operation_ref', 'finding_ref', 'prior_status', 'status', 'generation' ),
+            'file_v2_prepare'     => array( 'site_fingerprint', 'finding_ref', 'finding_generation', 'path_hash', 'component', 'component_type', 'component_version', 'current_hash', 'authoritative_hash', 'byte_count', 'file_type', 'symlink', 'within_root', 'source_authoritative', 'preparation_generation' ),
+            'file_v2_repair'      => array( 'operation_ref', 'finding_ref', 'state', 'current_hash', 'authoritative_hash', 'backup_ref', 'generation' ),
+            'firewall_v2_get'     => array( 'policy', 'effective', 'generation' ),
+            'firewall_v2_replace' => array( 'operation_ref', 'state', 'effective', 'management_probe', 'generation' ),
+            'blocks_v2_list'      => array( 'blocks', 'next_after_ref', 'truncated', 'generation' ),
+            'blocks_v2_replace'   => array( 'operation_ref', 'state', 'added', 'removed', 'management_probe', 'generation' ),
+            'operation_v2_status' => array( 'operation_ref', 'kind', 'state', 'progress', 'started_at', 'finished_at', 'result_ref', 'generation' ),
+        );
+        if ( ! isset( $keys[ $operation ] ) || ! $this->abilities_v2_exact_keys( $result, $keys[ $operation ] ) ) {
+            return false;
+        }
+        if ( 'site_v2' === $operation ) {
+            return is_string( $result['plugin_version'] ) && 100 >= strlen( $result['plugin_version'] ) && in_array( $result['state'], array( 'complete', 'partial', 'failed', 'unknown' ), true ) && $this->abilities_v2_valid_hash( $result['definitions_generation'] ) && $this->abilities_v2_valid_hash( $result['config_generation'] ) && ( null === $result['scan_ref'] || $this->abilities_v2_valid_hash( $result['scan_ref'] ) ) && in_array( $result['scan_state'], array( 'never', 'running', 'clean', 'findings', 'failed', 'unknown' ), true ) && ( null === $result['finding_count'] || ( is_int( $result['finding_count'] ) && 0 <= $result['finding_count'] && 5000 >= $result['finding_count'] ) ) && in_array( $result['firewall_mode'], array( 'disabled', 'learning', 'enabled', 'unknown' ), true ) && ( null === $result['blocked_attack_count'] || ( is_int( $result['blocked_attack_count'] ) && 0 <= $result['blocked_attack_count'] ) ) && $this->abilities_v2_valid_date( $result['observed_at'] ) && $this->abilities_v2_valid_hash( $result['generation'] );
+        }
+        if ( 'firewall_v2_get' === $operation ) {
+            return $this->abilities_v2_valid_firewall_policy( $result['policy'] ) && is_bool( $result['effective'] ) && $this->abilities_v2_valid_hash( $result['generation'] );
+        }
+        if ( 'blocks_v2_list' === $operation ) {
+            return $this->abilities_v2_valid_blocks( $result['blocks'] ) && 100 >= count( $result['blocks'] ) && ( null === $result['next_after_ref'] || $this->abilities_v2_valid_hash( $result['next_after_ref'] ) ) && is_bool( $result['truncated'] ) && $this->abilities_v2_valid_hash( $result['generation'] );
+        }
+        if ( 'file_v2_prepare' === $operation ) {
+            return $this->abilities_v2_valid_file_prepare_result( $result );
+        }
+        if ( 'findings_v2' === $operation ) {
+            return $this->abilities_v2_valid_findings_result( $result );
+        }
+        return $this->abilities_v2_valid_mutation_result( $operation, $result );
+    }
+
+    /**
+     * Validate a firewall policy.
+     *
+     * @param mixed $policy Policy value.
+     * @return bool
+     */
+    private function abilities_v2_valid_firewall_policy( $policy ) {
+        return is_array( $policy ) && $this->abilities_v2_exact_keys( $policy, array( 'mode', 'learning_until', 'ip_source', 'login_failures', 'forgot_password_attempts', 'rate_limit_per_minute', 'country_blocking_enabled' ) ) && in_array( $policy['mode'], array( 'disabled', 'learning', 'enabled' ), true ) && ( null === $policy['learning_until'] || $this->abilities_v2_valid_date( $policy['learning_until'] ) ) && in_array( $policy['ip_source'], array( 'REMOTE_ADDR', 'HTTP_X_FORWARDED_FOR', 'HTTP_X_REAL_IP' ), true ) && is_int( $policy['login_failures'] ) && 1 <= $policy['login_failures'] && 1000 >= $policy['login_failures'] && is_int( $policy['forgot_password_attempts'] ) && 1 <= $policy['forgot_password_attempts'] && 1000 >= $policy['forgot_password_attempts'] && is_int( $policy['rate_limit_per_minute'] ) && 1 <= $policy['rate_limit_per_minute'] && 100000 >= $policy['rate_limit_per_minute'] && is_bool( $policy['country_blocking_enabled'] );
+    }
+
+    /**
+     * Validate returned block projections.
+     *
+     * @param mixed $blocks Block projections.
+     * @return bool
+     */
+    private function abilities_v2_valid_blocks( $blocks ) {
+        if ( ! is_array( $blocks ) || 1000 < count( $blocks ) ) {
+            return false;
+        }
+        $seen = array();
+        foreach ( $blocks as $block ) {
+            if ( ! is_array( $block ) || ! $this->abilities_v2_exact_keys( $block, array( 'block_ref', 'kind', 'value', 'reason', 'expires_at' ) ) || ! $this->abilities_v2_valid_hash( $block['block_ref'] ) || ! in_array( $block['kind'], array( 'ip', 'cidr', 'country' ), true ) || ! is_string( $block['value'] ) || '' === $block['value'] || 64 < strlen( $block['value'] ) || ! is_string( $block['reason'] ) || 200 < strlen( $block['reason'] ) || ( null !== $block['expires_at'] && ! $this->abilities_v2_valid_date( $block['expires_at'] ) ) || isset( $seen[ $block['block_ref'] ] ) ) {
+                return false;
+            }
+            $seen[ $block['block_ref'] ] = true;
+        }
+        return true;
+    }
+
+    /**
+     * Validate caller-supplied block definitions.
+     *
+     * @param mixed $blocks Block definitions.
+     * @return bool
+     */
+    private function abilities_v2_valid_block_inputs( $blocks ) {
+        if ( ! is_array( $blocks ) || 1000 < count( $blocks ) ) {
+            return false;
+        }
+        $seen = array();
+        foreach ( $blocks as $block ) {
+            if ( ! is_array( $block ) || ! $this->abilities_v2_exact_keys( $block, array( 'kind', 'value', 'reason', 'expires_at' ) ) || ! in_array( $block['kind'], array( 'ip', 'cidr', 'country' ), true ) || ! is_string( $block['value'] ) || '' === $block['value'] || 64 < strlen( $block['value'] ) || ! is_string( $block['reason'] ) || 200 < strlen( $block['reason'] ) || ( null !== $block['expires_at'] && ! $this->abilities_v2_valid_date( $block['expires_at'] ) ) ) {
+                return false;
+            }
+            $identity = $block['kind'] . "\n" . strtolower( $block['value'] );
+            if ( isset( $seen[ $identity ] ) ) {
+                return false;
+            }
+            $seen[ $identity ] = true;
+        }
+        return true;
+    }
+
+    /**
+     * Validate a findings result.
+     *
+     * @param array $result Provider result.
+     * @return bool
+     */
+    private function abilities_v2_valid_findings_result( $result ) {
+        if ( ! $this->abilities_v2_valid_hash( $result['scan_ref'] ) || ! is_array( $result['findings'] ) || 100 < count( $result['findings'] ) || ( null !== $result['next_after_ref'] && ! $this->abilities_v2_valid_hash( $result['next_after_ref'] ) ) || ! is_bool( $result['truncated'] ) || ! $this->abilities_v2_valid_hash( $result['generation'] ) ) {
+            return false;
+        }
+        foreach ( $result['findings'] as $finding ) {
+            if ( ! is_array( $finding ) || ! $this->abilities_v2_exact_keys( $finding, array( 'finding_ref', 'type', 'severity', 'component', 'summary', 'classification', 'repairable', 'generation' ) ) || ! $this->abilities_v2_valid_hash( $finding['finding_ref'] ) || ! in_array( $finding['type'], array( 'malware', 'changed_file', 'vulnerability', 'configuration', 'user', 'database', 'other' ), true ) || ! in_array( $finding['severity'], array( 'critical', 'high', 'medium', 'low', 'unknown' ), true ) || ( null !== $finding['component'] && ( ! is_string( $finding['component'] ) || 191 < strlen( $finding['component'] ) ) ) || ! is_string( $finding['summary'] ) || 500 < strlen( $finding['summary'] ) || ! in_array( $finding['classification'], array( 'active', 'ignored', 'fixed_claimed', 'repaired', 'verification_failed' ), true ) || ! is_bool( $finding['repairable'] ) || ! $this->abilities_v2_valid_hash( $finding['generation'] ) ) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Validate a file preparation result.
+     *
+     * @param array $result Provider result.
+     * @return bool
+     */
+    private function abilities_v2_valid_file_prepare_result( $result ) {
+        $hashes = array( 'site_fingerprint', 'finding_ref', 'finding_generation', 'path_hash', 'current_hash', 'authoritative_hash', 'preparation_generation' );
+        foreach ( $hashes as $key ) {
+            if ( ! $this->abilities_v2_valid_hash( $result[ $key ] ) ) {
+                return false;
+            }
+        }
+        return is_string( $result['component'] ) && '' !== $result['component'] && 191 >= strlen( $result['component'] ) && in_array( $result['component_type'], array( 'core', 'plugin', 'theme' ), true ) && is_string( $result['component_version'] ) && '' !== $result['component_version'] && 100 >= strlen( $result['component_version'] ) && is_int( $result['byte_count'] ) && 0 <= $result['byte_count'] && 2 * 1024 * 1024 >= $result['byte_count'] && 'regular' === $result['file_type'] && is_bool( $result['symlink'] ) && is_bool( $result['within_root'] ) && is_bool( $result['source_authoritative'] );
+    }
+
+    /**
+     * Validate a mutation or operation-status result.
+     *
+     * @param string $operation Operation name.
+     * @param array  $result    Provider result.
+     * @return bool
+     */
+    private function abilities_v2_valid_mutation_result( $operation, $result ) { // phpcs:ignore Generic.Metrics.CyclomaticComplexity.TooHigh -- Closed scalar matrix.
+        if ( 'scan_v2_start' === $operation ) {
+            return $this->abilities_v2_valid_hash( $result['operation_ref'] ) && $this->abilities_v2_valid_hash( $result['scan_ref'] ) && in_array( $result['state'], array( 'requested', 'queued', 'running', 'reconciliation_required' ), true ) && $this->abilities_v2_valid_hash( $result['config_generation'] );
+        }
+        if ( 'scan_v2_cancel' === $operation ) {
+            return $this->abilities_v2_valid_hash( $result['operation_ref'] ) && $this->abilities_v2_valid_hash( $result['scan_ref'] ) && in_array( $result['state'], array( 'kill_requested', 'cancelled', 'already_terminal', 'reconciliation_required' ), true );
+        }
+        if ( 'scan_v2_status' === $operation ) {
+            return $this->abilities_v2_valid_hash( $result['scan_ref'] ) && in_array( $result['state'], array( 'requested', 'queued', 'running', 'kill_requested', 'completed_clean', 'completed_findings', 'failed', 'timed_out', 'unknown' ), true ) && is_int( $result['progress'] ) && 0 <= $result['progress'] && 100 >= $result['progress'] && ( null === $result['finding_count'] || ( is_int( $result['finding_count'] ) && 0 <= $result['finding_count'] && 5000 >= $result['finding_count'] ) ) && is_bool( $result['complete'] ) && $this->abilities_v2_valid_hash( $result['definitions_generation'] ) && $this->abilities_v2_valid_hash( $result['generation'] );
+        }
+        if ( 'finding_v2_classify' === $operation ) {
+            return $this->abilities_v2_valid_hash( $result['operation_ref'] ) && $this->abilities_v2_valid_hash( $result['finding_ref'] ) && in_array( $result['prior_status'], array( 'active', 'ignored', 'fixed_claimed' ), true ) && in_array( $result['status'], array( 'active', 'ignored', 'fixed_claimed' ), true ) && $this->abilities_v2_valid_hash( $result['generation'] );
+        }
+        if ( 'file_v2_repair' === $operation ) {
+            return $this->abilities_v2_valid_hash( $result['operation_ref'] ) && $this->abilities_v2_valid_hash( $result['finding_ref'] ) && in_array( $result['state'], array( 'queued', 'verifying', 'completed', 'reconciliation_required' ), true ) && $this->abilities_v2_valid_hash( $result['current_hash'] ) && $this->abilities_v2_valid_hash( $result['authoritative_hash'] ) && ( null === $result['backup_ref'] || $this->abilities_v2_valid_hash( $result['backup_ref'] ) ) && $this->abilities_v2_valid_hash( $result['generation'] );
+        }
+        if ( 'firewall_v2_replace' === $operation ) {
+            return $this->abilities_v2_valid_hash( $result['operation_ref'] ) && in_array( $result['state'], array( 'queued', 'verifying', 'completed', 'reconciliation_required' ), true ) && is_bool( $result['effective'] ) && in_array( $result['management_probe'], array( 'safe', 'unsafe', 'unknown' ), true ) && $this->abilities_v2_valid_hash( $result['generation'] );
+        }
+        if ( 'blocks_v2_replace' === $operation ) {
+            return $this->abilities_v2_valid_hash( $result['operation_ref'] ) && in_array( $result['state'], array( 'queued', 'verifying', 'completed', 'reconciliation_required' ), true ) && is_int( $result['added'] ) && 0 <= $result['added'] && 1000 >= $result['added'] && is_int( $result['removed'] ) && 0 <= $result['removed'] && 1000 >= $result['removed'] && in_array( $result['management_probe'], array( 'safe', 'unsafe', 'unknown' ), true ) && $this->abilities_v2_valid_hash( $result['generation'] );
+        }
+        return 'operation_v2_status' === $operation && $this->abilities_v2_valid_hash( $result['operation_ref'] ) && in_array( $result['kind'], array( 'scan', 'scan_cancel', 'finding_classify', 'file_repair', 'firewall_replace', 'blocks_replace' ), true ) && in_array( $result['state'], array( 'requested', 'queued', 'running', 'kill_requested', 'verifying', 'completed', 'completed_clean', 'completed_findings', 'failed', 'timed_out', 'unknown', 'reconciliation_required' ), true ) && is_int( $result['progress'] ) && 0 <= $result['progress'] && 100 >= $result['progress'] && ( null === $result['started_at'] || $this->abilities_v2_valid_date( $result['started_at'] ) ) && ( null === $result['finished_at'] || $this->abilities_v2_valid_date( $result['finished_at'] ) ) && ( null === $result['result_ref'] || $this->abilities_v2_valid_hash( $result['result_ref'] ) ) && $this->abilities_v2_valid_hash( $result['generation'] );
+    }
+
+    /**
+     * Validate a SHA-256 reference.
+     *
+     * @param mixed $value Candidate value.
+     * @return bool
+     */
+    private function abilities_v2_valid_hash( $value ) {
+        return is_string( $value ) && 1 === preg_match( '/^[a-f0-9]{64}$/D', $value );
+    }
+
+    /**
+     * Validate a UUID request reference.
+     *
+     * @param mixed $value Candidate value.
+     * @return bool
+     */
+    private function abilities_v2_valid_request_ref( $value ) {
+        return is_string( $value ) && 1 === preg_match( '/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/Di', $value );
+    }
+
+    /**
+     * Validate a UTC date-time.
+     *
+     * @param mixed $value Candidate value.
+     * @return bool
+     */
+    private function abilities_v2_valid_date( $value ) {
+        if ( ! is_string( $value ) || 1 !== preg_match( '/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/D', $value ) ) {
+            return false;
+        }
+        $date   = \DateTimeImmutable::createFromFormat( '!Y-m-d\TH:i:s\Z', $value, new \DateTimeZone( 'UTC' ) );
+        $errors = \DateTimeImmutable::getLastErrors();
+        return false !== $date && ( false === $errors || ( 0 === $errors['warning_count'] && 0 === $errors['error_count'] ) ) && $date->format( 'Y-m-d\TH:i:s\Z' ) === $value;
     }
 
     /**

@@ -10,6 +10,24 @@ namespace MainWP\Child;
 use ReflectionClass;
 use WP_UnitTestCase;
 
+class Wordfence_V2_Protocol_Fixture extends MainWP_Child_Wordfence {
+
+	/** @var array */
+	public $results = array();
+
+	/** @var array */
+	public $calls = array();
+
+	protected function abilities_v2_provider_supports_mutation() {
+		return true;
+	}
+
+	protected function abilities_v2_provider_operation( $operation, $payload, $request_ref ) {
+		$this->calls[] = array( $operation, $payload, $request_ref );
+		return isset( $this->results[ $operation ] ) ? $this->results[ $operation ] : new \WP_Error( 'provider_unavailable' );
+	}
+}
+
 class Test_MainWP_Child_Wordfence_V2 extends WP_UnitTestCase {
 
 	/** @var MainWP_Child_Wordfence */
@@ -17,15 +35,21 @@ class Test_MainWP_Child_Wordfence_V2 extends WP_UnitTestCase {
 
 	public function set_up(): void {
 		parent::set_up();
+		delete_option( 'mainwp_wordfence_abilities_v2_receipts' );
 		$reflection    = new ReflectionClass( MainWP_Child_Wordfence::class );
 		$this->subject = $reflection->newInstanceWithoutConstructor();
+	}
+
+	public function tear_down(): void {
+		delete_option( 'mainwp_wordfence_abilities_v2_receipts' );
+		parent::tear_down();
 	}
 
 	public function test_capabilities_are_closed_and_claim_no_unimplemented_operation() {
 		$result = $this->request( 'capabilities', array() );
 
 		$this->assertSame( array( 'protocol', 'operation', 'ok', 'operations', 'mutation_supported' ), array_keys( $result ) );
-		$this->assertSame( array(), $result['operations'] );
+		$this->assertSame( array( 'site_v2', 'scan_v2_status', 'findings_v2', 'firewall_v2_get', 'blocks_v2_list', 'operation_v2_status', 'file_v2_prepare', 'scan_v2_start', 'scan_v2_cancel', 'finding_v2_classify', 'file_v2_repair', 'firewall_v2_replace', 'blocks_v2_replace' ), $result['operations'] );
 		$this->assertFalse( $result['mutation_supported'] );
 	}
 
@@ -42,7 +66,63 @@ class Test_MainWP_Child_Wordfence_V2 extends WP_UnitTestCase {
 
 		$result = $this->request( 'site_v2', array() );
 		$this->assertFalse( $result['ok'] );
-		$this->assertSame( 'unsupported_operation', $result['code'] );
+		$this->assertSame( 'provider_unavailable', $result['code'] );
+	}
+
+	public function test_typed_blocks_replace_uses_request_ref_and_exact_replay() {
+		$fixture = new Wordfence_V2_Protocol_Fixture();
+		$fixture->results['blocks_v2_replace'] = array(
+			'operation_ref'   => str_repeat( 'a', 64 ),
+			'state'           => 'completed',
+			'added'           => 1,
+			'removed'         => 0,
+			'management_probe'=> 'safe',
+			'generation'      => str_repeat( 'b', 64 ),
+		);
+		$request = array(
+			'protocol'    => '2',
+			'operation'   => 'blocks_v2_replace',
+			'request_ref' => '123e4567-e89b-42d3-a456-426614174601',
+			'payload'     => array(
+				'if_match' => str_repeat( 'c', 64 ),
+				'blocks'   => array( array( 'kind' => 'cidr', 'value' => '203.0.113.0/24', 'reason' => 'abuse', 'expires_at' => null ) ),
+			),
+		);
+
+		$result = $fixture->abilities_v2( $request );
+		$this->assertTrue( $result['ok'] );
+		$this->assertSame( $request['request_ref'], $result['request_ref'] );
+		$this->assertSame( $result, $fixture->abilities_v2( $request ) );
+		$this->assertCount( 1, $fixture->calls );
+
+		$request['payload']['blocks'][0]['reason'] = 'changed';
+		$this->assertSame( 'request_conflict', $fixture->abilities_v2( $request )['code'] );
+		unset( $request['request_ref'] );
+		$request['request_id'] = '123e4567-e89b-42d3-a456-426614174602';
+		$this->assertSame( 'invalid_request', $fixture->abilities_v2( $request )['code'] );
+	}
+
+	public function test_read_results_are_closed_and_malformed_provider_data_fails() {
+		$fixture = new Wordfence_V2_Protocol_Fixture();
+		$fixture->results['site_v2'] = array(
+			'plugin_version'        => '8.0.5',
+			'state'                 => 'complete',
+			'definitions_generation'=> str_repeat( 'a', 64 ),
+			'config_generation'     => str_repeat( 'b', 64 ),
+			'scan_ref'              => null,
+			'scan_state'            => 'never',
+			'finding_count'         => 0,
+			'firewall_mode'         => 'enabled',
+			'blocked_attack_count'  => 4,
+			'observed_at'           => '2026-08-16T12:00:00Z',
+			'generation'            => str_repeat( 'c', 64 ),
+		);
+		$result = $fixture->abilities_v2( array( 'protocol' => '2', 'operation' => 'site_v2', 'payload' => array() ) );
+		$this->assertTrue( $result['ok'] );
+		$this->assertArrayNotHasKey( 'request_ref', $result );
+
+		$fixture->results['site_v2']['private_path'] = '/secret';
+		$this->assertSame( 'provider_schema_invalid', $fixture->abilities_v2( array( 'protocol' => '2', 'operation' => 'site_v2', 'payload' => array() ) )['code'] );
 	}
 
 	public function test_reordered_envelope_is_accepted_but_extra_fields_are_not() {

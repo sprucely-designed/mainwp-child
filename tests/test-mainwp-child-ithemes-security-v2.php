@@ -10,6 +10,24 @@ namespace MainWP\Child;
 use ReflectionClass;
 use WP_UnitTestCase;
 
+class IThemes_Security_V2_Protocol_Fixture extends MainWP_Child_IThemes_Security {
+
+	/** @var array */
+	public $results = array();
+
+	/** @var array */
+	public $calls = array();
+
+	protected function abilities_v2_provider_supports_mutation() {
+		return true;
+	}
+
+	protected function abilities_v2_provider_operation( $operation, $payload ) {
+		$this->calls[] = array( $operation, $payload );
+		return isset( $this->results[ $operation ] ) ? $this->results[ $operation ] : new \WP_Error( 'plugin_unavailable' );
+	}
+}
+
 class Test_MainWP_Child_IThemes_Security_V2 extends WP_UnitTestCase {
 
 	/** @var MainWP_Child_IThemes_Security */
@@ -18,12 +36,14 @@ class Test_MainWP_Child_IThemes_Security_V2 extends WP_UnitTestCase {
 	public function set_up(): void {
 		parent::set_up();
 		delete_site_option( 'itsec_temp_whitelist_ip' );
+		delete_option( 'mainwp_solid_abilities_v2_receipts' );
 		$reflection    = new ReflectionClass( MainWP_Child_IThemes_Security::class );
 		$this->subject = $reflection->newInstanceWithoutConstructor();
 	}
 
 	public function tear_down(): void {
 		delete_site_option( 'itsec_temp_whitelist_ip' );
+		delete_option( 'mainwp_solid_abilities_v2_receipts' );
 		parent::tear_down();
 	}
 
@@ -33,7 +53,7 @@ class Test_MainWP_Child_IThemes_Security_V2 extends WP_UnitTestCase {
 		$this->assertSame( array( 'protocol', 'operation', 'ok', 'operations', 'mutation_supported' ), array_keys( $result ) );
 		$this->assertSame( '2', $result['protocol'] );
 		$this->assertTrue( $result['ok'] );
-		$this->assertSame( array( 'ability_solid_file_permissions_v2', 'ability_solid_summary_v2', 'ability_solid_whitelist_v2' ), $result['operations'] );
+		$this->assertSame( array( 'ability_solid_file_permissions_v2', 'ability_solid_summary_v2', 'ability_solid_whitelist_v2', 'ability_solid_lockouts_v2', 'ability_solid_release_lockouts_v2', 'ability_solid_replace_whitelist_v2', 'ability_solid_file_scan_v2', 'ability_solid_backup_v2', 'ability_solid_malware_scan_v2', 'ability_solid_clear_logs_v2' ), $result['operations'] );
 		$this->assertFalse( $result['mutation_supported'] );
 	}
 
@@ -249,7 +269,7 @@ class Test_MainWP_Child_IThemes_Security_V2 extends WP_UnitTestCase {
 			$this->subject->abilities_v2( array() )
 		);
 
-		$unknown = $this->request( 'ability_solid_backup_v2', array() );
+		$unknown = $this->request( 'ability_solid_missing_v2', array() );
 		$this->assertFalse( $unknown['ok'] );
 		$this->assertSame( 'unsupported_operation', $unknown['code'] );
 
@@ -263,6 +283,50 @@ class Test_MainWP_Child_IThemes_Security_V2 extends WP_UnitTestCase {
 		);
 		$this->assertFalse( $alias['ok'] );
 		$this->assertSame( 'invalid_request', $alias['code'] );
+	}
+
+	public function test_lockout_read_and_release_are_closed_and_replay_exactly() {
+		$fixture = new IThemes_Security_V2_Protocol_Fixture();
+		$fixture->results['ability_solid_lockouts_v2'] = array(
+			'lockouts' => array( array( 'lockout_ref' => str_repeat( 'a', 64 ), 'kind' => 'host', 'expires_at' => '2026-08-16T13:00:00Z' ) ),
+			'next_after_lockout_ref' => null,
+			'truncated' => false,
+			'revision' => str_repeat( 'b', 64 ),
+		);
+		$read = $fixture->abilities_v2( array( 'protocol' => '2', 'operation' => 'ability_solid_lockouts_v2', 'payload' => array( 'limit' => 50, 'after_lockout_ref' => null ) ) );
+		$this->assertTrue( $read['ok'] );
+		$this->assertStringNotContainsString( 'ip', wp_json_encode( $read ) );
+
+		$fixture->results['ability_solid_release_lockouts_v2'] = array(
+			'requested_count'      => 1,
+			'releasable_count'     => 1,
+			'released_count'       => 1,
+			'already_absent_count' => 0,
+			'failed_count'         => 0,
+			'revision'             => str_repeat( 'c', 64 ),
+		);
+		$request = array(
+			'protocol'    => '2',
+			'operation'   => 'ability_solid_release_lockouts_v2',
+			'request_ref' => '123e4567-e89b-42d3-a456-426614174701',
+			'payload'     => array( 'lockout_refs' => array( str_repeat( 'a', 64 ) ), 'if_match' => str_repeat( 'b', 64 ) ),
+		);
+		$result = $fixture->abilities_v2( $request );
+		$this->assertTrue( $result['ok'] );
+		$this->assertSame( $result, $fixture->abilities_v2( $request ) );
+		$this->assertCount( 2, $fixture->calls );
+		$request['payload']['lockout_refs'][] = str_repeat( 'd', 64 );
+		$this->assertSame( 'request_conflict', $fixture->abilities_v2( $request )['code'] );
+	}
+
+	public function test_mutation_alias_and_malformed_provider_result_fail_closed() {
+		$fixture = new IThemes_Security_V2_Protocol_Fixture();
+		$fixture->results['ability_solid_backup_v2'] = array( 'accepted' => true, 'completed' => false, 'outcome' => 'accepted', 'generation' => str_repeat( 'a', 64 ), 'extra' => true );
+		$request = array( 'protocol' => '2', 'operation' => 'ability_solid_backup_v2', 'request_ref' => '123e4567-e89b-42d3-a456-426614174702', 'payload' => array() );
+		$this->assertSame( 'provider_schema_invalid', $fixture->abilities_v2( $request )['code'] );
+		unset( $request['request_ref'] );
+		$request['request_id'] = '123e4567-e89b-42d3-a456-426614174702';
+		$this->assertSame( 'invalid_request', $fixture->abilities_v2( $request )['code'] );
 	}
 
 	public function test_reordered_envelope_is_accepted_but_extra_payload_is_not() {

@@ -595,15 +595,16 @@ class Test_MainWP_Child_Back_WP_Up_Abilities_V2 extends WP_UnitTestCase {
 	/**
 	 * Download redemption keeps the provider target private and action-bound.
 	 */
-	public function test_redeem_backup_download_returns_only_a_bounded_internal_url() {
+	public function test_redeem_backup_download_returns_only_a_bounded_folder_target() {
 		$internal = array( 'destination_key' => '7_FOLDER', 'file' => '/private/provider/archive.zip' );
+		$target   = array( 'folder' => '/var/www/html/wp-content/uploads/backwpup', 'file_name' => 'archive.zip', 'size_bytes' => 24 );
 		$fixture  = new Test_MainWP_Child_Back_WP_Up_V2_Fixture(
 			array(),
 			array(
 				'list_backups'           => array(
 					array( 'job_id' => 7, 'destination' => 'FOLDER', 'file_name' => 'archive.zip', 'created_at' => 200, 'size_bytes' => 24, 'target' => $internal ),
 				),
-				'redeem_backup_download' => array( 'download_url' => 'https://child.example/wp-content/uploads/backwpup/archive.zip', 'size_bytes' => 24 ),
+				'redeem_backup_download' => $target,
 			)
 		);
 
@@ -612,7 +613,7 @@ class Test_MainWP_Child_Back_WP_Up_Abilities_V2 extends WP_UnitTestCase {
 		$result = $this->invoke_v2( array( 'operation' => 'redeem_backup_download', 'payload' => array( 'download_token' => $token ) ), $fixture );
 
 		$this->assertTrue( $result['ok'] );
-		$this->assertSame( array( 'download_url' => 'https://child.example/wp-content/uploads/backwpup/archive.zip', 'size_bytes' => 24 ), $result['data'] );
+		$this->assertSame( $target, $result['data'] );
 		$this->assertSame( array( 'redeem_backup_download', $internal ), $fixture->provider_calls[1] );
 		$this->assertStringNotContainsString( '/private/', wp_json_encode( $result ) );
 
@@ -620,10 +621,18 @@ class Test_MainWP_Child_Back_WP_Up_Abilities_V2 extends WP_UnitTestCase {
 		$this->assertFalse( $wrong_action['ok'] );
 		$this->assertSame( 'target_not_found', $wrong_action['error']['code'] );
 
-		$fixture->provider_results['redeem_backup_download'] = array( 'download_url' => 'file:///private/provider/archive.zip', 'size_bytes' => 24 );
-		$malformed = $this->invoke_v2( array( 'operation' => 'redeem_backup_download', 'payload' => array( 'download_token' => $token ) ), $fixture );
-		$this->assertFalse( $malformed['ok'] );
-		$this->assertSame( 'operation_failed', $malformed['error']['code'] );
+		foreach (
+			array(
+				array( 'folder' => '', 'file_name' => 'archive.zip', 'size_bytes' => 24 ),
+				array( 'folder' => '/var/www/html/wp-content/uploads/backwpup', 'file_name' => '../archive.zip', 'size_bytes' => 24 ),
+				array( 'download_url' => 'https://child.example/archive.zip', 'size_bytes' => 24 ),
+			) as $index => $invalid
+		) {
+			$fixture->provider_results['redeem_backup_download'] = $invalid;
+			$malformed = $this->invoke_v2( array( 'operation' => 'redeem_backup_download', 'payload' => array( 'download_token' => $token ) ), $fixture );
+			$this->assertFalse( $malformed['ok'], (string) $index );
+			$this->assertSame( 'operation_failed', $malformed['error']['code'], (string) $index );
+		}
 	}
 
 	/**

@@ -745,11 +745,11 @@ class MainWP_Child_Back_WP_Up { //phpcs:ignore -- NOSONAR - multi methods.
     }
 
     /**
-     * Resolve one exact download token into a bounded private download URL.
+     * Resolve one exact download token into a bounded private archive location.
      *
      * The authenticated Dashboard transport is the only consumer of this
-     * response. The Dashboard keeps the URL inside its one-use gateway claim;
-     * no Ability result exposes it to callers.
+     * response. The Dashboard rebuilds the managed-site content URL from the
+     * folder and file name itself; no Ability result exposes either to callers.
      *
      * @param string $operation Operation name.
      * @param array  $payload   Typed payload.
@@ -771,7 +771,7 @@ class MainWP_Child_Back_WP_Up { //phpcs:ignore -- NOSONAR - multi methods.
         if ( is_wp_error( $result ) ) {
             return $this->abilities_v2_from_provider_error( $operation, $result );
         }
-        if ( ! is_array( $result ) || ! $this->abilities_v2_has_keys( $result, array( 'download_url', 'size_bytes' ) ) || ! $this->abilities_v2_valid_download_url( $result['download_url'] ) || ! $this->abilities_v2_is_bounded_int( $result['size_bytes'], 0, PHP_INT_MAX ) ) {
+        if ( ! is_array( $result ) || ! $this->abilities_v2_has_keys( $result, array( 'folder', 'file_name', 'size_bytes' ) ) || ! $this->abilities_v2_valid_download_target( $result['folder'], $result['file_name'] ) || ! $this->abilities_v2_is_bounded_int( $result['size_bytes'], 0, PHP_INT_MAX ) ) {
             return $this->abilities_v2_error( $operation, 'operation_failed', __( 'The backup download result is invalid.', 'mainwp-child' ) );
         }
         return $this->abilities_v2_success( $operation, $result );
@@ -1098,17 +1098,17 @@ class MainWP_Child_Back_WP_Up { //phpcs:ignore -- NOSONAR - multi methods.
     }
 
     /**
-     * Validate a bounded HTTP(S) URL for the private Dashboard gateway.
+     * Validate a bounded archive directory and file name for the Dashboard gateway.
      *
-     * @param mixed $url Candidate URL.
+     * @param mixed $folder    Candidate destination directory.
+     * @param mixed $file_name Candidate archive file name.
      * @return bool
      */
-    private function abilities_v2_valid_download_url( $url ) {
-        if ( ! is_string( $url ) || '' === $url || 2048 < strlen( $url ) || preg_match( '/[\x00-\x1F\x7F]/', $url ) ) {
+    private function abilities_v2_valid_download_target( $folder, $file_name ) {
+        if ( ! is_string( $folder ) || '' === $folder || 4096 < strlen( $folder ) || preg_match( '/[\x00-\x1F\x7F]/', $folder ) ) {
             return false;
         }
-        $parts = wp_parse_url( $url );
-        return is_array( $parts ) && isset( $parts['scheme'], $parts['host'] ) && in_array( strtolower( $parts['scheme'] ), array( 'http', 'https' ), true ) && '' !== $parts['host'] && ! isset( $parts['user'] ) && ! isset( $parts['pass'] ) && ! isset( $parts['fragment'] );
+        return is_string( $file_name ) && '' !== $file_name && 255 >= strlen( $file_name ) && basename( $file_name ) === $file_name && false === strpos( $file_name, '\\' ) && ! preg_match( '/[\x00-\x1F\x7F]/', $file_name );
     }
 
     /**
@@ -1410,7 +1410,11 @@ class MainWP_Child_Back_WP_Up { //phpcs:ignore -- NOSONAR - multi methods.
     }
 
     /**
-     * Resolve the current provider download URL for one exact hidden target.
+     * Resolve the current provider archive location for one exact hidden target.
+     *
+     * Only the FOLDER destination keeps archives under the site's own web root,
+     * which is the one shape the Dashboard can turn back into a managed-site
+     * content URL. Every other destination fails closed here.
      *
      * @param array $target Internal target.
      * @return array|WP_Error
@@ -1432,13 +1436,15 @@ class MainWP_Child_Back_WP_Up { //phpcs:ignore -- NOSONAR - multi methods.
             if ( ! is_array( $file ) || ! isset( $file['file'] ) || ! is_string( $file['file'] ) || ! hash_equals( $target['file'], $file['file'] ) ) {
                 continue;
             }
-            $size = isset( $file['filesize'] ) ? $file['filesize'] : ( isset( $file['size'] ) ? $file['size'] : 0 );
-            if ( ! isset( $file['downloadurl'] ) || ! is_string( $file['downloadurl'] ) || ! is_numeric( $size ) || 0 > (int) $size ) {
+            $size      = isset( $file['filesize'] ) ? $file['filesize'] : ( isset( $file['size'] ) ? $file['size'] : 0 );
+            $file_name = isset( $file['filename'] ) && is_string( $file['filename'] ) ? $file['filename'] : basename( $file['file'] );
+            if ( ! isset( $file['folder'] ) || ! is_string( $file['folder'] ) || '' === $file['folder'] || ! is_numeric( $size ) || 0 > (int) $size ) {
                 return new \WP_Error( 'operation_failed' );
             }
             return array(
-                'download_url' => $file['downloadurl'],
-                'size_bytes'   => (int) $size,
+                'folder'     => $file['folder'],
+                'file_name'  => $file_name,
+                'size_bytes' => (int) $size,
             );
         }
         return new \WP_Error( 'not_found' );

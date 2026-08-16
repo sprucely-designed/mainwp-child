@@ -71,6 +71,42 @@ class Test_Post_Plus_Child_V2 extends WP_UnitTestCase {
 		$this->assertSame( $created['post_revision'], $readback['readback']['revision'] );
 	}
 
+	public function test_readback_source_mode_is_bounded_and_does_not_take_an_edit_lock() {
+		$post_id = self::factory()->post->create(
+			array(
+				'post_type'      => 'post',
+				'post_status'    => 'publish',
+				'post_title'     => 'Clone source',
+				'post_content'   => 'Bounded source content.',
+				'post_excerpt'   => 'Source excerpt.',
+				'post_name'      => 'clone-source',
+				'comment_status' => 'closed',
+				'ping_status'    => 'closed',
+			)
+		);
+		wp_set_post_terms( $post_id, array( 'post-plus-fixture' ), 'category' );
+		$payload = array(
+			'dashboard_ref'  => hash( 'sha256', 'https://dashboard.example.test' ),
+			'source_post_id' => $post_id,
+			'source_type'    => 'post',
+		);
+		$result = $this->request( 'post_plus_readback_v2', $payload );
+
+		$this->assertSame( array( 'protocol', 'operation', 'complete', 'source_post_id', 'source_type', 'source_ref', 'title', 'content_digest', 'compatibility', 'private_context', 'source_revision' ), array_keys( $result ) );
+		$this->assertTrue( $result['complete'] );
+		$this->assertSame( 'supported', $result['compatibility'] );
+		$this->assertSame( '', get_post_meta( $post_id, '_edit_lock', true ) );
+		$private = json_decode( $result['private_context'], true );
+		$this->assertSame( 'Bounded source content.', $private['post']['content'] );
+		$this->assertSame( $result['content_digest'], hash( 'sha256', wp_json_encode( array( $private['post'], $private['randomization'] ) ) ) );
+		$binding = $result;
+		unset( $binding['source_revision'] );
+		$this->assertSame( hash( 'sha256', wp_json_encode( $binding ) ), $result['source_revision'] );
+
+		$payload['source_post_id'] = (string) $post_id;
+		$this->assertSame( 'invalid_request', $this->request( 'post_plus_readback_v2', $payload )['code'] );
+	}
+
 	public function test_update_and_conflict_paths_do_not_duplicate_content() {
 		$create = $this->delivery_payload( '123e4567-e89b-42d3-a456-426614174613', 'Before Plus update' );
 		$first  = $this->request( 'post_plus_newpost_v2', $create );

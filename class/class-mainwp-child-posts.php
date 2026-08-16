@@ -427,10 +427,106 @@ class MainWP_Child_Posts { //phpcs:ignore -- NOSONAR - multi methods.
             return $this->content_v2_status( 'post_plus', $operation, $request['payload'], false );
         }
         if ( 'post_plus_readback_v2' === $operation ) {
+            if ( $this->posts_v2_exact_keys( $request['payload'], array( 'dashboard_ref', 'source_post_id', 'source_type' ) ) ) {
+                return $this->post_plus_v2_source( $operation, $request['payload'] );
+            }
             return $this->content_v2_status( 'post_plus', $operation, $request['payload'], true );
         }
 
         return $this->post_plus_v2_error( $operation, 'unsupported_operation' );
+    }
+
+    /**
+     * Return one bounded immutable core post/page source without taking an edit lock.
+     *
+     * @param string $operation Closed operation name.
+     * @param array  $payload   Exact source selector.
+     * @return array Closed private source response.
+     */
+    private function post_plus_v2_source( $operation, $payload ) {
+        $dashboard_ref = $this->content_v2_dashboard_ref();
+        if ( false === $dashboard_ref
+            || ! $this->posts_v2_exact_keys( $payload, array( 'dashboard_ref', 'source_post_id', 'source_type' ) )
+            || ! $this->content_v2_hash( $payload['dashboard_ref'] )
+            || ! hash_equals( $dashboard_ref, $payload['dashboard_ref'] )
+            || ! is_int( $payload['source_post_id'] )
+            || 1 > $payload['source_post_id']
+            || ! in_array( $payload['source_type'], array( 'post', 'page' ), true ) ) {
+            return $this->post_plus_v2_error( $operation, 'invalid_request' );
+        }
+
+        $source = get_post( $payload['source_post_id'] );
+        if ( ! $source instanceof \WP_Post || $source->post_type !== $payload['source_type'] ) {
+            return $this->post_plus_v2_error( $operation, 'source_not_found' );
+        }
+        $categories = 'post' === $source->post_type ? wp_get_post_terms( $source->ID, 'category', array( 'fields' => 'slugs' ) ) : array();
+        $tags       = 'post' === $source->post_type ? wp_get_post_terms( $source->ID, 'post_tag', array( 'fields' => 'slugs' ) ) : array();
+        if ( is_wp_error( $categories ) || is_wp_error( $tags ) || ! is_array( $categories ) || ! is_array( $tags ) || 100 < count( $categories ) || 100 < count( $tags ) ) {
+            return $this->post_plus_v2_error( $operation, 'storage_unavailable' );
+        }
+        sort( $categories, SORT_STRING );
+        sort( $tags, SORT_STRING );
+        $post = array(
+            'post_type'      => $source->post_type,
+            'status'         => in_array( $source->post_status, array( 'draft', 'publish' ), true ) ? $source->post_status : 'draft',
+            'title'          => $source->post_title,
+            'content'        => $source->post_content,
+            'excerpt'        => $source->post_excerpt,
+            'slug'           => $source->post_name,
+            'comment_status' => $source->comment_status,
+            'ping_status'    => $source->ping_status,
+            'categories'     => array_values( $categories ),
+            'tags'           => array_values( $tags ),
+        );
+        $randomization = array(
+            'roles'           => array(),
+            'random_category' => false,
+            'date_from'       => null,
+            'date_to'         => null,
+            'timezone'        => 'UTC',
+        );
+        if ( false === $this->content_v2_normalize_post( $post ) || false === $this->content_v2_normalize_randomization( $randomization ) ) {
+            return $this->post_plus_v2_error( $operation, 'unsupported_content' );
+        }
+
+        $compatibility = 'supported';
+        $meta          = get_post_meta( $source->ID );
+        if ( ! is_array( $meta ) ) {
+            return $this->post_plus_v2_error( $operation, 'storage_unavailable' );
+        }
+        foreach ( array_keys( $meta ) as $meta_key ) {
+            if ( in_array( $meta_key, array( '_edit_last', '_edit_lock', '_encloseme', '_pingme', '_wp_page_template' ), true ) ) {
+                continue;
+            }
+            if ( 1 === preg_match( '/(?:elementor|et_pb|fl_builder|beaver|brizy|oxygen)/i', $meta_key ) ) {
+                $compatibility = 'unsupported_builder';
+                break;
+            }
+            $compatibility = '_thumbnail_id' === $meta_key ? 'unsupported_media' : 'unsupported_meta';
+        }
+        if ( 'supported' === $compatibility && ( false !== stripos( $source->post_content, '<img' ) || false !== stripos( $source->post_content, '[gallery' ) ) ) {
+            $compatibility = 'unsupported_media';
+        }
+        if ( 'supported' === $compatibility && '' !== $source->post_password ) {
+            $compatibility = 'unsupported_meta';
+        }
+
+        $content_digest = hash( 'sha256', wp_json_encode( array( $post, $randomization ) ) );
+        $source_ref     = hash_hmac( 'sha256', 'post-plus-source-v1|' . $source->ID . '|' . $source->post_type, wp_salt( 'auth' ) );
+        $response       = array(
+            'protocol'        => '2',
+            'operation'       => $operation,
+            'complete'        => true,
+            'source_post_id'  => (int) $source->ID,
+            'source_type'     => $source->post_type,
+            'source_ref'      => $source_ref,
+            'title'           => $source->post_title,
+            'content_digest'  => $content_digest,
+            'compatibility'   => $compatibility,
+            'private_context' => wp_json_encode( array( 'post' => $post, 'randomization' => $randomization ) ),
+        );
+        $response['source_revision'] = hash( 'sha256', wp_json_encode( $response ) );
+        return $response;
     }
 
     /**

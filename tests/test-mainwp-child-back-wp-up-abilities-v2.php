@@ -468,6 +468,8 @@ class Test_MainWP_Child_Back_WP_Up_Abilities_V2 extends WP_UnitTestCase {
 		$this->assertTrue( $started['data']['accepted'] );
 		$this->assertMatchesRegularExpression( '/^[A-Za-z0-9_-]{43}$/D', $started['data']['run_token'] );
 		$this->assertArrayNotHasKey( 'logfile', $started['data'] );
+		$run_key = 'mainwp_backwpup_v2_' . hash( 'sha256', $started['data']['run_token'] );
+		$this->assertGreaterThanOrEqual( time() + DAY_IN_SECONDS - 5, (int) get_option( '_transient_timeout_' . $run_key ) );
 
 		$progress = $this->invoke_v2(
 			array(

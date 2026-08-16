@@ -1106,7 +1106,7 @@ class MainWP_Child_Back_WP_Up { //phpcs:ignore -- NOSONAR - multi methods.
     }
 
     /**
-     * Issue an opaque five-minute target token.
+     * Issue an opaque action-bound target token.
      *
      * @param string $action Action binding.
      * @param array  $target Internal target.
@@ -1123,8 +1123,9 @@ class MainWP_Child_Back_WP_Up { //phpcs:ignore -- NOSONAR - multi methods.
             'target'    => $target,
             'issued_at' => time(),
         );
+        $ttl   = 'backup_progress' === $action ? DAY_IN_SECONDS : 5 * MINUTE_IN_SECONDS;
         $key   = 'mainwp_backwpup_v2_' . hash( 'sha256', $token );
-        if ( ! set_transient( $key, $value, 5 * MINUTE_IN_SECONDS ) && get_transient( $key ) !== $value ) {
+        if ( ! set_transient( $key, $value, $ttl ) && get_transient( $key ) !== $value ) {
             return null;
         }
         return $token;
@@ -1142,7 +1143,8 @@ class MainWP_Child_Back_WP_Up { //phpcs:ignore -- NOSONAR - multi methods.
             return null;
         }
         $value = get_transient( 'mainwp_backwpup_v2_' . hash( 'sha256', $token ) );
-        if ( ! is_array( $value ) || ! $this->abilities_v2_has_keys( $value, array( 'action', 'target', 'issued_at' ) ) || $action !== $value['action'] || ! is_array( $value['target'] ) || ! is_int( $value['issued_at'] ) || $value['issued_at'] > time() || $value['issued_at'] < time() - ( 5 * MINUTE_IN_SECONDS ) ) {
+        $ttl   = 'backup_progress' === $action ? DAY_IN_SECONDS : 5 * MINUTE_IN_SECONDS;
+        if ( ! is_array( $value ) || ! $this->abilities_v2_has_keys( $value, array( 'action', 'target', 'issued_at' ) ) || $action !== $value['action'] || ! is_array( $value['target'] ) || ! is_int( $value['issued_at'] ) || $value['issued_at'] > time() || $value['issued_at'] < time() - $ttl ) {
             return null;
         }
         return $value['target'];

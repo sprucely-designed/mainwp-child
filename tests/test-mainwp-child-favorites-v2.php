@@ -40,7 +40,7 @@ class Test_MainWP_Child_Favorites_V2 extends WP_UnitTestCase {
 		$this->assertFalse( $subject->package_state_v2( $this->state_request( 'plugin', 'hello.php' ) )['installed'] );
 	}
 
-	public function test_install_callable_truthfully_advertises_no_mutation() {
+	public function test_install_callable_advertises_verified_mutation_and_status() {
 		$subject = new Testable_MainWP_Child_Favorites_V2( array(), array(), array() );
 		$result  = $subject->install_verified_v2(
 			array(
@@ -51,18 +51,65 @@ class Test_MainWP_Child_Favorites_V2 extends WP_UnitTestCase {
 		);
 
 		$this->assertSame( array( 'protocol', 'operation', 'ok', 'operations', 'mutation_supported' ), array_keys( $result ) );
-		$this->assertSame( array(), $result['operations'] );
-		$this->assertFalse( $result['mutation_supported'] );
-		$this->assertSame(
-			'unsupported_operation',
-			$subject->install_verified_v2(
-				array(
-					'protocol'  => '2',
-					'operation' => 'install',
-					'payload'   => array(),
-				)
-			)['code']
+		$this->assertSame( array( 'install', 'status' ), $result['operations'] );
+		$this->assertTrue( $result['mutation_supported'] );
+	}
+
+	public function test_verified_install_binds_digest_slug_version_and_final_activation() {
+		$subject = new Testable_MainWP_Child_Favorites_V2( array(), array(), array() );
+		$request = $this->install_request();
+		$result  = $subject->install_verified_v2( $request );
+
+		$this->assertSame( array( 'protocol', 'operation', 'ok', 'request_ref', 'status', 'installed', 'type', 'slug', 'version', 'active', 'code' ), array_keys( $result ) );
+		$this->assertTrue( $result['ok'] );
+		$this->assertSame( 'completed', $result['status'] );
+		$this->assertSame( 1, $subject->download_count );
+		$this->assertSame( 1, $subject->install_count );
+		$this->assertSame( 1, $subject->cleanup_count );
+		$this->assertStringNotContainsString( 'dashboard.example', wp_json_encode( $subject->receipts ) );
+
+		$this->assertSame( $result, $subject->install_verified_v2( $request ) );
+		$this->assertSame( 1, $subject->download_count );
+		$this->assertSame( 1, $subject->install_count );
+
+		$changed = $request;
+		$changed['payload']['activate'] = false;
+		$this->assertSame( 'request_conflict', $subject->install_verified_v2( $changed )['code'] );
+	}
+
+	public function test_verified_install_rejects_bad_digest_before_dispatch() {
+		$subject                              = new Testable_MainWP_Child_Favorites_V2( array(), array(), array() );
+		$subject->downloaded_package_digest   = str_repeat( 'b', 64 );
+		$result                               = $subject->install_verified_v2( $this->install_request() );
+
+		$this->assertFalse( $result['ok'] );
+		$this->assertSame( 'failed', $result['status'] );
+		$this->assertSame( 'digest_mismatch', $result['code'] );
+		$this->assertSame( 0, $subject->install_count );
+		$this->assertSame( 1, $subject->cleanup_count );
+	}
+
+	public function test_dispatching_receipt_never_blindly_retries_and_status_is_read_only() {
+		$subject = new Testable_MainWP_Child_Favorites_V2( array(), array(), array() );
+		$request = $this->install_request();
+		$subject->seed_dispatching( $request );
+
+		$result = $subject->install_verified_v2( $request );
+		$this->assertFalse( $result['ok'] );
+		$this->assertSame( 'unknown', $result['status'] );
+		$this->assertSame( 'outcome_unknown', $result['code'] );
+		$this->assertSame( 0, $subject->download_count );
+		$this->assertSame( 0, $subject->install_count );
+
+		$status = $subject->install_verified_v2(
+			array(
+				'protocol'  => '2',
+				'operation' => 'status',
+				'payload'   => array( 'request_ref' => $request['payload']['request_ref'] ),
+			)
 		);
+		$this->assertSame( 'unknown', $status['status'] );
+		$this->assertSame( 0, $subject->download_count );
 	}
 
 	public function test_uuid_alias_and_callable_map_are_closed() {
@@ -89,6 +136,24 @@ class Test_MainWP_Child_Favorites_V2 extends WP_UnitTestCase {
 			'slug'        => $slug,
 		);
 	}
+
+	private function install_request() {
+		return array(
+			'protocol'  => '2',
+			'operation' => 'install',
+			'payload'   => array(
+				'request_ref'     => '123e4567-e89b-42d3-a456-426614173021',
+				'type'            => 'plugin',
+				'slug'            => 'forms/forms.php',
+				'expected_version' => '2.1.0',
+				'expected_sha256' => str_repeat( 'a', 64 ),
+				'download_url'    => 'https://example.com/private/favorite',
+				'overwrite'       => true,
+				'activate'        => true,
+				'state_generation' => hash( 'sha256', wp_json_encode( array( 'type' => 'plugin', 'slug' => 'forms/forms.php', 'installed' => false, 'version' => null, 'active' => null ) ) ),
+			),
+		);
+	}
 }
 
 class Testable_MainWP_Child_Favorites_V2 extends MainWP_Child_Favorites {
@@ -99,10 +164,21 @@ class Testable_MainWP_Child_Favorites_V2 extends MainWP_Child_Favorites {
 
 	private $test_themes;
 
+	public $download_count = 0;
+
+	public $install_count = 0;
+
+	public $cleanup_count = 0;
+
+	public $downloaded_package_digest;
+
+	public $receipts = array();
+
 	public function __construct( $plugins, $active_plugins, $themes ) {
 		$this->test_plugins        = $plugins;
 		$this->test_active_plugins = $active_plugins;
 		$this->test_themes         = $themes;
+		$this->downloaded_package_digest = str_repeat( 'a', 64 );
 	}
 
 	protected function package_runtime() {
@@ -111,5 +187,78 @@ class Testable_MainWP_Child_Favorites_V2 extends MainWP_Child_Favorites {
 			'active_plugins' => $this->test_active_plugins,
 			'themes'         => $this->test_themes,
 		);
+	}
+
+	protected function download_package( $url ) {
+		unset( $url );
+		++$this->download_count;
+		return '/private/tmp/favorites-fixture.zip';
+	}
+
+	protected function package_digest( $path ) {
+		unset( $path );
+		return $this->downloaded_package_digest;
+	}
+
+	protected function inspect_package( $path, $type, $slug, $version ) {
+		unset( $path, $type, $slug, $version );
+		return true;
+	}
+
+	protected function dispatch_install( $path, $payload ) {
+		unset( $path );
+		++$this->install_count;
+		$this->test_plugins[ $payload['slug'] ] = array( 'Version' => $payload['expected_version'] );
+		if ( $payload['activate'] ) {
+			$this->test_active_plugins[] = $payload['slug'];
+		}
+		return true;
+	}
+
+	protected function cleanup_package( $path ) {
+		unset( $path );
+		++$this->cleanup_count;
+	}
+
+	protected function load_install_receipt( $request_ref ) {
+		return isset( $this->receipts[ $request_ref ] ) ? $this->receipts[ $request_ref ] : null;
+	}
+
+	protected function create_install_receipt( $request_ref, $receipt ) {
+		if ( isset( $this->receipts[ $request_ref ] ) ) {
+			return false;
+		}
+		$this->receipts[ $request_ref ] = $receipt;
+		return true;
+	}
+
+	protected function settle_install_receipt( $request_ref, $expected, $receipt ) {
+		if ( ! isset( $this->receipts[ $request_ref ] ) || $expected !== $this->receipts[ $request_ref ] ) {
+			return false;
+		}
+		$this->receipts[ $request_ref ] = $receipt;
+		return true;
+	}
+
+	public function seed_dispatching( $request ) {
+		$this->receipts[ $request['payload']['request_ref'] ] = array(
+			'effect_hash'      => $this->effect_hash_for_test( $request['payload'] ),
+			'state'            => 'dispatching',
+			'request_ref'      => $request['payload']['request_ref'],
+			'type'             => $request['payload']['type'],
+			'slug'             => $request['payload']['slug'],
+			'expected_version' => $request['payload']['expected_version'],
+			'activate'         => $request['payload']['activate'],
+			'installed'        => false,
+			'previous_version' => null,
+			'previous_active'  => null,
+			'result'           => null,
+			'updated_at'       => time(),
+			'expires_at'       => time() + DAY_IN_SECONDS,
+		);
+	}
+
+	public function effect_hash_for_test( $payload ) {
+		return $this->install_effect_hash( $payload );
 	}
 }

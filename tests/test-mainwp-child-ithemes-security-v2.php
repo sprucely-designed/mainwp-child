@@ -28,6 +28,13 @@ class IThemes_Security_V2_Protocol_Fixture extends MainWP_Child_IThemes_Security
 	}
 }
 
+/** Exercise the production option/database adapters without requiring Solid itself. */
+class IThemes_Security_V2_Production_Adapter_Fixture extends MainWP_Child_IThemes_Security {
+	protected function abilities_v2_provider_supports_mutation() {
+		return true;
+	}
+}
+
 class Test_MainWP_Child_IThemes_Security_V2 extends WP_UnitTestCase {
 
 	/** @var MainWP_Child_IThemes_Security */
@@ -327,6 +334,71 @@ class Test_MainWP_Child_IThemes_Security_V2 extends WP_UnitTestCase {
 		unset( $request['request_ref'] );
 		$request['request_id'] = '123e4567-e89b-42d3-a456-426614174702';
 		$this->assertSame( 'invalid_request', $fixture->abilities_v2( $request )['code'] );
+	}
+
+	public function test_production_whitelist_adapter_replaces_state_without_disclosing_address() {
+		$fixture  = new IThemes_Security_V2_Production_Adapter_Fixture();
+		$current  = $fixture->abilities_v2( array( 'protocol' => '2', 'operation' => 'ability_solid_whitelist_v2', 'payload' => array() ) );
+		$request  = array(
+			'protocol'    => '2',
+			'operation'   => 'ability_solid_replace_whitelist_v2',
+			'request_ref' => '123e4567-e89b-42d3-a456-426614174703',
+			'payload'     => array(
+				'ip_address'  => '192.0.2.44',
+				'ttl_seconds' => 3600,
+				'if_match'    => $current['revision'],
+				'dry_run'     => true,
+			),
+		);
+		$preview = $fixture->abilities_v2( $request );
+		$this->assertTrue( $preview['ok'] );
+		$this->assertTrue( $preview['changed'] );
+		$this->assertFalse( get_site_option( 'itsec_temp_whitelist_ip', false ) );
+		$this->assertArrayNotHasKey( $request['request_ref'], get_option( 'mainwp_solid_abilities_v2_receipts', array() ) );
+
+		$request['payload']['dry_run'] = false;
+		$response                      = $fixture->abilities_v2( $request );
+
+		$this->assertTrue( $response['ok'] );
+		$this->assertTrue( $response['active'] );
+		$this->assertSame( 'ipv4', $response['address_family'] );
+		$this->assertStringNotContainsString( '192.0.2.44', wp_json_encode( $response ) );
+		$this->assertSame( '192.0.2.44', get_site_option( 'itsec_temp_whitelist_ip' )['ip'] );
+		$this->assertSame( $response, $fixture->abilities_v2( $request ) );
+	}
+
+	public function test_production_log_preview_is_receipt_free_and_confirm_is_replay_safe() {
+		global $wpdb;
+		$table = $wpdb->base_prefix . 'itsec_log';
+		$wpdb->query( 'DROP TABLE IF EXISTS `' . $table . '`' );
+		$created = $wpdb->query( 'CREATE TABLE `' . $table . '` (id bigint(20) unsigned NOT NULL AUTO_INCREMENT, payload text NOT NULL, PRIMARY KEY (id)) ENGINE=InnoDB' );
+		$this->assertNotFalse( $created, $wpdb->last_error );
+		$wpdb->insert( $table, array( 'payload' => 'private-a' ), array( '%s' ) );
+		$wpdb->insert( $table, array( 'payload' => 'private-b' ), array( '%s' ) );
+
+		try {
+			$fixture = new IThemes_Security_V2_Production_Adapter_Fixture();
+			$root    = array(
+				'protocol'    => '2',
+				'operation'   => 'ability_solid_clear_logs_v2',
+				'request_ref' => '123e4567-e89b-42d3-a456-426614174704',
+			);
+			$preview = $fixture->abilities_v2( $root + array( 'payload' => array( 'dry_run' => true ) ) );
+			$this->assertTrue( $preview['ok'], wp_json_encode( $preview ) );
+			$this->assertSame( 2, $preview['rows_before'] );
+			$this->assertSame( 0, $preview['rows_deleted'] );
+			$this->assertSame( 2, (int) $wpdb->get_var( 'SELECT COUNT(*) FROM `' . $table . '`' ) );
+			$this->assertSame( array(), get_option( 'mainwp_solid_abilities_v2_receipts', array() ) );
+
+			$confirm = $fixture->abilities_v2( $root + array( 'payload' => array( 'dry_run' => false ) ) );
+			$this->assertTrue( $confirm['ok'] );
+			$this->assertSame( 2, $confirm['rows_deleted'] );
+			$this->assertSame( 0, $confirm['rows_after'] );
+			$this->assertSame( $confirm, $fixture->abilities_v2( $root + array( 'payload' => array( 'dry_run' => false ) ) ) );
+			$this->assertStringNotContainsString( 'private-a', wp_json_encode( $confirm ) );
+		} finally {
+			$wpdb->query( 'DROP TABLE IF EXISTS `' . $table . '`' );
+		}
 	}
 
 	public function test_reordered_envelope_is_accepted_but_extra_payload_is_not() {

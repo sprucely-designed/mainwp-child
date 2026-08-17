@@ -288,7 +288,7 @@ class MainWP_Child_Favorites {
 
     /** Project current state into the closed install result. */
     private function result_from_state( $state, $status, $code, $receipt ) {
-        $installed = is_array( $state ) && isset( $state['installed'] ) && true === $state['installed'];
+        $installed = is_array( $state ) && array_key_exists( 'installed', $state ) ? true === $state['installed'] : $receipt['installed'];
         return array(
             'protocol'    => '2',
             'operation'   => 'install',

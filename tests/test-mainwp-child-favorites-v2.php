@@ -65,6 +65,7 @@ class Test_MainWP_Child_Favorites_V2 extends WP_UnitTestCase {
 		$this->assertSame( 'completed', $result['status'] );
 		$this->assertSame( 1, $subject->download_count );
 		$this->assertSame( 1, $subject->install_count );
+		$this->assertSame( 1, $subject->cache_refresh_count );
 		$this->assertSame( 1, $subject->cleanup_count );
 		$this->assertStringNotContainsString( 'dashboard.example', wp_json_encode( $subject->receipts ) );
 
@@ -170,6 +171,8 @@ class Testable_MainWP_Child_Favorites_V2 extends MainWP_Child_Favorites {
 
 	public $cleanup_count = 0;
 
+	public $cache_refresh_count = 0;
+
 	public $downloaded_package_digest;
 
 	public $receipts = array();
@@ -213,6 +216,11 @@ class Testable_MainWP_Child_Favorites_V2 extends MainWP_Child_Favorites {
 			$this->test_active_plugins[] = $payload['slug'];
 		}
 		return true;
+	}
+
+	protected function refresh_package_cache( $type ) {
+		unset( $type );
+		++$this->cache_refresh_count;
 	}
 
 	protected function cleanup_package( $path ) {

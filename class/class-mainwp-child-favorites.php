@@ -183,7 +183,8 @@ class MainWP_Child_Favorites {
             }
 
             $dispatched = $this->dispatch_install( $path, $payload );
-            $after      = $this->package_state_v2(
+            $this->refresh_package_cache( $payload['type'] );
+            $after = $this->package_state_v2(
                 array(
                     'protocol'    => '2',
                     'operation'   => 'package_state',
@@ -485,6 +486,15 @@ class MainWP_Child_Favorites {
             }
         }
         return true;
+    }
+
+    /** Refresh the exact WordPress package inventory before terminal readback. */
+    protected function refresh_package_cache( $type ) {
+        if ( 'plugin' === $type && function_exists( 'wp_clean_plugins_cache' ) ) {
+            wp_clean_plugins_cache( true );
+        } elseif ( 'theme' === $type && function_exists( 'wp_clean_themes_cache' ) ) {
+            wp_clean_themes_cache( true );
+        }
     }
 
     /** Remove only the request-local downloaded package. */

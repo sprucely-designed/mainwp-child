@@ -180,18 +180,10 @@ class MainWP_Child_IThemes_Security { //phpcs:ignore -- NOSONAR - multi methods.
         $information = array();
 
         $mwp_action = MainWP_System::instance()->validate_params( 'mwp_action' );
-        if ( 'abilities_v2' === $mwp_action ) {
-            // phpcs:disable WordPress.Security.NonceVerification
-            $raw_request = isset( $_POST['request'] ) && is_string( $_POST['request'] ) ? wp_unslash( $_POST['request'] ) : '';
-            // phpcs:enable
-            $request = 4096 >= strlen( $raw_request ) ? json_decode( $raw_request, true ) : null;
-            MainWP_Helper::write( $this->abilities_v2( $request ) );
-            return;
-        }
-
         if ( ! class_exists( '\ITSEC_Core' ) || ! class_exists( '\ITSEC_Modules' ) ) {
             $information['error'] = 'NO_ITHEME';
             MainWP_Helper::write( $information );
+            return;
         }
 
         /**
@@ -202,6 +194,15 @@ class MainWP_Child_IThemes_Security { //phpcs:ignore -- NOSONAR - multi methods.
         global $mainwp_itsec_modules_path;
 
         $mainwp_itsec_modules_path = \ITSEC_Core::get_core_dir() . '/modules/';
+
+        if ( 'abilities_v2' === $mwp_action ) {
+            // phpcs:disable WordPress.Security.NonceVerification
+            $raw_request = isset( $_POST['request'] ) && is_string( $_POST['request'] ) ? wp_unslash( $_POST['request'] ) : '';
+            // phpcs:enable
+            $request = 4096 >= strlen( $raw_request ) ? json_decode( $raw_request, true ) : null;
+            MainWP_Helper::write( $this->abilities_v2( $request ) );
+            return;
+        }
 
         if ( ! empty( $mwp_action ) ) {
             switch ( $mwp_action ) {
@@ -293,6 +294,10 @@ class MainWP_Child_IThemes_Security { //phpcs:ignore -- NOSONAR - multi methods.
                 return $this->abilities_v2_error( $operation, 'invalid_request' );
             }
 
+            if ( ! $this->abilities_v2_provider_available() ) {
+                return $this->abilities_v2_error( $operation, 'plugin_unavailable' );
+            }
+
             return $this->abilities_v2_file_permissions();
         }
 
@@ -301,12 +306,20 @@ class MainWP_Child_IThemes_Security { //phpcs:ignore -- NOSONAR - multi methods.
                 return $this->abilities_v2_error( $operation, 'invalid_request' );
             }
 
+            if ( ! $this->abilities_v2_provider_available() ) {
+                return $this->abilities_v2_error( $operation, 'plugin_unavailable' );
+            }
+
             return $this->abilities_v2_summary();
         }
 
         if ( 'ability_solid_whitelist_v2' === $operation ) {
             if ( array() !== $request['payload'] ) {
                 return $this->abilities_v2_error( $operation, 'invalid_request' );
+            }
+
+            if ( ! $this->abilities_v2_provider_available() ) {
+                return $this->abilities_v2_error( $operation, 'plugin_unavailable' );
             }
 
             return $this->abilities_v2_whitelist();
@@ -321,6 +334,11 @@ class MainWP_Child_IThemes_Security { //phpcs:ignore -- NOSONAR - multi methods.
 
         if ( in_array( $operation, $mutations, true ) ) {
             return $this->abilities_v2_execute_mutation( $operation, strtolower( $request['request_ref'] ), $request['payload'] );
+        }
+
+        // Only reads reach here, and each one answers from Solid-owned storage that does not exist without Solid.
+        if ( ! $this->abilities_v2_provider_available() ) {
+            return $this->abilities_v2_error( $operation, 'plugin_unavailable' );
         }
 
         try {
@@ -371,6 +389,27 @@ class MainWP_Child_IThemes_Security { //phpcs:ignore -- NOSONAR - multi methods.
                 $receipt = $receipts[ $request_ref ];
                 if ( ! is_array( $receipt ) || ! $this->abilities_v2_exact_keys( $receipt, array( 'effect_hash', 'response' ) ) || ! $this->abilities_v2_valid_hash( $receipt['effect_hash'] ) || ! $this->abilities_v2_valid_receipt_response( $operation, $request_ref, $receipt['response'] ) ) {
                     $response = $this->abilities_v2_error( $operation, 'storage_unavailable' );
+                } elseif ( 'ability_solid_file_scan_v2' === $operation && true === $receipt['response']['accepted'] && false === $receipt['response']['completed'] && 'accepted' === $receipt['response']['outcome'] ) {
+                    $result = $this->abilities_v2_poll_file_scan();
+                    if ( is_wp_error( $result ) ) {
+                        $response = $this->abilities_v2_provider_error( $operation, $result );
+                    } elseif ( ! $this->abilities_v2_valid_provider_result( $operation, $result ) ) {
+                        $response = $this->abilities_v2_error( $operation, 'provider_schema_invalid' );
+                    } else {
+                        $response                             = array_merge(
+                            array(
+                                'protocol'    => '2',
+                                'operation'   => $operation,
+                                'ok'          => true,
+                                'request_ref' => $request_ref,
+                            ),
+                            $result
+                        );
+                        $receipts[ $request_ref ]['response'] = $response;
+                        if ( ! update_option( 'mainwp_solid_abilities_v2_receipts', $receipts, false ) && get_option( 'mainwp_solid_abilities_v2_receipts', array() ) !== $receipts ) {
+                            $response = $this->abilities_v2_error( $operation, 'outcome_unknown' );
+                        }
+                    }
                 } else {
                     $response = hash_equals( $receipt['effect_hash'], $effect_hash ) ? $receipt['response'] : $this->abilities_v2_error( $operation, 'request_conflict' );
                 }
@@ -780,12 +819,25 @@ class MainWP_Child_IThemes_Security { //phpcs:ignore -- NOSONAR - multi methods.
     }
 
     /**
+     * Check whether Solid Security is active on this site.
+     *
+     * @return bool
+     */
+    protected function abilities_v2_provider_available() {
+        return class_exists( '\ITSEC_Core' );
+    }
+
+    /**
      * Check whether the installed Solid version has a typed mutation adapter.
+     *
+     * Mutation support currently adds nothing beyond the provider being
+     * present, but the two seams answer different questions and reads gate on
+     * availability alone.
      *
      * @return bool
      */
     protected function abilities_v2_provider_supports_mutation() {
-        return class_exists( '\ITSEC_Core' );
+        return $this->abilities_v2_provider_available();
     }
 
     /**
@@ -940,7 +992,7 @@ class MainWP_Child_IThemes_Security { //phpcs:ignore -- NOSONAR - multi methods.
         }
         return array(
             'requested_count'      => count( $payload['lockout_refs'] ),
-            'releasable_count'     => count( $payload['lockout_refs'] ),
+            'releasable_count'     => $released + $failed,
             'released_count'       => $released,
             'already_absent_count' => $absent,
             'failed_count'         => $failed,
@@ -1093,6 +1145,44 @@ class MainWP_Child_IThemes_Security { //phpcs:ignore -- NOSONAR - multi methods.
         return $this->abilities_v2_coarse_operation_result( 'file_scan', $ok, false, $ok ? 'accepted' : 'failed' );
     }
 
+    /** Poll the active File Change scan without submitting a second scan request. */
+    private function abilities_v2_poll_file_scan() {
+        if ( ! class_exists( '\ITSEC_File_Change_Scanner' ) || ! is_callable( array( '\ITSEC_File_Change_Scanner', 'get_status' ) ) ) {
+            return new \WP_Error( 'plugin_unavailable' );
+        }
+
+        try {
+            if ( is_callable( array( '\ITSEC_File_Change_Scanner', 'is_running' ) ) && \ITSEC_File_Change_Scanner::is_running() ) {
+                return $this->abilities_v2_coarse_operation_result( 'file_scan', true, false, 'accepted' );
+            }
+            $status = \ITSEC_File_Change_Scanner::get_status();
+        } catch ( \Throwable $throwable ) { // NOSONAR - third-party version boundary.
+            return new \WP_Error( 'outcome_unknown' );
+        }
+
+        if ( ! is_array( $status ) || empty( $status['complete'] ) || ! class_exists( '\ITSEC_File_Change' ) || ! is_callable( array( '\ITSEC_File_Change', 'get_latest_changes' ) ) ) {
+            return $this->abilities_v2_coarse_operation_result( 'file_scan', true, false, 'accepted' );
+        }
+
+        try {
+            $changes = \ITSEC_File_Change::get_latest_changes();
+        } catch ( \Throwable $throwable ) { // NOSONAR - third-party version boundary.
+            return new \WP_Error( 'outcome_unknown' );
+        }
+        if ( ! is_array( $changes ) ) {
+            return new \WP_Error( 'outcome_unknown' );
+        }
+        foreach ( $changes as $change_group ) {
+            if ( ! is_array( $change_group ) ) {
+                return new \WP_Error( 'outcome_unknown' );
+            }
+            if ( array() !== $change_group ) {
+                return $this->abilities_v2_coarse_operation_result( 'file_scan', true, true, 'changes_found' );
+            }
+        }
+        return $this->abilities_v2_coarse_operation_result( 'file_scan', true, true, 'clean' );
+    }
+
     /** Run the configured database backup and retain no artifact details. */
     private function abilities_v2_provider_backup() {
         $result = $this->backup_db();
@@ -1102,12 +1192,24 @@ class MainWP_Child_IThemes_Security { //phpcs:ignore -- NOSONAR - multi methods.
 
     /** Run the malware scan and reduce the result to the latest coarse state. */
     private function abilities_v2_provider_malware_scan() {
-        $result = $this->malware_scan();
+        $before = $this->abilities_v2_summary();
+        if ( ! is_array( $before ) || empty( $before['ok'] ) || empty( $before['complete'] ) || ! isset( $before['latest_scan']['completed_at'] ) || ( null !== $before['latest_scan']['completed_at'] && ! $this->abilities_v2_valid_date( $before['latest_scan']['completed_at'] ) ) ) {
+            return $this->abilities_v2_coarse_operation_result( 'malware_scan', false, true, 'outcome_unknown' );
+        }
+        $before_timestamp = null === $before['latest_scan']['completed_at'] ? null : strtotime( $before['latest_scan']['completed_at'] );
+        $result           = $this->malware_scan();
         if ( ! is_array( $result ) || isset( $result['error'] ) ) {
             return $this->abilities_v2_coarse_operation_result( 'malware_scan', false, true, 'failed' );
         }
         $summary = $this->abilities_v2_summary();
-        $outcome = is_array( $summary ) && isset( $summary['ok'], $summary['latest_scan']['status'] ) && true === $summary['ok'] ? $summary['latest_scan']['status'] : 'outcome_unknown';
+        if ( ! is_array( $summary ) || empty( $summary['ok'] ) || empty( $summary['complete'] ) || ! isset( $summary['latest_scan']['status'], $summary['latest_scan']['completed_at'] ) || null === $summary['latest_scan']['completed_at'] || ! $this->abilities_v2_valid_date( $summary['latest_scan']['completed_at'] ) ) {
+            return $this->abilities_v2_coarse_operation_result( 'malware_scan', true, true, 'outcome_unknown' );
+        }
+        $after_timestamp = strtotime( $summary['latest_scan']['completed_at'] );
+        if ( false === $after_timestamp || ( null !== $before_timestamp && $after_timestamp <= $before_timestamp ) ) {
+            return $this->abilities_v2_coarse_operation_result( 'malware_scan', true, true, 'outcome_unknown' );
+        }
+        $outcome = $summary['latest_scan']['status'];
         if ( ! in_array( $outcome, array( 'clean', 'issues_found', 'failed' ), true ) ) {
             $outcome = 'outcome_unknown';
         }

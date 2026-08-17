@@ -18,7 +18,7 @@ class IThemes_Security_V2_Protocol_Fixture extends MainWP_Child_IThemes_Security
 	/** @var array */
 	public $calls = array();
 
-	protected function abilities_v2_provider_supports_mutation() {
+	protected function abilities_v2_provider_available() {
 		return true;
 	}
 
@@ -30,7 +30,7 @@ class IThemes_Security_V2_Protocol_Fixture extends MainWP_Child_IThemes_Security
 
 /** Exercise the production option/database adapters without requiring Solid itself. */
 class IThemes_Security_V2_Production_Adapter_Fixture extends MainWP_Child_IThemes_Security {
-	protected function abilities_v2_provider_supports_mutation() {
+	protected function abilities_v2_provider_available() {
 		return true;
 	}
 }
@@ -70,6 +70,49 @@ class Test_MainWP_Child_IThemes_Security_V2 extends WP_UnitTestCase {
 		$this->assertSame( array( 'protocol', 'operation', 'ok', 'code' ), array_keys( $result ) );
 		$this->assertFalse( $result['ok'] );
 		$this->assertSame( 'plugin_unavailable', $result['code'] );
+	}
+
+	public function test_every_v2_read_fails_closed_when_solid_is_absent() {
+		$reads = array(
+			'ability_solid_file_permissions_v2' => array(),
+			'ability_solid_summary_v2'          => array(),
+			'ability_solid_whitelist_v2'        => array(),
+			'ability_solid_lockouts_v2'         => array(
+				'limit'             => 50,
+				'after_lockout_ref' => null,
+			),
+		);
+
+		foreach ( $reads as $operation => $payload ) {
+			$result = $this->request( $operation, $payload );
+
+			$this->assertSame( array( 'protocol', 'operation', 'ok', 'code' ), array_keys( $result ), $operation );
+			$this->assertSame( $operation, $result['operation'] );
+			$this->assertFalse( $result['ok'], $operation );
+			$this->assertSame( 'plugin_unavailable', $result['code'], $operation );
+		}
+	}
+
+	public function test_v2_dispatcher_initializes_solid_before_dispatching_without_preload() {
+		$source       = file_get_contents( dirname( __DIR__ ) . '/class/class-mainwp-child-ithemes-security.php' );
+		$provider_gate = strpos( $source, "if ( ! class_exists( '\\ITSEC_Core' ) || ! class_exists( '\\ITSEC_Modules' ) )" );
+		$module_path   = strpos( $source, "\\ITSEC_Core::get_core_dir() . '/modules/';" );
+		$v2_dispatch   = strpos( $source, "if ( 'abilities_v2' === \$mwp_action )" );
+
+		$this->assertIsInt( $provider_gate );
+		$this->assertIsInt( $module_path );
+		$this->assertIsInt( $v2_dispatch );
+		$this->assertLessThan( $v2_dispatch, $provider_gate );
+		$this->assertLessThan( $v2_dispatch, $module_path );
+	}
+
+	public function test_file_scan_receipt_repoll_is_present_and_keeps_the_intermediate_state_closed() {
+		$source = file_get_contents( dirname( __DIR__ ) . '/class/class-mainwp-child-ithemes-security.php' );
+
+		$this->assertStringContainsString( "'ability_solid_file_scan_v2' === \$operation && true === \$receipt['response']['accepted'] && false === \$receipt['response']['completed']", $source );
+		$this->assertStringContainsString( 'abilities_v2_poll_file_scan()', $source );
+		$this->assertStringContainsString( "'changes_found'", $source );
+		$this->assertStringContainsString( "'clean'", $source );
 	}
 
 	public function test_summary_projection_is_closed_bounded_and_redacted() {
@@ -146,7 +189,7 @@ class Test_MainWP_Child_IThemes_Security_V2 extends WP_UnitTestCase {
 			)
 		);
 
-		$result = $this->request( 'ability_solid_whitelist_v2', array() );
+		$result = $this->request_with_provider( 'ability_solid_whitelist_v2', array() );
 
 		$this->assertSame( array( 'protocol', 'operation', 'ok', 'active', 'expires_at', 'address_family', 'revision' ), array_keys( $result ) );
 		$this->assertTrue( $result['ok'] );
@@ -163,12 +206,12 @@ class Test_MainWP_Child_IThemes_Security_V2 extends WP_UnitTestCase {
 				'exp' => $expires,
 			)
 		);
-		$changed_address = $this->request( 'ability_solid_whitelist_v2', array() );
+		$changed_address = $this->request_with_provider( 'ability_solid_whitelist_v2', array() );
 		$this->assertNotSame( $result['revision'], $changed_address['revision'] );
 	}
 
 	public function test_temporary_whitelist_read_handles_absent_and_expired_without_writes() {
-		$absent = $this->request( 'ability_solid_whitelist_v2', array() );
+		$absent = $this->request_with_provider( 'ability_solid_whitelist_v2', array() );
 		$this->assertTrue( $absent['ok'] );
 		$this->assertFalse( $absent['active'] );
 		$this->assertNull( $absent['expires_at'] );
@@ -179,7 +222,7 @@ class Test_MainWP_Child_IThemes_Security_V2 extends WP_UnitTestCase {
 			'exp' => time() - 60,
 		);
 		update_site_option( 'itsec_temp_whitelist_ip', $expired );
-		$result = $this->request( 'ability_solid_whitelist_v2', array() );
+		$result = $this->request_with_provider( 'ability_solid_whitelist_v2', array() );
 
 		$this->assertTrue( $result['ok'] );
 		$this->assertFalse( $result['active'] );
@@ -198,17 +241,18 @@ class Test_MainWP_Child_IThemes_Security_V2 extends WP_UnitTestCase {
 			)
 		);
 
-		$result = $this->request( 'ability_solid_whitelist_v2', array() );
+		$result = $this->request_with_provider( 'ability_solid_whitelist_v2', array() );
 		$this->assertFalse( $result['ok'] );
 		$this->assertSame( 'invalid_stored_state', $result['code'] );
 
+		// Bare subject: a bad payload must be rejected before the Solid gate can mask it as plugin_unavailable.
 		$result = $this->request( 'ability_solid_whitelist_v2', array( 'request_ref' => '123e4567-e89b-42d3-a456-426614174401' ) );
 		$this->assertFalse( $result['ok'] );
 		$this->assertSame( 'invalid_request', $result['code'] );
 	}
 
 	public function test_file_permissions_are_closed_bounded_and_path_free() {
-		$result = $this->request( 'ability_solid_file_permissions_v2', array() );
+		$result = $this->request_with_provider( 'ability_solid_file_permissions_v2', array() );
 
 		$this->assertSame( array( 'protocol', 'operation', 'ok', 'targets', 'observed_at' ), array_keys( $result ) );
 		$this->assertTrue( $result['ok'] );
@@ -418,6 +462,19 @@ class Test_MainWP_Child_IThemes_Security_V2 extends WP_UnitTestCase {
 
 	private function request( $operation, $payload ) {
 		return $this->subject->abilities_v2(
+			array(
+				'protocol'  => '2',
+				'operation' => $operation,
+				'payload'   => $payload,
+			)
+		);
+	}
+
+	/** Dispatch past the Solid availability gate, for reads whose subject is the projection rather than the gate. */
+	private function request_with_provider( $operation, $payload ) {
+		$fixture = new IThemes_Security_V2_Production_Adapter_Fixture();
+
+		return $fixture->abilities_v2(
 			array(
 				'protocol'  => '2',
 				'operation' => $operation,

@@ -17,7 +17,7 @@ class Test_Post_Dripper_Idempotency extends WP_UnitTestCase {
 	public function set_up(): void {
 		parent::set_up();
 		$this->server_option = get_option( 'mainwp_child_server', null );
-		update_option( 'mainwp_child_server', 'https://dashboard.example.test/' );
+		update_option( 'mainwp_child_server', 'https://dashboard.example.test/wp-admin/' );
 		$this->actor = self::factory()->user->create( array( 'role' => 'administrator' ) );
 		wp_set_current_user( $this->actor );
 		delete_option( 'mainwp_child_post_dripper_operations_v2' );

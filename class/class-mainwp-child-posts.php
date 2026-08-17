@@ -1294,6 +1294,9 @@ class MainWP_Child_Posts { //phpcs:ignore -- NOSONAR - multi methods.
         }
         $port = isset( $parts['port'] ) && is_int( $parts['port'] ) && 1 <= $parts['port'] && 65535 >= $parts['port'] ? ':' . $parts['port'] : '';
         $path = isset( $parts['path'] ) && is_string( $parts['path'] ) ? '/' . trim( $parts['path'], '/' ) : '';
+        if ( '/wp-admin' === substr( $path, -9 ) ) {
+            $path = substr( $path, 0, -9 );
+        }
         return hash( 'sha256', strtolower( $parts['scheme'] ) . '://' . strtolower( $parts['host'] ) . $port . rtrim( $path, '/' ) );
     }
 

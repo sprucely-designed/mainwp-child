@@ -86,7 +86,7 @@ class MainWP_WordPress_SEO {
      */
     public function action() {
         $mwp_action = MainWP_System::instance()->validate_params( 'action' );
-        if ( in_array( $mwp_action, array( 'describe_v2', 'read_safe_v1' ), true ) ) {
+        if ( in_array( $mwp_action, array( 'describe_v2', 'read_safe_v1', 'apply_safe_v1', 'rollback_safe_v1' ), true ) ) {
             MainWP_Helper::write( $this->abilities_v2( $mwp_action, $this->abilities_v2_request() ) );
             return;
         }
@@ -117,8 +117,20 @@ class MainWP_WordPress_SEO {
             return $this->abilities_v2_describe();
         }
 
-        if ( 'read_safe_v1' !== $operation || ! $this->abilities_v2_valid_read_request( $request ) ) {
+        $is_read     = 'read_safe_v1' === $operation;
+        $is_mutation = in_array( $operation, array( 'apply_safe_v1', 'rollback_safe_v1' ), true );
+        if ( ( $is_read && ! $this->abilities_v2_valid_read_request( $request ) ) || ( $is_mutation && ! $this->abilities_v2_valid_mutation_request( $operation, $request ) ) || ( ! $is_read && ! $is_mutation ) ) {
             return $this->abilities_v2_error( $operation, 'invalid_request' );
+        }
+
+        if ( $is_mutation ) {
+            $replay = $this->abilities_v2_receipt( $operation, $request );
+            if ( is_array( $replay ) ) {
+                return $this->abilities_v2_valid_mutation_response( $operation, $request, $replay ) ? $replay : $this->abilities_v2_error( $operation, 'storage_unavailable' );
+            }
+            if ( false === $replay ) {
+                return $this->abilities_v2_error( $operation, 'request_conflict' );
+            }
         }
 
         $runtime = $this->abilities_v2_runtime();
@@ -137,17 +149,60 @@ class MainWP_WordPress_SEO {
             return $this->abilities_v2_error( $operation, 'unsafe_configuration' );
         }
 
-        return array(
+        if ( $is_read ) {
+            return array(
+                'contract_version'  => '2',
+                'operation'         => 'read_safe_v1',
+                'ok'                => true,
+                'request_ref'       => $request['request_ref'],
+                'site_generation'   => $request['site_generation'],
+                'version'           => $runtime['version'],
+                'schema'            => 'yoast-safe-v1',
+                'settings'          => $settings,
+                'config_generation' => $this->abilities_v2_generation( $settings ),
+            );
+        }
+
+        $current_generation = $this->abilities_v2_generation( $settings );
+        if ( ! hash_equals( $request['expected_generation'], $current_generation ) ) {
+            return $this->abilities_v2_error( $operation, 'generation_drift' );
+        }
+
+        $target = $this->abilities_v2_canonical_settings( $request['settings'] );
+        if ( ! is_array( $target ) || ! hash_equals( $request['target_generation'], $this->abilities_v2_generation( $target ) ) ) {
+            return $this->abilities_v2_error( $operation, 'invalid_request' );
+        }
+
+        $changed_fields = $this->abilities_v2_changed_fields( $settings, $target );
+        if ( 0 < $changed_fields ) {
+            $applied = $this->abilities_v2_apply_settings( $runtime['options'], $target );
+            if ( true !== $applied ) {
+                return $this->abilities_v2_error( $operation, $applied );
+            }
+        }
+
+        $response = array(
             'contract_version'  => '2',
-            'operation'         => 'read_safe_v1',
+            'operation'         => $operation,
             'ok'                => true,
             'request_ref'       => $request['request_ref'],
             'site_generation'   => $request['site_generation'],
             'version'           => $runtime['version'],
             'schema'            => 'yoast-safe-v1',
-            'settings'          => $settings,
-            'config_generation' => hash( 'sha256', wp_json_encode( $settings ) ),
+            'before_generation' => $current_generation,
+            'config_generation' => $request['target_generation'],
+            'changed_fields'    => $changed_fields,
+            'state'             => 0 === $changed_fields ? 'no_change' : ( 'apply_safe_v1' === $operation ? 'applied' : 'rolled_back' ),
         );
+
+        if ( ! $this->abilities_v2_store_receipt( $operation, $request, $response ) ) {
+            if ( 0 < $changed_fields && true !== $this->abilities_v2_apply_settings( $this->abilities_v2_runtime()['options'], $settings ) ) {
+                return $this->abilities_v2_error( $operation, 'outcome_unknown' );
+            }
+            return $this->abilities_v2_error( $operation, 'storage_unavailable' );
+        }
+
+        return $response;
     }
 
     /**
@@ -193,9 +248,306 @@ class MainWP_WordPress_SEO {
             'version'            => $active ? $runtime['version'] : null,
             'compatibility'      => $supported ? 'supported' : ( $active ? 'unsupported' : 'unavailable' ),
             'schema'             => $supported ? 'yoast-safe-v1' : null,
-            'operations'         => $supported ? array( 'read_safe_v1' ) : array(),
-            'mutation_supported' => false,
+            'operations'         => $supported ? array( 'read_safe_v1', 'apply_safe_v1', 'rollback_safe_v1' ) : array(),
+            'mutation_supported' => $supported,
         );
+    }
+
+    /**
+     * Validate one exact mutation request.
+     *
+     * @param string $operation Operation.
+     * @param mixed  $request   Request.
+     * @return bool
+     */
+    private function abilities_v2_valid_mutation_request( $operation, $request ) {
+        $generation_key = 'apply_safe_v1' === $operation ? 'template_generation' : 'result_generation';
+        return is_array( $request )
+            && $this->abilities_v2_exact_keys( $request, array( 'contract_version', 'request_ref', 'site_generation', $generation_key, 'rollout_generation', 'expected_generation', 'target_generation', 'settings' ) )
+            && '2' === $request['contract_version']
+            && $this->abilities_v2_uuid( $request['request_ref'] )
+            && $this->abilities_v2_digest( $request['site_generation'] )
+            && $this->abilities_v2_digest( $request[ $generation_key ] )
+            && $this->abilities_v2_digest( $request['rollout_generation'] )
+            && $this->abilities_v2_digest( $request['expected_generation'] )
+            && $this->abilities_v2_digest( $request['target_generation'] )
+            && is_array( $request['settings'] );
+    }
+
+    /**
+     * Validate one stored mutation response before replay.
+     *
+     * @param string $operation Operation.
+     * @param array  $request   Request.
+     * @param array  $response  Stored response.
+     * @return bool
+     */
+    private function abilities_v2_valid_mutation_response( $operation, $request, $response ) {
+        return $this->abilities_v2_exact_keys( $response, array( 'contract_version', 'operation', 'ok', 'request_ref', 'site_generation', 'version', 'schema', 'before_generation', 'config_generation', 'changed_fields', 'state' ) )
+            && '2' === $response['contract_version']
+            && $operation === $response['operation']
+            && true === $response['ok']
+            && $request['request_ref'] === $response['request_ref']
+            && $request['site_generation'] === $response['site_generation']
+            && $this->abilities_v2_string( $response['version'], 100 )
+            && 'yoast-safe-v1' === $response['schema']
+            && $this->abilities_v2_digest( $response['before_generation'] )
+            && $this->abilities_v2_digest( $response['config_generation'] )
+            && is_int( $response['changed_fields'] )
+            && 0 <= $response['changed_fields']
+            && 7 >= $response['changed_fields']
+            && in_array( $response['state'], array( 'applied', 'rolled_back', 'no_change' ), true )
+            && ( 'no_change' === $response['state'] || ( 'apply_safe_v1' === $operation && 'applied' === $response['state'] ) || ( 'rollback_safe_v1' === $operation && 'rolled_back' === $response['state'] ) );
+    }
+
+    /**
+     * Validate a bounded non-control string.
+     *
+     * @param mixed $value  Value.
+     * @param int   $length Maximum length.
+     * @return bool
+     */
+    private function abilities_v2_string( $value, $length ) {
+        return is_string( $value ) && '' !== $value && $length >= strlen( $value ) && 0 === preg_match( '/[\x00-\x1F\x7F]/', $value );
+    }
+
+    /**
+     * Validate one UUID value.
+     *
+     * @param mixed $value Value.
+     * @return bool
+     */
+    private function abilities_v2_uuid( $value ) {
+        return is_string( $value ) && 1 === preg_match( '/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/D', $value );
+    }
+
+    /**
+     * Validate one SHA-256 digest.
+     *
+     * @param mixed $value Value.
+     * @return bool
+     */
+    private function abilities_v2_digest( $value ) {
+        return is_string( $value ) && 1 === preg_match( '/^[a-f0-9]{64}$/D', $value );
+    }
+
+    /**
+     * Return the canonical safe-subset generation.
+     *
+     * @param array $settings Settings.
+     * @return string
+     */
+    private function abilities_v2_generation( $settings ) {
+        return hash( 'sha256', wp_json_encode( $settings ) );
+    }
+
+    /**
+     * Validate and canonicalize one complete safe settings subset.
+     *
+     * @param mixed $settings Settings.
+     * @return array|null
+     */
+    private function abilities_v2_canonical_settings( $settings ) {
+        if ( ! is_array( $settings ) || ! $this->abilities_v2_exact_keys( $settings, array( 'post_types', 'taxonomies', 'archives', 'sitemaps' ) ) || ! is_array( $settings['post_types'] ) || ! is_array( $settings['taxonomies'] ) || 2 !== count( $settings['post_types'] ) || 2 !== count( $settings['taxonomies'] ) || ! $this->abilities_v2_exact_keys( $settings['archives'], array( 'author_index', 'date_index' ) ) || ! $this->abilities_v2_exact_keys( $settings['sitemaps'], array( 'enabled' ) ) || ! is_bool( $settings['archives']['author_index'] ) || ! is_bool( $settings['archives']['date_index'] ) || ! is_bool( $settings['sitemaps']['enabled'] ) ) {
+            return null;
+        }
+
+        $canonical = array();
+        foreach ( array(
+            'post_types' => array( 'post', 'page' ),
+            'taxonomies' => array( 'category', 'post_tag' ),
+        ) as $group => $slugs ) {
+            $records = array();
+            foreach ( $settings[ $group ] as $record ) {
+                if ( ! is_array( $record ) || ! $this->abilities_v2_exact_keys( $record, array( 'slug', 'index', 'title_template', 'description_template' ) ) || ! in_array( $record['slug'], $slugs, true ) || isset( $records[ $record['slug'] ] ) || ! is_bool( $record['index'] ) ) {
+                    return null;
+                }
+                $title = $this->abilities_v2_template( $record['title_template'], 200 );
+                $desc  = $this->abilities_v2_template( $record['description_template'], 500 );
+                if ( false === $title || false === $desc ) {
+                    return null;
+                }
+                $records[ $record['slug'] ] = array(
+                    'slug'                 => $record['slug'],
+                    'index'                => $record['index'],
+                    'title_template'       => $title,
+                    'description_template' => $desc,
+                );
+            }
+            if ( count( $records ) !== count( $slugs ) ) {
+                return null;
+            }
+            $canonical[ $group ] = array();
+            foreach ( $slugs as $slug ) {
+                $canonical[ $group ][] = $records[ $slug ];
+            }
+        }
+        $canonical['archives'] = $settings['archives'];
+        $canonical['sitemaps'] = $settings['sitemaps'];
+        return $canonical;
+    }
+
+    /**
+     * Count changed leaf fields in the closed subset.
+     *
+     * @param array $before Current settings.
+     * @param array $after  Target settings.
+     * @return int
+     */
+    private function abilities_v2_changed_fields( $before, $after ) {
+        $count = 0;
+        foreach ( array( 'post_types', 'taxonomies' ) as $group ) {
+            foreach ( $before[ $group ] as $index => $record ) {
+                $count += $record === $after[ $group ][ $index ] ? 0 : 1;
+            }
+        }
+        $count += $before['archives']['author_index'] === $after['archives']['author_index'] ? 0 : 1;
+        $count += $before['archives']['date_index'] === $after['archives']['date_index'] ? 0 : 1;
+        $count += $before['sitemaps']['enabled'] === $after['sitemaps']['enabled'] ? 0 : 1;
+        return $count;
+    }
+
+    /**
+     * Apply owned keys and verify the exact normalized readback.
+     *
+     * @param array $old_options Existing option arrays.
+     * @param array $target      Canonical target settings.
+     * @return true|string
+     */
+    private function abilities_v2_apply_settings( $old_options, $target ) {
+        $next = $this->abilities_v2_options_for_settings( $old_options, $target );
+        if ( ! is_array( $next ) ) {
+            return 'unsafe_configuration';
+        }
+
+        $written = array();
+        foreach ( array( 'wpseo_titles', 'wpseo' ) as $name ) {
+            if ( $old_options[ $name ] === $next[ $name ] ) {
+                continue;
+            }
+            if ( ! $this->abilities_v2_write_option( $name, $next[ $name ] ) ) {
+                return $this->abilities_v2_restore_options( $old_options, $written ) ? 'write_failed' : 'outcome_unknown';
+            }
+            $written[] = $name;
+        }
+
+        $readback = $this->abilities_v2_runtime();
+        $actual   = is_array( $readback ) && isset( $readback['options'] ) ? $this->abilities_v2_normalize_settings( $readback['options'] ) : null;
+        if ( ! is_array( $actual ) || $target !== $actual ) {
+            return $this->abilities_v2_restore_options( $old_options, $written ) ? 'readback_mismatch' : 'outcome_unknown';
+        }
+        return true;
+    }
+
+    /**
+     * Build Yoast option arrays while preserving every unowned key.
+     *
+     * @param array $old_options Existing options.
+     * @param array $target      Target settings.
+     * @return array|null
+     */
+    private function abilities_v2_options_for_settings( $old_options, $target ) {
+        if ( ! is_array( $old_options ) || ! isset( $old_options['wpseo_titles'], $old_options['wpseo'] ) || ! is_array( $old_options['wpseo_titles'] ) || ! is_array( $old_options['wpseo'] ) ) {
+            return null;
+        }
+        $next = $old_options;
+        foreach ( array(
+            'post_types' => '',
+            'taxonomies' => 'tax-',
+        ) as $group => $prefix ) {
+            foreach ( $target[ $group ] as $record ) {
+                $slug = $record['slug'];
+                $next['wpseo_titles'][ 'noindex-' . $prefix . $slug ]  = ! $record['index'];
+                $next['wpseo_titles'][ 'title-' . $prefix . $slug ]    = $record['title_template'];
+                $next['wpseo_titles'][ 'metadesc-' . $prefix . $slug ] = $record['description_template'];
+            }
+        }
+        $next['wpseo_titles']['noindex-author-wpseo']  = ! $target['archives']['author_index'];
+        $next['wpseo_titles']['noindex-archive-wpseo'] = ! $target['archives']['date_index'];
+        $next['wpseo']['enable_xml_sitemap']           = $target['sitemaps']['enabled'];
+        return $next;
+    }
+
+    /**
+     * Restore changed option arrays and verify their exact values.
+     *
+     * @param array $old_options Existing options.
+     * @param array $written     Written option names.
+     * @return bool
+     */
+    private function abilities_v2_restore_options( $old_options, $written ) {
+        $ok = true;
+        foreach ( array_reverse( $written ) as $name ) {
+            $ok = $this->abilities_v2_write_option( $name, $old_options[ $name ] ) && $ok;
+        }
+        $readback = $this->abilities_v2_runtime();
+        return $ok && is_array( $readback ) && isset( $readback['options'] ) && $old_options === $readback['options'];
+    }
+
+    /**
+     * Write one owned Yoast option.
+     *
+     * @param string $name  Option name.
+     * @param array  $value Option value.
+     * @return bool
+     */
+    protected function abilities_v2_write_option( $name, $value ) {
+        return update_option( $name, $value, false ) || get_option( $name, null ) === $value;
+    }
+
+    /**
+     * Read a prior receipt, returning null when absent and false on conflict/corruption.
+     *
+     * @param string $operation Operation.
+     * @param array  $request   Request.
+     * @return array|null|false
+     */
+    protected function abilities_v2_receipt( $operation, $request ) {
+        $receipts = get_option( 'mainwp_wordpress_seo_v2_receipts', array() );
+        $key      = $operation . ':' . $request['request_ref'];
+        if ( ! is_array( $receipts ) || ! isset( $receipts[ $key ] ) ) {
+            return is_array( $receipts ) ? null : false;
+        }
+        $receipt = $receipts[ $key ];
+        $hash    = $this->abilities_v2_request_hash( $operation, $request );
+        return is_array( $receipt ) && $this->abilities_v2_exact_keys( $receipt, array( 'request_hash', 'response' ) ) && is_string( $receipt['request_hash'] ) && hash_equals( $receipt['request_hash'], $hash ) && is_array( $receipt['response'] ) ? $receipt['response'] : false;
+    }
+
+    /**
+     * Persist a bounded mutation receipt with exact readback.
+     *
+     * @param string $operation Operation.
+     * @param array  $request   Request.
+     * @param array  $response  Response.
+     * @return bool
+     */
+    protected function abilities_v2_store_receipt( $operation, $request, $response ) {
+        $receipts = get_option( 'mainwp_wordpress_seo_v2_receipts', array() );
+        if ( ! is_array( $receipts ) ) {
+            return false;
+        }
+        $key              = $operation . ':' . $request['request_ref'];
+        $receipts[ $key ] = array(
+            'request_hash' => $this->abilities_v2_request_hash( $operation, $request ),
+            'response'     => $response,
+        );
+        if ( 100 < count( $receipts ) ) {
+            $receipts = array_slice( $receipts, -100, null, true );
+        }
+        $written  = update_option( 'mainwp_wordpress_seo_v2_receipts', $receipts, false );
+        $readback = get_option( 'mainwp_wordpress_seo_v2_receipts', null );
+        return ( $written || $readback === $receipts ) && $readback === $receipts;
+    }
+
+    /**
+     * Hash one closed request with its operation.
+     *
+     * @param string $operation Operation.
+     * @param array  $request   Request.
+     * @return string
+     */
+    private function abilities_v2_request_hash( $operation, $request ) {
+        return hash( 'sha256', $operation . "\n" . wp_json_encode( $request ) );
     }
 
     /**

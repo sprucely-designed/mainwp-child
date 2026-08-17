@@ -1835,7 +1835,10 @@ class MainWP_Child_Posts { //phpcs:ignore -- NOSONAR - multi methods.
             wp_trash_post( $postId );
         } elseif ( 'delete' === $action ) {
             add_action( 'delete_post', array( MainWP_Child_Links_Checker::get_class_name(), 'hook_post_deleted' ) );
-            wp_delete_post( $postId, true );
+            $delete_result = $this->delete_post_with_result( $postId );
+            if ( ! $delete_result['deleted'] && ! $delete_result['already_absent'] ) {
+                $information['status'] = 'FAIL';
+            }
 
         } elseif ( 'restore' === $action ) {
             wp_untrash_post( $postId );
@@ -1901,6 +1904,47 @@ class MainWP_Child_Posts { //phpcs:ignore -- NOSONAR - multi methods.
         );
         $information['my_post']    = $my_post;
         MainWP_Helper::write( $information );
+    }
+
+    /**
+     * Permanently delete one exact post and prove the terminal result.
+     *
+     * A missing post is an idempotent terminal success. A present post is
+     * successful only when WordPress reports a deleted post and a fresh read
+     * proves absence. The closed result is intentionally not written directly
+     * to the legacy wire response, whose established shape remains unchanged.
+     *
+     * @param mixed $post_id Candidate post identity.
+     * @return array{deleted:bool,already_absent:bool}
+     */
+    public function delete_post_with_result( $post_id ) {
+        if ( ! is_int( $post_id ) && ! ( is_string( $post_id ) && 1 === preg_match( '/^[1-9][0-9]*$/D', $post_id ) ) ) {
+            return array(
+                'deleted'        => false,
+                'already_absent' => false,
+            );
+        }
+
+        $post_id = (int) $post_id;
+        if ( 1 > $post_id ) {
+            return array(
+                'deleted'        => false,
+                'already_absent' => false,
+            );
+        }
+
+        if ( null === get_post( $post_id ) ) {
+            return array(
+                'deleted'        => false,
+                'already_absent' => true,
+            );
+        }
+
+        $deleted = wp_delete_post( $post_id, true );
+        return array(
+            'deleted'        => $deleted instanceof \WP_Post && null === get_post( $post_id ),
+            'already_absent' => false,
+        );
     }
 
     /**

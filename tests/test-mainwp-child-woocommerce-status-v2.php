@@ -33,12 +33,19 @@ class WooCommerce_Status_V2_Fixture extends MainWP_Child_WooCommerce_Status {
 	/** @var array|null */
 	public $observation = null;
 
+	/** @var string|false */
+	public $source_generation;
+
 	protected function abilities_v2_runtime() {
 		return $this->runtime;
 	}
 
 	protected function abilities_v2_order_page( $payload, $runtime ) {
 		return $this->page;
+	}
+
+	protected function abilities_v2_source_generation( $payload ) {
+		return $this->source_generation;
 	}
 
 	protected function abilities_v2_db_readiness( $runtime ) {
@@ -129,6 +136,7 @@ class Test_MainWP_Child_WooCommerce_Status_V2 extends WP_UnitTestCase {
 			'state'           => 'ready',
 		);
 		$this->subject->observation = array( 'generation' => str_repeat( 'd', 64 ), 'observed_at' => 101 );
+		$this->subject->source_generation = str_repeat( 'e', 64 );
 	}
 
 	public function test_capabilities_are_closed_and_claim_the_complete_protocol() {
@@ -206,6 +214,10 @@ class Test_MainWP_Child_WooCommerce_Status_V2 extends WP_UnitTestCase {
 		$this->assertSame( hash( 'sha256', wp_json_encode( $result ) ), $hash );
 
 		$payload['preparation_generation'] = str_repeat( 'f', 64 );
+		$this->assertSame( 'preparation_drift', $this->request( 'status_v2_page', $payload )['code'] );
+
+		$payload['preparation_generation'] = $prepare['preparation_generation'];
+		$this->subject->source_generation  = str_repeat( 'f', 64 );
 		$this->assertSame( 'preparation_drift', $this->request( 'status_v2_page', $payload )['code'] );
 	}
 

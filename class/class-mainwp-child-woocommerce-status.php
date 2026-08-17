@@ -166,6 +166,11 @@ class MainWP_Child_WooCommerce_Status {
             return $this->abilities_v2_error( $operation, 'invalid_request' );
         }
 
+        $source_generation = $this->abilities_v2_source_generation( $request['payload'] );
+        if ( false === $source_generation ) {
+            return $this->abilities_v2_error( $operation, 'partial_result' );
+        }
+
         return array(
             'protocol'               => '2',
             'operation'              => 'status_v2_prepare',
@@ -184,7 +189,7 @@ class MainWP_Child_WooCommerce_Status {
             'accounting_profile'     => 'net-order-total-v1',
             'page_size_max'          => 250,
             'order_limit'            => 100000,
-            'preparation_generation' => hash( 'sha256', wp_json_encode( array( $request['payload'], $runtime ) ) ),
+            'preparation_generation' => hash( 'sha256', wp_json_encode( array( $request['payload'], $runtime, $source_generation ) ) ),
         );
     }
 
@@ -200,8 +205,12 @@ class MainWP_Child_WooCommerce_Status {
         if ( ! $this->abilities_v2_exact_keys( $payload, $keys ) || ! $this->abilities_v2_valid_prepare_request( array_intersect_key( $payload, array_flip( array( 'request_ref', 'site_fingerprint', 'start_at', 'end_at', 'top_limit' ) ) ) ) || ! $this->abilities_v2_digest( $payload['preparation_generation'] ) || ( null !== $payload['cursor'] && ( ! is_int( $payload['cursor'] ) || 0 > $payload['cursor'] || 100000 <= $payload['cursor'] ) ) || ! is_int( $payload['page_size'] ) || 1 > $payload['page_size'] || 250 < $payload['page_size'] ) {
             return $this->abilities_v2_error( 'status_v2_page', 'invalid_request' );
         }
-        $prepare_payload = array_intersect_key( $payload, array_flip( array( 'request_ref', 'site_fingerprint', 'start_at', 'end_at', 'top_limit' ) ) );
-        $expected        = hash( 'sha256', wp_json_encode( array( $prepare_payload, $runtime ) ) );
+        $prepare_payload   = array_intersect_key( $payload, array_flip( array( 'request_ref', 'site_fingerprint', 'start_at', 'end_at', 'top_limit' ) ) );
+        $source_generation = $this->abilities_v2_source_generation( $prepare_payload );
+        if ( false === $source_generation ) {
+            return $this->abilities_v2_error( 'status_v2_page', 'partial_result' );
+        }
+        $expected = hash( 'sha256', wp_json_encode( array( $prepare_payload, $runtime, $source_generation ) ) );
         if ( ! hash_equals( $expected, $payload['preparation_generation'] ) ) {
             return $this->abilities_v2_error( 'status_v2_page', 'preparation_drift' );
         }
@@ -530,6 +539,48 @@ class MainWP_Child_WooCommerce_Status {
             'storage_mode'          => $runtime['storage_mode'],
             'accounting_profile'    => 'net-order-total-v1',
         );
+    }
+
+    /**
+     * Bind every page to a stable order-set generation without exposing order data.
+     *
+     * @param array $payload Closed report identity.
+     * @return string|false
+     */
+    protected function abilities_v2_source_generation( $payload ) {
+        if ( ! function_exists( 'wc_get_orders' ) ) {
+            return false;
+        }
+        $start  = $this->abilities_v2_utc_timestamp( $payload['start_at'] );
+        $end    = $this->abilities_v2_utc_timestamp( $payload['end_at'] );
+        $result = wc_get_orders(
+            array(
+                'status'       => array( 'wc-completed', 'wc-processing', 'wc-on-hold' ),
+                'date_created' => $start . '...' . ( $end - 1 ),
+                'limit'        => 1,
+                'orderby'      => 'modified',
+                'order'        => 'DESC',
+                'paginate'     => true,
+                'return'       => 'objects',
+            )
+        );
+        if ( ! is_object( $result ) || ! isset( $result->orders, $result->total ) || ! is_array( $result->orders ) || ! is_int( $result->total ) || 0 > $result->total || 100000 < $result->total || 1 < count( $result->orders ) ) {
+            return false;
+        }
+        $latest = empty( $result->orders ) ? null : reset( $result->orders );
+        if ( null === $latest ) {
+            return hash( 'sha256', 'empty|0' );
+        }
+        if ( ! is_object( $latest ) || ! method_exists( $latest, 'get_id' ) || ! method_exists( $latest, 'get_date_modified' ) ) {
+            return false;
+        }
+        $modified = $latest->get_date_modified();
+        $order_id = (int) $latest->get_id();
+        if ( 1 > $order_id || ! is_object( $modified ) || ! method_exists( $modified, 'getTimestamp' ) ) {
+            return false;
+        }
+
+        return hash( 'sha256', wp_json_encode( array( $result->total, $order_id, (int) $modified->getTimestamp() ) ) );
     }
 
     /** Read separately timestamped order and stock counts. */

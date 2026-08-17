@@ -12,52 +12,104 @@ use WP_UnitTestCase;
 
 class Test_MainWP_Child_Virusdie_V1 extends WP_UnitTestCase {
 
-	/** @var MainWP_Child_Misc */
-	private $subject;
+	public function test_capabilities_advertise_only_the_narrow_operations() {
+		$result = ( new Testable_MainWP_Child_Virusdie() )->request_v1( $this->request( 'capabilities', array() ) );
 
-	public function set_up(): void {
-		parent::set_up();
-		$reflection    = new ReflectionClass( MainWP_Child_Misc::class );
-		$this->subject = $reflection->newInstanceWithoutConstructor();
+		$this->assertSame( array( 'protocol', 'operation', 'ok', 'operations', 'max_artifact_bytes' ), array_keys( $result ) );
+		$this->assertSame( array( 'install', 'status', 'remove' ), $result['operations'] );
+		$this->assertSame( 262144, $result['max_artifact_bytes'] );
 	}
 
-	public function test_capabilities_are_closed_and_claim_no_executable_mutation() {
-		$result = $this->subject->virusdie_sync_install_v1_response(
-			array(
-				'protocol'  => '1',
-				'operation' => 'capabilities',
-				'payload'   => array(),
-			)
-		);
+	public function test_install_reserves_downloads_once_and_replays_truth() {
+		$subject                = new Testable_MainWP_Child_Virusdie();
+		$subject->gateway_bytes = '<?php // signed fixture';
+		$request                = $this->install_request( $subject->gateway_bytes );
 
-		$this->assertSame( array( 'protocol', 'operation', 'ok', 'operations', 'mutation_supported' ), array_keys( $result ) );
-		$this->assertSame( array(), $result['operations'] );
-		$this->assertFalse( $result['mutation_supported'] );
+		$result = $subject->request_v1( $request );
+		$this->assertTrue( $result['ok'] );
+		$this->assertSame( 'completed', $result['status'] );
+		$this->assertTrue( $result['installed'] );
+		$this->assertSame( 1, $subject->gateway_reads );
+		$this->assertSame( 1, $subject->installs );
+		$this->assertStringNotContainsString( 'one-use-private-token', wp_json_encode( $subject->receipts ) );
+
+		$this->assertSame( $result, $subject->request_v1( $request ) );
+		$this->assertSame( 1, $subject->gateway_reads );
+		$this->assertSame( 1, $subject->installs );
+		$this->assertSame( $result, $subject->request_v1( $this->request( 'status', array( 'request_ref' => $request['payload']['request_ref'] ) ) ) );
 	}
 
-	public function test_malformed_and_install_requests_fail_closed_without_effects() {
-		$this->assertSame(
-			array(
-				'protocol'  => '1',
-				'operation' => 'unknown',
-				'ok'        => false,
-				'code'      => 'invalid_request',
-			),
-			$this->subject->virusdie_sync_install_v1_response( array() )
-		);
+	public function test_dispatching_install_is_unknown_without_blind_retry() {
+		$subject                = new Testable_MainWP_Child_Virusdie();
+		$subject->gateway_bytes = '<?php // signed fixture';
+		$request                = $this->install_request( $subject->gateway_bytes );
+		$subject->seed_dispatching( $request );
 
-		$result = $this->subject->virusdie_sync_install_v1_response(
-			array(
-				'protocol'  => '1',
-				'operation' => 'install',
-				'payload'   => array(
-					'request_ref' => '123e4567-e89b-42d3-a456-426614175000',
-				),
-			)
-		);
-
+		$result = $subject->request_v1( $request );
 		$this->assertFalse( $result['ok'] );
-		$this->assertSame( 'unsupported_operation', $result['code'] );
+		$this->assertSame( 'unknown', $result['status'] );
+		$this->assertSame( 'outcome_unknown', $result['code'] );
+		$this->assertSame( 0, $subject->gateway_reads );
+		$this->assertSame( 0, $subject->installs );
+	}
+
+	public function test_digest_failure_and_existing_target_are_non_mutating() {
+		$subject                = new Testable_MainWP_Child_Virusdie();
+		$subject->gateway_bytes = 'wrong';
+		$result                 = $subject->request_v1( $this->install_request( 'expected' ) );
+		$this->assertSame( 'digest_mismatch', $result['code'] );
+		$this->assertSame( 0, $subject->installs );
+
+		$existing                = new Testable_MainWP_Child_Virusdie();
+		$existing->target_exists = true;
+		$existing->target_bytes  = 'existing';
+		$result                  = $existing->request_v1( $this->install_request( 'expected' ) );
+		$this->assertSame( 'target_exists', $result['code'] );
+		$this->assertSame( 0, $existing->gateway_reads );
+	}
+
+	public function test_remove_requires_exact_current_hash_and_replays() {
+		$subject                = new Testable_MainWP_Child_Virusdie();
+		$subject->target_exists = true;
+		$subject->target_bytes  = 'installed bytes';
+		$request                = $this->request(
+			'remove',
+			array(
+				'request_ref'     => '123e4567-e89b-42d3-a456-426614175003',
+				'basename'        => 'virusdie_fixture.php',
+				'expected_sha256' => hash( 'sha256', 'installed bytes' ),
+				'site_generation' => str_repeat( 'b', 64 ),
+			)
+		);
+
+		$result = $subject->request_v1( $request );
+		$this->assertTrue( $result['ok'] );
+		$this->assertSame( 'completed', $result['status'] );
+		$this->assertFalse( $result['installed'] );
+		$this->assertSame( 1, $subject->removals );
+		$this->assertSame( $result, $subject->request_v1( $request ) );
+		$this->assertSame( 1, $subject->removals );
+
+		$drifted                = new Testable_MainWP_Child_Virusdie();
+		$drifted->target_exists = true;
+		$drifted->target_bytes  = 'drifted';
+		$this->assertSame( 'stale_target', $drifted->request_v1( $request )['code'] );
+		$this->assertSame( 0, $drifted->removals );
+	}
+
+	public function test_malformed_alias_path_and_gateway_fail_closed() {
+		$subject = new Testable_MainWP_Child_Virusdie();
+		$request = $this->install_request( 'bytes' );
+		$request['payload']['request_id'] = $request['payload']['request_ref'];
+		unset( $request['payload']['request_ref'] );
+		$this->assertSame( 'invalid_request', $subject->request_v1( $request )['code'] );
+
+		$request = $this->install_request( 'bytes' );
+		$request['payload']['basename'] = '../virusdie.php';
+		$this->assertSame( 'invalid_request', $subject->request_v1( $request )['code'] );
+		$request = $this->install_request( 'bytes' );
+		$request['payload']['gateway_url'] = 'https://attacker.example/file';
+		$this->assertSame( 'gateway_rejected', $subject->request_v1( $request )['code'] );
 	}
 
 	public function test_callable_dispatch_map_registers_the_narrow_protocol() {
@@ -68,5 +120,95 @@ class Test_MainWP_Child_Virusdie_V1 extends WP_UnitTestCase {
 
 		$this->assertSame( 'virusdie_sync_install_v1', $property->getValue( $callable )['virusdie_sync_install_v1'] );
 		$this->assertTrue( method_exists( $callable, 'virusdie_sync_install_v1' ) );
+	}
+
+	private function install_request( $bytes ) {
+		return $this->request(
+			'install',
+			array(
+				'request_ref'     => '123e4567-e89b-42d3-a456-426614175001',
+				'basename'        => 'virusdie_fixture.php',
+				'expected_bytes'  => strlen( $bytes ),
+				'expected_sha256' => hash( 'sha256', $bytes ),
+				'gateway_url'     => 'https://dashboard.example/mainwp-virusdie-artifact',
+				'gateway_token'   => 'one-use-private-token',
+				'site_generation' => str_repeat( 'a', 64 ),
+				'expires_at'      => time() + 300,
+			)
+		);
+	}
+
+	private function request( $operation, $payload ) {
+		return array( 'protocol' => '1', 'operation' => $operation, 'payload' => $payload );
+	}
+}
+
+class Testable_MainWP_Child_Virusdie extends MainWP_Child_Virusdie {
+
+	public $target_exists = false;
+	public $target_bytes = '';
+	public $gateway_bytes = '';
+	public $gateway_reads = 0;
+	public $installs = 0;
+	public $removals = 0;
+	public $receipts = array();
+
+	protected function target_snapshot( $basename ) {
+		unset( $basename );
+		return array(
+			'exists' => $this->target_exists,
+			'bytes'  => $this->target_exists ? strlen( $this->target_bytes ) : null,
+			'sha256' => $this->target_exists ? hash( 'sha256', $this->target_bytes ) : null,
+		);
+	}
+
+	protected function gateway_allowed( $url ) {
+		return 'https://dashboard.example/mainwp-virusdie-artifact' === $url;
+	}
+
+	protected function download_artifact( $url, $token, $expected_bytes ) {
+		unset( $url, $token, $expected_bytes );
+		++$this->gateway_reads;
+		return $this->gateway_bytes;
+	}
+
+	protected function install_artifact( $basename, $bytes ) {
+		unset( $basename );
+		++$this->installs;
+		$this->target_exists = true;
+		$this->target_bytes  = $bytes;
+		return true;
+	}
+
+	protected function remove_artifact( $basename ) {
+		unset( $basename );
+		++$this->removals;
+		$this->target_exists = false;
+		$this->target_bytes  = '';
+		return true;
+	}
+
+	protected function load_receipt( $request_ref ) {
+		return isset( $this->receipts[ $request_ref ] ) ? $this->receipts[ $request_ref ] : null;
+	}
+
+	protected function create_receipt( $request_ref, $receipt ) {
+		if ( isset( $this->receipts[ $request_ref ] ) ) {
+			return false;
+		}
+		$this->receipts[ $request_ref ] = $receipt;
+		return true;
+	}
+
+	protected function settle_receipt( $request_ref, $expected, $receipt ) {
+		if ( ! isset( $this->receipts[ $request_ref ] ) || $expected !== $this->receipts[ $request_ref ] ) {
+			return false;
+		}
+		$this->receipts[ $request_ref ] = $receipt;
+		return true;
+	}
+
+	public function seed_dispatching( $request ) {
+		$this->receipts[ $request['payload']['request_ref'] ] = $this->dispatching_receipt_for_test( $request );
 	}
 }

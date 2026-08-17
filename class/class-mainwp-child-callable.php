@@ -76,6 +76,10 @@ class MainWP_Child_Callable { //phpcs:ignore -- NOSONAR - multi methods.
         'branding_child_plugin'    => 'branding_child_plugin',
         'code_snippet'             => 'code_snippet',
         'uploader_action'          => 'uploader_action',
+        'uploader_preflight_v2'         => 'uploader_preflight_v2',
+        'uploader_deploy_v2'            => 'uploader_deploy_v2',
+        'uploader_deployment_state_v2'  => 'uploader_deployment_state_v2',
+        'uploader_rollback_v2'          => 'uploader_rollback_v2',
         'early_access_release_v2'  => 'early_access_release_v2',
         'favorites_package_state_v2' => 'favorites_package_state_v2',
         'favorites_install_verified_v2' => 'favorites_install_verified_v2',
@@ -858,6 +862,26 @@ class MainWP_Child_Callable { //phpcs:ignore -- NOSONAR - multi methods.
      */
     public function uploader_action() {
         MainWP_Child_Misc::get_instance()->uploader_action();
+    }
+
+    /** Dispatch the read-pure file deployment preflight. */
+    public function uploader_preflight_v2() {
+        ( new MainWP_Child_File_Deployment() )->handle_preflight();
+    }
+
+    /** Dispatch one verified file deployment. */
+    public function uploader_deploy_v2() {
+        ( new MainWP_Child_File_Deployment() )->handle_deploy();
+    }
+
+    /** Read one durable file deployment result. */
+    public function uploader_deployment_state_v2() {
+        ( new MainWP_Child_File_Deployment() )->handle_state();
+    }
+
+    /** Dispatch one exact file deployment rollback. */
+    public function uploader_rollback_v2() {
+        ( new MainWP_Child_File_Deployment() )->handle_rollback();
     }
 
     /**

@@ -456,53 +456,7 @@ class MainWP_Child_Misc {
      * @return array<string,mixed> Closed response.
      */
     public function virusdie_sync_install_v1_response( $request ) {
-        $operation = is_array( $request ) && isset( $request['operation'] ) && is_string( $request['operation'] ) ? $request['operation'] : 'unknown';
-        if ( ! is_array( $request ) || ! $this->virusdie_sync_install_v1_exact_keys( $request, array( 'protocol', 'operation', 'payload' ) ) || '1' !== $request['protocol'] || ! is_array( $request['payload'] ) ) {
-            return $this->virusdie_sync_install_v1_error( 'unknown', 'invalid_request' );
-        }
-
-        if ( 'capabilities' === $operation && array() === $request['payload'] ) {
-            return array(
-                'protocol'           => '1',
-                'operation'          => 'capabilities',
-                'ok'                 => true,
-                'operations'         => array(),
-                'mutation_supported' => false,
-            );
-        }
-
-        return $this->virusdie_sync_install_v1_error( $operation, 'unsupported_operation' );
-    }
-
-    /**
-     * Check an exact associative-key set.
-     *
-     * @param array $value Input object.
-     * @param array $keys  Expected keys.
-     * @return bool
-     */
-    private function virusdie_sync_install_v1_exact_keys( $value, $keys ) {
-        $actual = array_keys( $value );
-        sort( $actual, SORT_STRING );
-        sort( $keys, SORT_STRING );
-
-        return $actual === $keys;
-    }
-
-    /**
-     * Build a closed Virusdie installer protocol error.
-     *
-     * @param string $operation Protocol operation.
-     * @param string $code      Stable error code.
-     * @return array<string,mixed>
-     */
-    private function virusdie_sync_install_v1_error( $operation, $code ) {
-        return array(
-            'protocol'  => '1',
-            'operation' => $operation,
-            'ok'        => false,
-            'code'      => $code,
-        );
+        return ( new MainWP_Child_Virusdie() )->request_v1( $request );
     }
 
     /**

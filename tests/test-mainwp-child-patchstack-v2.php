@@ -27,7 +27,7 @@ class Test_MainWP_Child_Patchstack_V2 extends WP_UnitTestCase {
 		$this->assertSame( array( 'protocol', 'operation', 'ok', 'operations', 'mutation_supported' ), array_keys( $result ) );
 		$this->assertSame( '2', $result['protocol'] );
 		$this->assertTrue( $result['ok'] );
-		$this->assertSame( array( 'patchstack_protection_preview_v2', 'patchstack_visibility_replace_v2' ), $result['operations'] );
+		$this->assertSame( array( 'patchstack_protection_preview_v2', 'patchstack_protection_execute_v2', 'patchstack_protection_status_v2', 'patchstack_visibility_replace_v2' ), $result['operations'] );
 		$this->assertTrue( $result['mutation_supported'] );
 	}
 
@@ -44,11 +44,94 @@ class Test_MainWP_Child_Patchstack_V2 extends WP_UnitTestCase {
 		$this->assertSame( 'hidden', $result['visibility'] );
 		$this->assertMatchesRegularExpression( '/^[a-f0-9]{64}$/', $result['state_revision'] );
 		$this->assertSame( 0, $this->subject->writes );
+		$active_revision = $result['state_revision'];
 
 		$this->subject->plugin_state = 'absent';
 		$result                      = $this->request( 'patchstack_protection_preview_v2', $this->base_payload( '123e4567-e89b-42d3-a456-426614174511' ) );
 		$this->assertSame( 'install', $result['planned_action'] );
 		$this->assertSame( 'verification_unavailable', $result['package_state'] );
+
+		$this->subject->manifest = $this->verified_manifest();
+		$result                  = $this->request( 'patchstack_protection_preview_v2', $this->base_payload( '123e4567-e89b-42d3-a456-426614174512' ) );
+		$this->assertSame( 'verified_available', $result['package_state'] );
+		$this->assertNotSame( $active_revision, $result['state_revision'] );
+	}
+
+	public function test_protection_execute_reserves_converges_replays_and_reports_status() {
+		$this->subject->plugin_state = 'absent';
+		$this->subject->manifest     = $this->verified_manifest();
+		$common                      = $this->base_payload();
+		$preview                     = $this->request( 'patchstack_protection_preview_v2', $common );
+		$payload                     = array_merge(
+			$common,
+			array(
+				'if_match'     => $preview['state_revision'],
+				'license_token' => 'private-one-use-license-token',
+			)
+		);
+
+		$result = $this->request( 'patchstack_protection_execute_v2', $payload );
+		$this->assertSame( array( 'protocol', 'operation', 'ok', 'operation_ref', 'status', 'current_state', 'changed', 'code' ), array_keys( $result ) );
+		$this->assertTrue( $result['ok'] );
+		$this->assertSame( 'completed', $result['status'] );
+		$this->assertSame( 'protected', $result['current_state'] );
+		$this->assertTrue( $result['changed'] );
+		$this->assertNull( $result['code'] );
+		$this->assertSame( 1, $this->subject->protection_writes );
+		$this->assertSame( 'dispatching', $this->subject->protection_receipt_writes[0][ $common['operation_ref'] ]['state'] );
+		$this->assertStringNotContainsString( 'private-one-use-license-token', wp_json_encode( $this->subject->protection_receipts ) );
+
+		$this->assertSame( $result, $this->request( 'patchstack_protection_execute_v2', $payload ) );
+		$this->assertSame( 1, $this->subject->protection_writes );
+
+		$status = $this->request( 'patchstack_protection_status_v2', $common );
+		$this->assertSame( array( 'protocol', 'operation', 'ok', 'operation_ref', 'status', 'current_state', 'changed', 'code' ), array_keys( $status ) );
+		$this->assertSame( 'patchstack_protection_status_v2', $status['operation'] );
+		$this->assertSame( 'completed', $status['status'] );
+		$this->assertSame( 'protected', $status['current_state'] );
+
+		$changed                  = $payload;
+		$changed['license_token'] = 'different-private-token';
+		$this->assertSame( 'request_conflict', $this->request( 'patchstack_protection_execute_v2', $changed )['code'] );
+	}
+
+	public function test_protection_execute_fails_closed_without_trust_and_rolls_back_contradiction() {
+		$this->subject->plugin_state = 'absent';
+		$common                      = $this->base_payload();
+		$preview                     = $this->request( 'patchstack_protection_preview_v2', $common );
+		$payload                     = array_merge( $common, array( 'if_match' => $preview['state_revision'], 'license_token' => 'private-license-token' ) );
+
+		$this->assertSame( 'package_verification_unavailable', $this->request( 'patchstack_protection_execute_v2', $payload )['code'] );
+		$this->assertSame( 0, $this->subject->protection_writes );
+		$this->assertSame( array(), $this->subject->protection_receipts );
+
+		$this->subject->manifest                = $this->verified_manifest();
+		$preview                                = $this->request( 'patchstack_protection_preview_v2', $common );
+		$payload['if_match']                    = $preview['state_revision'];
+		$this->subject->protection_readback     = 'active';
+		$result                                 = $this->request( 'patchstack_protection_execute_v2', $payload );
+		$this->assertSame( 'write_failed', $result['code'] );
+		$this->assertSame( 'failed', $result['status'] );
+		$this->assertSame( 'absent', $this->subject->plugin_state );
+		$this->assertSame( 1, $this->subject->protection_rollbacks );
+	}
+
+	public function test_dispatching_protection_receipt_is_unknown_and_status_never_dispatches() {
+		$this->subject->plugin_state = 'absent';
+		$this->subject->manifest     = $this->verified_manifest();
+		$common                      = $this->base_payload();
+		$preview                     = $this->request( 'patchstack_protection_preview_v2', $common );
+		$payload                     = array_merge( $common, array( 'if_match' => $preview['state_revision'], 'license_token' => 'private-license-token' ) );
+		$this->subject->seed_dispatching_protection( $payload );
+
+		$result = $this->request( 'patchstack_protection_execute_v2', $payload );
+		$this->assertSame( 'unknown', $result['status'] );
+		$this->assertSame( 'outcome_unknown', $result['code'] );
+		$this->assertSame( 0, $this->subject->protection_writes );
+
+		$status = $this->request( 'patchstack_protection_status_v2', $common );
+		$this->assertSame( 'unknown', $status['status'] );
+		$this->assertSame( 0, $this->subject->protection_writes );
 	}
 
 	public function test_visibility_replace_stages_replays_and_restores_on_contradiction() {
@@ -172,6 +255,14 @@ class Test_MainWP_Child_Patchstack_V2 extends WP_UnitTestCase {
 			'expires_at'             => time() + 300,
 		);
 	}
+
+	private function verified_manifest() {
+		return array(
+			'version'         => '2.3.4',
+			'package_sha256'  => str_repeat( 'c', 64 ),
+			'manifest_digest' => str_repeat( 'd', 64 ),
+		);
+	}
 }
 
 class Testable_MainWP_Child_Patchstack extends MainWP_Child_Patchstack {
@@ -182,6 +273,12 @@ class Testable_MainWP_Child_Patchstack extends MainWP_Child_Patchstack {
 	public $writes = 0;
 	public $receipts = array();
 	public $receipt_writes = array();
+	public $manifest = null;
+	public $protection_writes = 0;
+	public $protection_rollbacks = 0;
+	public $protection_readback = 'protected';
+	public $protection_receipts = array();
+	public $protection_receipt_writes = array();
 
 	protected function abilities_v2_plugin_state() {
 		return $this->plugin_state;
@@ -219,5 +316,48 @@ class Testable_MainWP_Child_Patchstack extends MainWP_Child_Patchstack {
 
 	protected function abilities_v2_end_mutation() {
 		return true;
+	}
+
+	protected function abilities_v2_verified_package_manifest() {
+		return $this->manifest;
+	}
+
+	protected function abilities_v2_apply_protection( $payload, $before, $manifest ) {
+		unset( $payload, $before, $manifest );
+		++$this->protection_writes;
+		$this->plugin_state = $this->protection_readback;
+		return array( 'changed' => true );
+	}
+
+	protected function abilities_v2_rollback_protection( $before ) {
+		++$this->protection_rollbacks;
+		$this->plugin_state = $before;
+		return true;
+	}
+
+	protected function abilities_v2_read_protection_receipts() {
+		return $this->protection_receipts;
+	}
+
+	protected function abilities_v2_write_protection_receipts( $receipts ) {
+		$this->protection_receipt_writes[] = $receipts;
+		$this->protection_receipts         = $receipts;
+		return true;
+	}
+
+	public function seed_dispatching_protection( $payload ) {
+		$this->protection_receipts[ $payload['operation_ref'] ] = array(
+			'effect_hash'     => $this->protection_effect_hash_for_test( $payload ),
+			'binding_digest'  => $payload['provider_binding_digest'],
+			'operation_ref'   => $payload['operation_ref'],
+			'prior_state'     => $this->plugin_state,
+			'state'           => 'dispatching',
+			'result'          => null,
+			'updated_at'      => time(),
+		);
+	}
+
+	public function protection_effect_hash_for_test( $payload ) {
+		return $this->abilities_v2_protection_effect_hash( $payload );
 	}
 }

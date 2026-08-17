@@ -560,9 +560,10 @@ class MainWP_Child_Wordfence { //phpcs:ignore -- NOSONAR - multi methods.
 
         if ( 'abilities_v2' === $mwp_action ) {
             // phpcs:disable WordPress.Security.NonceVerification
+            // phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized -- Closed JSON is decoded and validated by abilities_v2().
             $raw_request = isset( $_POST['request'] ) && is_string( $_POST['request'] ) ? wp_unslash( $_POST['request'] ) : '';
             // phpcs:enable
-            $request = 4096 >= strlen( $raw_request ) ? json_decode( $raw_request, true ) : null;
+            $request = 2 * 1024 * 1024 >= strlen( $raw_request ) ? json_decode( $raw_request, true ) : null;
             MainWP_Helper::write( $this->abilities_v2( $request ) );
             return;
         }

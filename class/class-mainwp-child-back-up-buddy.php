@@ -225,6 +225,9 @@ class MainWP_Child_Back_Up_Buddy { //phpcs:ignore -- NOSONAR - multi methods.
             );
 
             $recentBackups_list = glob( \backupbuddy_core::getLogDirectory() . 'fileoptions/*.txt' );
+            $lasttime_logged    = (int) MainWP_Utility::get_lasttime_backup( 'backupbuddy' );
+            $new_lasttime       = $lasttime_logged;
+            $can_advance_cursor = true;
 
             foreach ( $recentBackups_list as $backup_fileoptions ) {
 
@@ -269,7 +272,13 @@ class MainWP_Child_Back_Up_Buddy { //phpcs:ignore -- NOSONAR - multi methods.
                 $finish_time = $backup['finish_time'];
                 $message     = 'BackupBuddy ' . $backupType . ' finished';
                 if ( ! empty( $finish_time ) ) {
-                    do_action( 'mainwp_reports_backupbuddy_backup', $message, $backupType, $finish_time );
+                    $fingerprint = MainWP_Utility::backup_fingerprint( 'backupbuddy', basename( $backup_fileoptions ) );
+                    do_action( 'mainwp_reports_backupbuddy_backup', $message, $backupType, $finish_time, $fingerprint );
+                    if ( MainWP_Utility::backup_fingerprint_logged( $fingerprint ) ) {
+                        $new_lasttime = max( $new_lasttime, (int) $finish_time );
+                    } else {
+                        $can_advance_cursor = false;
+                    }
                 }
             }
 
@@ -293,10 +302,20 @@ class MainWP_Child_Back_Up_Buddy { //phpcs:ignore -- NOSONAR - multi methods.
                         $backupType  = 'Live Backup to cloud';
                         $message     = 'BackupBuddy ' . $backupType . ' finished';
                         if ( ! empty( $finish_time ) ) {
-                            do_action( 'mainwp_reports_backupbuddy_backup', $message, $backupType, $finish_time );
+                            $fingerprint = MainWP_Utility::backup_fingerprint( 'backupbuddy', 'live', $finish_time );
+                            do_action( 'mainwp_reports_backupbuddy_backup', $message, $backupType, $finish_time, $fingerprint );
+                            if ( MainWP_Utility::backup_fingerprint_logged( $fingerprint ) ) {
+                                $new_lasttime = max( $new_lasttime, (int) $finish_time );
+                            } else {
+                                $can_advance_cursor = false;
+                            }
                         }
                     }
                 }
+            }
+
+            if ( $can_advance_cursor && $new_lasttime > $lasttime_logged ) {
+                MainWP_Utility::update_lasttime_backup( 'backupbuddy', $new_lasttime );
             }
         } catch ( MainWP_Exception $e ) {
             // ok!
@@ -1051,7 +1070,6 @@ class MainWP_Child_Back_Up_Buddy { //phpcs:ignore -- NOSONAR - multi methods.
                 $time                    = $this->localize_time( $finish_time );
                 $data['lastBackupStats'] = date( 'M j - g:i A', $time ); // phpcs:ignore -- local time.
                 $data['lasttime_backup'] = $finish_time;
-                MainWP_Utility::update_lasttime_backup( 'backupbuddy', $finish_time ); // support Require Backup Before Update feature.
             } else {
                 $data['lastBackupStats'] = 'Unknown';
             }

@@ -1050,10 +1050,6 @@ class MainWP_Child_Timecapsule { //phpcs:ignore -- NOSONAR - multi methods.
 
             $backup_time = $config->get_option( 'last_backup_time' );
 
-            if ( ! empty( $backup_time ) ) {
-                MainWP_Utility::update_lasttime_backup( 'wptimecapsule', $backup_time );
-            }
-
             $last_time       = time() - 24 * 7 * 2 * 60 * 60;
             $lasttime_logged = MainWP_Utility::get_lasttime_backup( 'wptimecapsule' );
             if ( empty( $lasttime_logged ) ) {
@@ -1064,6 +1060,7 @@ class MainWP_Child_Timecapsule { //phpcs:ignore -- NOSONAR - multi methods.
 
             if ( is_array( $all_last_backups ) ) {
                 $formatted_backups = array();
+                $value_array       = array();
                 foreach ( $all_last_backups as $key => $value ) {
                     $value_array                                     = (array) $value;
                     $formatted_backups[ $value_array['backupID'] ][] = $value_array;
@@ -1071,9 +1068,20 @@ class MainWP_Child_Timecapsule { //phpcs:ignore -- NOSONAR - multi methods.
                 $message     = 'WP Time Capsule backup finished';
                 $backup_type = 'WP Time Capsule backup';
                 if ( ! empty( $formatted_backups ) ) {
+                    $can_advance_cursor = true;
                     foreach ( $formatted_backups as $key => $value ) {
                         $backup_time = $key;
-                        do_action( 'mainwp_reports_wptimecapsule_backup', $message, $backup_type, $backup_time );
+                        $fingerprint = MainWP_Utility::backup_fingerprint( 'wptimecapsule', $key );
+                        do_action( 'mainwp_reports_wptimecapsule_backup', $message, $backup_type, $backup_time, $fingerprint );
+                        if ( MainWP_Utility::backup_fingerprint_logged( $fingerprint ) ) {
+                            continue;
+                        }
+
+                        $can_advance_cursor = false;
+                    }
+
+                    if ( $can_advance_cursor ) {
+                        MainWP_Utility::update_lasttime_backup( 'wptimecapsule', $backup_time );
                     }
                 }
             }

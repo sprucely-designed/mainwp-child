@@ -560,7 +560,12 @@ class Changes_Logs_Logger { //phpcs:ignore -- NOSONAR -ok.
             )
         );
 
-        if ( ( ! empty( $last_changes_logs ) && isset( $last_changes_logs[0]['log_type_id'] ) ) || ( ( ! is_array( $log_type_id ) && (int) $last_changes_logs[0]['log_type_id'] === (int) $log_type_id ) || ( is_array( $log_type_id ) && in_array( (int) $last_changes_logs[0]['log_type_id'], $log_type_id, true ) ) ) ) {
+        if ( ! empty( $last_changes_logs ) && isset( $last_changes_logs[0]['log_type_id'] )
+            && (
+                ( ! is_array( $log_type_id ) && (int) $last_changes_logs[0]['log_type_id'] === (int) $log_type_id )
+                || ( is_array( $log_type_id ) && in_array( (int) $last_changes_logs[0]['log_type_id'], $log_type_id, true ) )
+            )
+        ) {
             return true;
         }
 

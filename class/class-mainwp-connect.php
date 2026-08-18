@@ -584,7 +584,7 @@ class MainWP_Connect { //phpcs:ignore -- NOSONAR - multi methods.
                     if ( true === $valid_code && isset( $_REQUEST['mainwpsignature'] ) ) {
                         $request_id = rawurldecode( wp_unslash( $_REQUEST['mainwpsignature'] ) ); // phpcs:ignore --NOSONAR - WordPress.Security.ValidatedSanitizedInput.InputNotSanitized
                         if ( strlen( $request_id ) > 50 ) { // base64 encoded string - Looks like a valid base signature was sent as well, so block it to prevent potential misuse.
-                            add_option( 'mainwp_child_request_id_' . hash( 'sha256', $request_id ), time(), '', false );
+                            add_option( 'mainwp_child_blocked_request_id_' . hash( 'sha256', $request_id ), time(), '', false );
                         }
                     }
                 } else {

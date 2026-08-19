@@ -442,6 +442,7 @@ class MainWP_Child_Misc {
      */
     public function virusdie_sync_install_v1() {
         // phpcs:disable WordPress.Security.NonceVerification
+        // phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized -- JSON request body, length-capped and strictly validated by json_decode; sanitizing would corrupt it.
         $raw_request = isset( $_POST['request'] ) && is_string( $_POST['request'] ) ? wp_unslash( $_POST['request'] ) : '';
         // phpcs:enable
         $request = 4096 >= strlen( $raw_request ) ? json_decode( $raw_request, true ) : null;
@@ -566,7 +567,7 @@ class MainWP_Child_Misc {
             $utf8_pcre = @preg_match( '/^./u', 'a' );
         }
 
-        if ( ! seems_utf8( $filename ) ) {
+        if ( ! seems_utf8( $filename ) ) { // phpcs:ignore WordPress.WP.DeprecatedFunctions.seems_utf8Found -- wp_is_valid_utf8() requires WP 6.9; the plugin supports 6.2+.
             $_ext     = pathinfo( $filename, PATHINFO_EXTENSION );
             $_name    = pathinfo( $filename, PATHINFO_FILENAME );
             $filename = sanitize_title_with_dashes( $_name ) . '.' . $_ext;
@@ -620,6 +621,7 @@ class MainWP_Child_Misc {
         $action = MainWP_System::instance()->validate_params( 'action' );
 
         if ( in_array( $action, array( 'run_snippet_v2', 'apply_snippet_v2', 'remove_snippet_v2' ), true ) ) {
+            // phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized -- JSON request body, length-capped and strictly validated by json_decode; sanitizing would corrupt it.
             $raw_request = isset( $_POST['request'] ) && is_string( $_POST['request'] ) ? wp_unslash( $_POST['request'] ) : '';
             $request     = 70000 >= strlen( $raw_request ) ? json_decode( $raw_request, true ) : null;
             MainWP_Helper::write( $this->snippet_v2( $action, $request ) );
@@ -716,7 +718,12 @@ class MainWP_Child_Misc {
         return array_merge( array( 'request_ref' => $request['request_ref'] ), $result );
     }
 
-    /** @return array<string,mixed> */
+    /**
+     * Build the failure response for a Code Snippets v2 request.
+     *
+     * @param string $code Error code, replaced with storage_failed when unrecognised.
+     * @return array<string,mixed>
+     */
     private function snippet_v2_error( $code ) {
         $allowed = array( 'invalid_request', 'lock_busy', 'execution_failed', 'storage_failed' );
         return array(
@@ -725,42 +732,83 @@ class MainWP_Child_Misc {
         );
     }
 
-    /** @return bool */
+    /**
+     * Whether a value is a well-formed request reference UUID.
+     *
+     * @param mixed $value Value to check.
+     * @return bool
+     */
     private function snippet_v2_valid_request_ref( $value ) {
         return is_string( $value ) && 1 === preg_match( '/^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/D', $value );
     }
 
-    /** @return bool */
+    /**
+     * Whether a value is an accepted snippet slug.
+     *
+     * @param mixed $value Value to check.
+     * @return bool
+     */
     private function snippet_v2_valid_slug( $value ) {
         return is_string( $value ) && 1 === preg_match( '/^[A-Za-z0-9]{1,32}$/D', $value );
     }
 
-    /** @return bool */
+    /**
+     * Whether a value is snippet code within the accepted size and encoding.
+     *
+     * @param mixed $value Value to check.
+     * @return bool
+     */
     private function snippet_v2_valid_code( $value ) {
         return is_string( $value ) && '' !== $value && 60000 >= strlen( $value ) && wp_check_invalid_utf8( $value ) === $value;
     }
 
-    /** @return int */
+    /**
+     * Current Unix timestamp, overridable in tests.
+     *
+     * @return int
+     */
     protected function snippet_v2_now() {
         return time();
     }
 
-    /** @return mixed */
+    /**
+     * Read an option, overridable in tests.
+     *
+     * @param string $name     Option name.
+     * @param mixed  $fallback Value returned when the option is absent.
+     * @return mixed
+     */
     protected function snippet_v2_get_option( $name, $fallback = false ) {
         return get_option( $name, $fallback );
     }
 
-    /** @return bool */
+    /**
+     * Write an option, treating an unchanged stored value as success.
+     *
+     * @param string $name  Option name.
+     * @param mixed  $value Value to store.
+     * @return bool
+     */
     protected function snippet_v2_update_option( $name, $value ) {
         return update_option( $name, $value ) || get_option( $name, null ) === $value;
     }
 
-    /** @return bool */
+    /**
+     * Delete an option, treating an already absent option as success.
+     *
+     * @param string $name Option name.
+     * @return bool
+     */
     protected function snippet_v2_delete_option( $name ) {
         return delete_option( $name ) || false === get_option( $name, false );
     }
 
-    /** @return string|false */
+    /**
+     * Take the per-slug write lock, clearing an expired one first.
+     *
+     * @param string $slug Snippet slug.
+     * @return string|false Lock owner token, or false when the lock is held.
+     */
     protected function snippet_v2_acquire_lock( $slug ) {
         $name  = 'mainwp_cs_v2_lock_' . hash( 'sha256', $slug );
         $now   = $this->snippet_v2_now();
@@ -783,14 +831,25 @@ class MainWP_Child_Misc {
         return $owner;
     }
 
-    /** @return bool */
+    /**
+     * Release the per-slug write lock held by this owner token.
+     *
+     * @param string $slug  Snippet slug.
+     * @param string $owner Lock owner token.
+     * @return bool
+     */
     protected function snippet_v2_release_lock( $slug, $owner ) {
         $name = 'mainwp_cs_v2_lock_' . hash( 'sha256', $slug );
         $lock = $this->snippet_v2_get_option( $name, false );
         return is_array( $lock ) && isset( $lock['owner'] ) && is_string( $lock['owner'] ) && hash_equals( $lock['owner'], $owner ) && $this->snippet_v2_delete_option( $name );
     }
 
-    /** @return array<string,mixed> */
+    /**
+     * Run snippet code once and report the execution outcome.
+     *
+     * @param array $request Validated request.
+     * @return array<string,mixed>
+     */
     private function snippet_v2_run( $request ) {
         $execution = $this->snippet_v2_execute_code( $request['code'] );
         if ( ! is_array( $execution ) || ! isset( $execution['status'], $execution['output'], $execution['output_truncated'] ) ) {
@@ -805,7 +864,12 @@ class MainWP_Child_Misc {
         );
     }
 
-    /** @return array<string,mixed> */
+    /**
+     * Evaluate snippet code with buffered, truncated output capture.
+     *
+     * @param string $code Snippet code.
+     * @return array<string,mixed>
+     */
     protected function snippet_v2_execute_code( $code ) {
         $level = ob_get_level();
         ob_start();
@@ -832,7 +896,14 @@ class MainWP_Child_Misc {
         );
     }
 
-    /** @return array<string,mixed> */
+    /**
+     * Install snippet code into option storage or wp-config.php.
+     *
+     * @param string $slug Snippet slug.
+     * @param string $type Snippet type, S for option storage.
+     * @param string $code Snippet code.
+     * @return array<string,mixed>
+     */
     private function snippet_v2_apply( $slug, $type, $code ) {
         if ( 'S' === $type ) {
             $before  = $this->snippet_v2_get_option( 'mainwp_ext_code_snippets', array() );
@@ -861,7 +932,13 @@ class MainWP_Child_Misc {
         return $this->snippet_v2_config_change( 'apply', $slug, $code );
     }
 
-    /** @return array<string,mixed> */
+    /**
+     * Remove a snippet from option storage or wp-config.php.
+     *
+     * @param string $slug Snippet slug.
+     * @param string $type Snippet type, S for option storage.
+     * @return array<string,mixed>
+     */
     private function snippet_v2_remove( $slug, $type ) {
         if ( 'S' === $type ) {
             $before = $this->snippet_v2_get_option( 'mainwp_ext_code_snippets', array() );
@@ -888,7 +965,11 @@ class MainWP_Child_Misc {
         return $this->snippet_v2_config_change( 'remove', $slug, '' );
     }
 
-    /** @return string|false */
+    /**
+     * Locate the wp-config.php this install actually loads.
+     *
+     * @return string|false
+     */
     protected function snippet_v2_config_path() {
         if ( file_exists( ABSPATH . 'wp-config.php' ) ) {
             return ABSPATH . 'wp-config.php';
@@ -897,7 +978,14 @@ class MainWP_Child_Misc {
         return file_exists( $parent ) && ! file_exists( dirname( ABSPATH ) . '/wp-settings.php' ) ? $parent : false;
     }
 
-    /** @return array<string,mixed> */
+    /**
+     * Rewrite the slug's delimited block in wp-config.php.
+     *
+     * @param string $operation Either apply or remove.
+     * @param string $slug      Snippet slug.
+     * @param string $code      Snippet code, empty when removing.
+     * @return array<string,mixed>
+     */
     private function snippet_v2_config_change( $operation, $slug, $code ) {
         $path = $this->snippet_v2_config_path();
         if ( false === $path ) {
@@ -955,12 +1043,26 @@ class MainWP_Child_Misc {
         );
     }
 
-    /** @return string|false */
+    // phpcs:disable WordPress.WP.AlternativeFunctions -- wp-config.php snippet writes need flock, a same-filesystem rename, and byte-exact readback; WP_Filesystem offers none of these.
+
+    /**
+     * Read a file whole, overridable in tests.
+     *
+     * @param string $path File path.
+     * @return string|false
+     */
     protected function snippet_v2_read_file( $path ) {
         return file_get_contents( $path );
     }
 
-    /** @return bool */
+    /**
+     * Replace a file's contents only while it still matches the expected bytes.
+     *
+     * @param string $path     File path.
+     * @param string $expected Contents the caller read before editing.
+     * @param string $next     Contents to write.
+     * @return bool
+     */
     protected function snippet_v2_write_file_atomic( $path, $expected, $next ) {
         $handle = fopen( $path, 'c+' );
         if ( false === $handle || ! flock( $handle, LOCK_EX ) ) {
@@ -1032,6 +1134,8 @@ class MainWP_Child_Misc {
         }
         return $staged;
     }
+
+    // phpcs:enable WordPress.WP.AlternativeFunctions
 
     /**
      * Method snippet_save_snippet()

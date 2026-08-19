@@ -1434,8 +1434,10 @@ class MainWP_Child_Timecapsule { //phpcs:ignore -- NOSONAR - multi methods.
      * @return array Action result.
      */
     public function get_logs_rows() {
-        $result                 = $this->prepare_items();
-        $result['display_rows'] = base64_encode( wp_json_encode( $this->get_display_rows( $result['items'] ) ) ); // phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions -- base64_encode required for the backwards compatibility.
+        $result = $this->prepare_items();
+        // phpcs:disable WordPress.PHP.DiscouragedPHPFunctions.obfuscation_base64_encode -- transport encoding the legacy WPTC log payload expects, not obfuscation.
+        $result['display_rows'] = base64_encode( wp_json_encode( $this->get_display_rows( $result['items'] ) ) );
+        // phpcs:enable WordPress.PHP.DiscouragedPHPFunctions.obfuscation_base64_encode
         return $result;
     }
 
@@ -1942,8 +1944,10 @@ class MainWP_Child_Timecapsule { //phpcs:ignore -- NOSONAR - multi methods.
         $config  = \WPTC_Base_Factory::get( 'Wptc_InitialSetup_Config' );
         $options = \WPTC_Factory::get( 'config' );
 
-        $config->set_option( 'wptc_main_acc_email_temp', base64_encode( $email ) ); // phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions -- base64_encode function is used for http encode compatible..
-        $config->set_option( 'wptc_main_acc_pwd_temp', base64_encode( md5( trim( wp_unslash( $pwd ) ) ) ) ); // phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions -- NOSONAR - compatible, base64_encode function is used for http encode compatible..
+        // phpcs:disable WordPress.PHP.DiscouragedPHPFunctions.obfuscation_base64_encode -- transport encoding the WPTC service expects, not obfuscation.
+        $config->set_option( 'wptc_main_acc_email_temp', base64_encode( $email ) );
+        $config->set_option( 'wptc_main_acc_pwd_temp', base64_encode( md5( trim( wp_unslash( $pwd ) ) ) ) ); // NOSONAR - compatible.
+        // phpcs:enable WordPress.PHP.DiscouragedPHPFunctions.obfuscation_base64_encode
         $config->set_option( 'wptc_token', false );
 
         $cust_info = $options->request_service(
@@ -2158,12 +2162,14 @@ class MainWP_Child_Timecapsule { //phpcs:ignore -- NOSONAR - multi methods.
 
         $config = \WPTC_Factory::get( 'config' );
 
+        // phpcs:disable WordPress.PHP.DiscouragedPHPFunctions.obfuscation_base64_encode -- transport encoding the WPTC service expects, not obfuscation.
         $email         = trim( $config->get_option( 'main_account_email', true ) );
         $emailhash     = md5( $email ); // NOSONAR - 3rd compatible.
-        $email_encoded = base64_encode( $email ); // phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions -- Required for backwards compatibility.
+        $email_encoded = base64_encode( $email );
 
         $pwd         = trim( $config->get_option( 'main_account_pwd', true ) );
-        $pwd_encoded = base64_encode( $pwd ); // phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions -- Required for backwards compatibility.
+        $pwd_encoded = base64_encode( $pwd );
+        // phpcs:enable WordPress.PHP.DiscouragedPHPFunctions.obfuscation_base64_encode
 
         if ( empty( $email ) || empty( $pwd ) ) {
             return false;

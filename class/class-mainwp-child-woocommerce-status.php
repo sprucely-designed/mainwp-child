@@ -1201,6 +1201,7 @@ class MainWP_Child_WooCommerce_Status {
         // If cache miss, execute the query and cache result.
         if ( false === $sales ) {
             $sales = $wpdb->get_var( //phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+                // phpcs:disable WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber -- IN() list is array_fill('%s') placeholders; every value goes through prepare().
                 $wpdb->prepare(
                     "SELECT SUM( postmeta.meta_value ) FROM {$wpdb->posts} as posts
                     LEFT JOIN {$wpdb->term_relationships} AS rel ON posts.ID=rel.object_ID
@@ -1217,6 +1218,7 @@ class MainWP_Child_WooCommerce_Status {
                     array_merge( $safe_statuses, array( $month_start, $month_end ) )
                 )
             );
+            // phpcs:enable WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber
 
             wp_cache_set( $cache_key, $sales, 'mainwp_woocommerce', HOUR_IN_SECONDS );
         }
@@ -1230,6 +1232,7 @@ class MainWP_Child_WooCommerce_Status {
         // If cache miss, execute the query and cache result.
         if ( false === $top_seller ) {
             $top_seller = $wpdb->get_row( //phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+                // phpcs:disable WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber -- IN() list is array_fill('%s') placeholders; every value goes through prepare().
                 $wpdb->prepare(
                     "SELECT SUM( order_item_meta.meta_value ) as qty, order_item_meta_2.meta_value as product_id
                     FROM {$wpdb->posts} as posts
@@ -1253,6 +1256,7 @@ class MainWP_Child_WooCommerce_Status {
                     array_merge( $safe_statuses, array( $month_start, $month_end ) )
                 )
             );
+            // phpcs:enable WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber
 
             wp_cache_set( $cache_key_top, $top_seller, 'mainwp_woocommerce', HOUR_IN_SECONDS );
         }
@@ -1291,7 +1295,7 @@ class MainWP_Child_WooCommerce_Status {
 
         if ( $include_last_7_days_sales ) {
             $data['sales_report_mode'] = 'legacy';
-            $data = $this->add_last_7_days_sales( $data, false );
+            $data                      = $this->add_last_7_days_sales( $data, false );
         }
 
         $data = apply_filters( 'mainwp_child_woocom_sync_data', $data );
@@ -1353,6 +1357,7 @@ class MainWP_Child_WooCommerce_Status {
         // If cache miss, execute the query and cache result.
         if ( false === $sales ) {
             $sales = $wpdb->get_var( //phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+                // phpcs:disable WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber -- IN() list is array_fill('%s') placeholders; every value goes through prepare().
                 $wpdb->prepare(
                     "SELECT SUM( postmeta.meta_value ) FROM {$wpdb->posts} as posts
                     LEFT JOIN {$wpdb->term_relationships} AS rel ON posts.ID=rel.object_ID
@@ -1369,6 +1374,7 @@ class MainWP_Child_WooCommerce_Status {
                     array_merge( $safe_statuses, array( $start_date, $end_date ) )
                 )
             );
+            // phpcs:enable WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber
 
             wp_cache_set( $cache_key, $sales, 'mainwp_woocommerce', HOUR_IN_SECONDS );
         }
@@ -1382,6 +1388,7 @@ class MainWP_Child_WooCommerce_Status {
         // If cache miss, execute the query and cache result.
         if ( false === $top_seller ) {
             $top_seller = $wpdb->get_row( //phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+                // phpcs:disable WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber -- IN() list is array_fill('%s') placeholders; every value goes through prepare().
                 $wpdb->prepare(
                     "SELECT SUM( order_item_meta.meta_value ) as qty, order_item_meta_2.meta_value as product_id
                     FROM {$wpdb->posts} as posts
@@ -1405,6 +1412,7 @@ class MainWP_Child_WooCommerce_Status {
                     array_merge( $safe_statuses, array( $start_date, $end_date ) )
                 )
             );
+            // phpcs:enable WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber
 
             wp_cache_set( $cache_key_top, $top_seller, 'mainwp_woocommerce', HOUR_IN_SECONDS );
         }
@@ -1561,6 +1569,7 @@ class MainWP_Child_WooCommerce_Status {
 
         if ( false === $sales ) {
             $sales = $wpdb->get_var( //phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+                // phpcs:disable WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber -- IN() list is array_fill('%s') placeholders; every value goes through prepare().
                 $wpdb->prepare(
                     "SELECT SUM( postmeta.meta_value ) FROM {$wpdb->posts} as posts
                     LEFT JOIN {$wpdb->term_relationships} AS rel ON posts.ID=rel.object_ID
@@ -1577,6 +1586,7 @@ class MainWP_Child_WooCommerce_Status {
                     array_merge( $safe_statuses, array( $start_date, $end_date ) )
                 )
             );
+            // phpcs:enable WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber
 
             wp_cache_set( $cache_key, $sales, 'mainwp_woocommerce', HOUR_IN_SECONDS );
         }

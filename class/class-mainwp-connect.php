@@ -304,7 +304,8 @@ class MainWP_Connect { //phpcs:ignore -- NOSONAR - multi methods.
             return $is_valid_pwd ? true : false;
         }
 
-        $is_dash_version_older_than_ver53 = empty( $_POST['mainwpver'] ) || version_compare( $_POST['mainwpver'], '5.3', '<' ) ? true : false;
+        $mainwp_ver                       = isset( $_POST['mainwpver'] ) ? sanitize_text_field( wp_unslash( $_POST['mainwpver'] ) ) : '';
+        $is_dash_version_older_than_ver53 = empty( $mainwp_ver ) || version_compare( $mainwp_ver, '5.3', '<' ) ? true : false;
 
         if ( empty( $reg_verify ) && $is_dash_version_older_than_ver53 ) {
             MainWP_Helper::instance()->error( esc_html__( 'Your current MainWP Dashboard version is not compatible with the new connection protocol. To add a site using Password Authentication, please update the MainWP Dashboard to the latest version.', 'mainwp-child' ), 'REG_ERROR10' );
@@ -363,7 +364,8 @@ class MainWP_Connect { //phpcs:ignore -- NOSONAR - multi methods.
      */
     private function may_be_generate_register_verify() { // phpcs:ignore -- NOSONAR - Current complexity is the only way to achieve desired results, pull request solutions appreciated.
         //phpcs:disable WordPress.Security.NonceVerification
-        $is_dash_version_older_than_ver53 = empty( $_POST['mainwpver'] ) || version_compare( $_POST['mainwpver'], '5.3', '<' ) ? true : false;
+        $mainwp_ver                       = isset( $_POST['mainwpver'] ) ? sanitize_text_field( wp_unslash( $_POST['mainwpver'] ) ) : '';
+        $is_dash_version_older_than_ver53 = empty( $mainwp_ver ) || version_compare( $mainwp_ver, '5.3', '<' ) ? true : false;
 
         if ( $is_dash_version_older_than_ver53 ) {
             return false; // not genereate verify registers for dashboard version before 5.2.
@@ -657,7 +659,7 @@ class MainWP_Connect { //phpcs:ignore -- NOSONAR - multi methods.
      * @param bool   $exit_error Wether exit error.
      * @param bool   $check_login_required Wether check login requires request.
      *
-     * @return void
+     * @return string|void Error message when $exit_error is false, otherwise the request is terminated.
      */
     public static function handle_signature_error( $error_code, $exit_error = true, $check_login_required = true ) {
         $err_msg = '';
@@ -1355,6 +1357,13 @@ class MainWP_Connect { //phpcs:ignore -- NOSONAR - multi methods.
         }
     }
 
+    /**
+     * Method destroy_user_session()
+     *
+     * End the current session and clear its auth cookies.
+     *
+     * @return void
+     */
     private function destroy_user_session() {
         wp_destroy_current_session();
         wp_clear_auth_cookie();

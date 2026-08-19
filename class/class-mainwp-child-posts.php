@@ -292,7 +292,18 @@ class MainWP_Child_Posts { //phpcs:ignore -- NOSONAR - multi methods.
             return $this->posts_v2_error( 'invalid_request' );
         }
 
-        $generation = hash( 'sha256', wp_json_encode( array_diff_key( $query, array( 'cursor' => true, 'offset' => true ) ) ) );
+        $generation = hash(
+            'sha256',
+            wp_json_encode(
+                array_diff_key(
+                    $query,
+                    array(
+                        'cursor' => true,
+                        'offset' => true,
+                    )
+                )
+            )
+        );
         $offset     = 0;
         if ( null !== $query['cursor'] ) {
             $offset = $this->posts_v2_cursor_offset( $query['cursor'], $generation );
@@ -466,7 +477,7 @@ class MainWP_Child_Posts { //phpcs:ignore -- NOSONAR - multi methods.
         }
         sort( $categories, SORT_STRING );
         sort( $tags, SORT_STRING );
-        $post = array(
+        $post          = array(
             'post_type'      => $source->post_type,
             'status'         => in_array( $source->post_status, array( 'draft', 'publish' ), true ) ? $source->post_status : 'draft',
             'title'          => $source->post_title,
@@ -511,9 +522,9 @@ class MainWP_Child_Posts { //phpcs:ignore -- NOSONAR - multi methods.
             $compatibility = 'unsupported_meta';
         }
 
-        $content_digest = hash( 'sha256', wp_json_encode( array( $post, $randomization ) ) );
-        $source_ref     = hash_hmac( 'sha256', 'post-plus-source-v1|' . $source->ID . '|' . $source->post_type, wp_salt( 'auth' ) );
-        $response       = array(
+        $content_digest              = hash( 'sha256', wp_json_encode( array( $post, $randomization ) ) );
+        $source_ref                  = hash_hmac( 'sha256', 'post-plus-source-v1|' . $source->ID . '|' . $source->post_type, wp_salt( 'auth' ) );
+        $response                    = array(
             'protocol'        => '2',
             'operation'       => $operation,
             'complete'        => true,
@@ -523,7 +534,12 @@ class MainWP_Child_Posts { //phpcs:ignore -- NOSONAR - multi methods.
             'title'           => $source->post_title,
             'content_digest'  => $content_digest,
             'compatibility'   => $compatibility,
-            'private_context' => wp_json_encode( array( 'post' => $post, 'randomization' => $randomization ) ),
+            'private_context' => wp_json_encode(
+                array(
+                    'post'          => $post,
+                    'randomization' => $randomization,
+                )
+            ),
         );
         $response['source_revision'] = hash( 'sha256', wp_json_encode( $response ) );
         return $response;
@@ -1444,7 +1460,7 @@ class MainWP_Child_Posts { //phpcs:ignore -- NOSONAR - multi methods.
         if ( ! $this->posts_v2_enum_list( $query['post_types'], array( 'post', 'page' ), 2 ) || ! $this->posts_v2_enum_list( $query['statuses'], array( 'publish', 'private', 'draft', 'pending', 'future', 'trash' ), 6 ) || ! is_int( $query['page_size'] ) || 1 > $query['page_size'] || 100 < $query['page_size'] || ( null !== $query['cursor'] && ( ! is_string( $query['cursor'] ) || 80 < strlen( $query['cursor'] ) ) ) ) {
             return false;
         }
-        if ( null !== $query['keyword'] && ( ! is_string( $query['keyword'] ) || 200 < $this->posts_v2_length( $query['keyword'] ) || $query['keyword'] !== wp_check_invalid_utf8( $query['keyword'] ) ) ) {
+        if ( null !== $query['keyword'] && ( ! is_string( $query['keyword'] ) || 200 < $this->posts_v2_length( $query['keyword'] ) || wp_check_invalid_utf8( $query['keyword'] ) !== $query['keyword'] ) ) {
             return false;
         }
         if ( ! $this->posts_v2_nullable_positive_integer( $query['post_id'] ) || ! $this->posts_v2_nullable_positive_integer( $query['author_id'] ) || ( null !== $query['post_id'] && null !== $query['author_id'] ) ) {
@@ -1519,7 +1535,7 @@ class MainWP_Child_Posts { //phpcs:ignore -- NOSONAR - multi methods.
      */
     private function posts_v2_cursor( $offset, $generation ) {
         $mac = hash_hmac( 'sha256', $generation . ':' . $offset, wp_salt( 'auth' ), true );
-        return $offset . '.' . rtrim( strtr( base64_encode( $mac ), '+/', '-_' ), '=' );
+        return $offset . '.' . rtrim( strtr( base64_encode( $mac ), '+/', '-_' ), '=' ); // phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions.obfuscation_base64_encode -- base64url-encodes an HMAC for the cursor, not code.
     }
 
     /**
@@ -1538,7 +1554,14 @@ class MainWP_Child_Posts { //phpcs:ignore -- NOSONAR - multi methods.
         return 10000 >= $offset && hash_equals( $expected, $cursor ) ? $offset : false;
     }
 
-    /** @return bool */
+    /**
+     * Whether a list holds unique values drawn only from the allowed set.
+     *
+     * @param mixed $values  Values to check.
+     * @param array $allowed Allowed values.
+     * @param int   $maximum Maximum number of values.
+     * @return bool
+     */
     private function posts_v2_enum_list( $values, $allowed, $maximum ) {
         if ( ! is_array( $values ) || empty( $values ) || $maximum < count( $values ) || count( $values ) !== count( array_unique( $values, SORT_REGULAR ) ) ) {
             return false;
@@ -1551,12 +1574,22 @@ class MainWP_Child_Posts { //phpcs:ignore -- NOSONAR - multi methods.
         return true;
     }
 
-    /** @return bool */
+    /**
+     * Whether a value is null or a positive integer.
+     *
+     * @param mixed $value Value to check.
+     * @return bool
+     */
     private function posts_v2_nullable_positive_integer( $value ) {
         return null === $value || ( is_int( $value ) && 1 <= $value );
     }
 
-    /** @return bool */
+    /**
+     * Whether a value is null or a real calendar date in Y-m-d form.
+     *
+     * @param mixed $value Value to check.
+     * @return bool
+     */
     private function posts_v2_date( $value ) {
         if ( null === $value ) {
             return true;
@@ -1568,17 +1601,34 @@ class MainWP_Child_Posts { //phpcs:ignore -- NOSONAR - multi methods.
         return checkdate( $parts[1], $parts[2], $parts[0] );
     }
 
-    /** @return int */
+    /**
+     * Character length of a string, falling back to bytes without mbstring.
+     *
+     * @param string $value String to measure.
+     * @return int
+     */
     private function posts_v2_length( $value ) {
         return function_exists( 'mb_strlen' ) ? mb_strlen( $value, 'UTF-8' ) : strlen( $value );
     }
 
-    /** @return string|false */
+    /**
+     * Accept a UTF-8 string no longer than the given character limit.
+     *
+     * @param mixed $value   Value to check.
+     * @param int   $maximum Maximum length in characters.
+     * @return string|false
+     */
     private function posts_v2_string( $value, $maximum ) {
-        return is_string( $value ) && $value === wp_check_invalid_utf8( $value ) && $maximum >= $this->posts_v2_length( $value ) ? $value : false;
+        return is_string( $value ) && wp_check_invalid_utf8( $value ) === $value && $maximum >= $this->posts_v2_length( $value ) ? $value : false;
     }
 
-    /** @return bool */
+    /**
+     * Whether an array holds exactly the given keys, no more and no fewer.
+     *
+     * @param mixed $value Value to inspect.
+     * @param array $keys  Required keys.
+     * @return bool
+     */
     private function posts_v2_exact_keys( $value, $keys ) {
         if ( ! is_array( $value ) ) {
             return false;
@@ -1589,7 +1639,12 @@ class MainWP_Child_Posts { //phpcs:ignore -- NOSONAR - multi methods.
         return $actual === $keys;
     }
 
-    /** @return array */
+    /**
+     * Build a closed get_all_posts_v2 protocol error.
+     *
+     * @param string $code Stable error code.
+     * @return array
+     */
     private function posts_v2_error( $code ) {
         return array(
             'protocol'  => '2',
@@ -1842,7 +1897,6 @@ class MainWP_Child_Posts { //phpcs:ignore -- NOSONAR - multi methods.
             if ( ! $delete_result['deleted'] && ! $delete_result['already_absent'] ) {
                 $information['status'] = 'FAIL';
             }
-
         } elseif ( 'restore' === $action ) {
             wp_untrash_post( $postId );
         } elseif ( 'update_meta' === $action ) {
@@ -2208,7 +2262,7 @@ class MainWP_Child_Posts { //phpcs:ignore -- NOSONAR - multi methods.
         if ( $edit_post_id ) {
             $user_id = wp_check_post_lock( $edit_post_id );
             if ( $user_id ) {
-                $user  = get_userdata( $user_id );
+                $user = get_userdata( $user_id );
                 // translators: %s: User display name.
                 $error = sprintf( esc_html__( 'This content is currently locked. %s is currently editing.', 'mainwp-child' ), $user->display_name );
                 return array( 'error' => $error );

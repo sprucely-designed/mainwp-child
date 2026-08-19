@@ -698,24 +698,24 @@ class MainWP_Child_Staging { //phpcs:ignore -- NOSONAR - multi methods.
      * Build an internal clone binding and bounded public facts.
      *
      * @param string $clone_key Provider clone key.
-     * @param array  $clone Provider clone metadata.
+     * @param array  $clone_data Provider clone metadata.
      * @return array|false
      */
-    private function abilities_v2_clone_identity( $clone_key, $clone ) {
+    private function abilities_v2_clone_identity( $clone_key, $clone_data ) {
         foreach ( array( 'directoryName', 'path', 'url' ) as $required ) {
-            if ( ! isset( $clone[ $required ] ) || ! is_string( $clone[ $required ] ) || '' === $clone[ $required ] || 4096 < strlen( $clone[ $required ] ) || false !== strpos( $clone[ $required ], "\0" ) ) {
+            if ( ! isset( $clone_data[ $required ] ) || ! is_string( $clone_data[ $required ] ) || '' === $clone_data[ $required ] || 4096 < strlen( $clone_data[ $required ] ) || false !== strpos( $clone_data[ $required ], "\0" ) ) {
                 return false;
             }
         }
 
         $real_root  = realpath( ABSPATH );
-        $clone_path = realpath( $clone['path'] );
+        $clone_path = realpath( $clone_data['path'] );
         if ( false === $real_root || false === $clone_path || $clone_path === $real_root || 0 !== strpos( trailingslashit( $clone_path ), trailingslashit( $real_root ) ) ) {
             return false;
         }
 
-        $created_at = $this->abilities_v2_optional_time( isset( $clone['createdAt'] ) ? $clone['createdAt'] : null );
-        $updated_at = $this->abilities_v2_optional_time( isset( $clone['updatedAt'] ) ? $clone['updatedAt'] : null );
+        $created_at = $this->abilities_v2_optional_time( isset( $clone_data['createdAt'] ) ? $clone_data['createdAt'] : null );
+        $updated_at = $this->abilities_v2_optional_time( isset( $clone_data['updatedAt'] ) ? $clone_data['updatedAt'] : null );
         if ( false === $created_at || false === $updated_at ) {
             return false;
         }
@@ -723,10 +723,10 @@ class MainWP_Child_Staging { //phpcs:ignore -- NOSONAR - multi methods.
         $binding = wp_json_encode(
             array(
                 'clone_key'    => $clone_key,
-                'directory'    => $clone['directoryName'],
+                'directory'    => $clone_data['directoryName'],
                 'path'         => $clone_path,
-                'url'          => $clone['url'],
-                'db_prefix'    => isset( $clone['databasePrefix'] ) && is_string( $clone['databasePrefix'] ) ? $clone['databasePrefix'] : '',
+                'url'          => $clone_data['url'],
+                'db_prefix'    => isset( $clone_data['databasePrefix'] ) && is_string( $clone_data['databasePrefix'] ) ? $clone_data['databasePrefix'] : '',
                 'wpstg_version' => $this->abilities_v2_plugin_version(),
             )
         );
@@ -736,9 +736,9 @@ class MainWP_Child_Staging { //phpcs:ignore -- NOSONAR - multi methods.
 
         return array(
             'binding'                      => $binding,
-            'isolated'                     => ! empty( $clone['isolated'] ),
-            'search_index_blocked'         => ! empty( $clone['searchIndexBlocked'] ),
-            'outbound_side_effects_blocked' => ! empty( $clone['outboundSideEffectsBlocked'] ),
+            'isolated'                     => ! empty( $clone_data['isolated'] ),
+            'search_index_blocked'         => ! empty( $clone_data['searchIndexBlocked'] ),
+            'outbound_side_effects_blocked' => ! empty( $clone_data['outboundSideEffectsBlocked'] ),
             'created_at'                   => $created_at,
             'updated_at'                   => $updated_at,
         );
@@ -930,9 +930,9 @@ class MainWP_Child_Staging { //phpcs:ignore -- NOSONAR - multi methods.
         return gmdate( 'c', strtotime( $value ) );
     }
 
-    /** @param array $settings Settings. @param string $key Key. @param int $minimum Minimum. @param int $maximum Maximum. @param int $default Default. @return int */
-    private function abilities_v2_bounded_int( $settings, $key, $minimum, $maximum, $default ) {
-        $value = isset( $settings[ $key ] ) && is_numeric( $settings[ $key ] ) ? (int) $settings[ $key ] : $default;
+    /** @param array $settings Settings. @param string $key Key. @param int $minimum Minimum. @param int $maximum Maximum. @param int $default_value Default. @return int */
+    private function abilities_v2_bounded_int( $settings, $key, $minimum, $maximum, $default_value ) {
+        $value = isset( $settings[ $key ] ) && is_numeric( $settings[ $key ] ) ? (int) $settings[ $key ] : $default_value;
         return max( $minimum, min( $maximum, $value ) );
     }
 

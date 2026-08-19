@@ -1092,7 +1092,7 @@ class MainWP_Child_WP_Rocket {//phpcs:ignore -- NOSONAR - multi methods.
         if ( 'optimize_database' !== $operation || ! $this->abilities_v2_exact_keys( $request, array( 'protocol', 'operation', 'request_ref', 'payload' ) ) ) {
             return $this->abilities_v2_error( $operation );
         }
-        if ( ! is_string( $request['request_ref'] ) || 1 !== preg_match( '/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/D', $request['request_ref'] ) ) {
+        if ( ! $this->abilities_v2_valid_request_ref( $request['request_ref'] ) ) {
             return $this->abilities_v2_error( $operation );
         }
         if ( ! is_array( $request['payload'] ) || ! $this->abilities_v2_exact_keys( $request['payload'], array( 'categories' ) ) ) {
@@ -1141,10 +1141,15 @@ class MainWP_Child_WP_Rocket {//phpcs:ignore -- NOSONAR - multi methods.
         }
         if ( isset( $receipts[ $request_ref ] ) ) {
             $receipt = $receipts[ $request_ref ];
-            if ( ! is_array( $receipt ) || ! $this->abilities_v2_exact_keys( $receipt, array( 'effect_hash', 'response', 'accepted_at' ) ) || ! is_string( $receipt['effect_hash'] ) || ! $this->abilities_v2_valid_receipt_response( $receipt['response'] ) ) {
+            if ( ! $this->abilities_v2_valid_receipt( $receipt ) ) {
                 return $this->abilities_v2_error( $operation, 'storage_unavailable' );
             }
-            return hash_equals( $receipt['effect_hash'], $effect_hash ) ? $receipt['response'] : $this->abilities_v2_error( $operation, 'request_conflict' );
+            if ( ! hash_equals( $receipt['effect_hash'], $effect_hash ) ) {
+                return $this->abilities_v2_error( $operation, 'request_conflict' );
+            }
+            // A reservation nobody settled belongs to a request that reached WP Rocket's queue and
+            // then lost its answer. Running it again would optimize twice, so the outcome is unknown.
+            return 'dispatching' === $receipt['state'] ? $this->abilities_v2_error( $operation, 'outcome_unknown' ) : $receipt['response'];
         }
 
         // The request is well formed, so a missing WP Rocket is refused for what it is rather than blamed on the payload.
@@ -1159,6 +1164,36 @@ class MainWP_Child_WP_Rocket {//phpcs:ignore -- NOSONAR - multi methods.
             return $this->abilities_v2_error( $operation, 'storage_unavailable' );
         }
 
+        // The reservation is durable before the provider runs, not after it. An interrupted request
+        // that already queued the work must leave something behind for its retry to land on.
+        $receipts[ $request_ref ] = array(
+            'effect_hash' => $effect_hash,
+            'state'       => 'dispatching',
+            'response'    => null,
+            'accepted_at' => time(),
+        );
+        if ( ! $this->abilities_v2_store_receipts( $receipts ) ) {
+            return $this->abilities_v2_error( $operation, 'storage_unavailable' );
+        }
+
+        $response                             = $this->abilities_v2_dispatch_optimize_database( $provider_categories, $categories );
+        $receipts[ $request_ref ]['state']    = 'settled';
+        $receipts[ $request_ref ]['response'] = $response;
+        if ( ! $this->abilities_v2_store_receipts( $receipts ) ) {
+            return $this->abilities_v2_error( $operation, 'outcome_unknown' );
+        }
+        return $response;
+    }
+
+    /**
+     * Queue the optimization and turn the provider outcome into this request's settled answer.
+     *
+     * @param array $provider_categories WP Rocket category keys.
+     * @param array $categories Public category names.
+     * @return array Closed protocol result.
+     */
+    private function abilities_v2_dispatch_optimize_database( $provider_categories, $categories ) {
+        $operation = 'optimize_database';
         try {
             $result = $this->abilities_v2_provider_optimize_database( $provider_categories );
         } catch ( \Throwable $e ) {
@@ -1170,22 +1205,45 @@ class MainWP_Child_WP_Rocket {//phpcs:ignore -- NOSONAR - multi methods.
 
         // WP Rocket runs the categories on its own background queue and the Child never reads the outcome back,
         // so the only claim this response can support is that the request was accepted for processing.
-        $response                 = array(
+        return array(
             'protocol'   => '2',
-            'operation'  => 'optimize_database',
+            'operation'  => $operation,
             'ok'         => true,
             'status'     => 'requested',
             'categories' => $categories,
         );
-        $receipts[ $request_ref ] = array(
-            'effect_hash' => $effect_hash,
-            'response'    => $response,
-            'accepted_at' => time(),
-        );
-        if ( ! update_option( self::ABILITIES_V2_RECEIPTS_OPTION, $receipts, false ) && get_option( self::ABILITIES_V2_RECEIPTS_OPTION, array() ) !== $receipts ) {
-            return $this->abilities_v2_error( $operation, 'outcome_unknown' );
+    }
+
+    /**
+     * Persist the receipt store, treating an unchanged-value write as success.
+     *
+     * @param array $receipts Receipts to store.
+     * @return bool
+     */
+    private function abilities_v2_store_receipts( $receipts ) {
+        return update_option( self::ABILITIES_V2_RECEIPTS_OPTION, $receipts, false ) || get_option( self::ABILITIES_V2_RECEIPTS_OPTION, array() ) === $receipts;
+    }
+
+    /**
+     * Validate one stored receipt before anything is decided from it.
+     *
+     * The store is a WordPress option, so every entry is untrusted input: a malformed one may not
+     * be replayed as an answer, and it may not be treated as a receipt worth protecting either.
+     *
+     * @param mixed $receipt Stored receipt.
+     * @return bool
+     */
+    private function abilities_v2_valid_receipt( $receipt ) {
+        if ( ! is_array( $receipt ) || ! $this->abilities_v2_exact_keys( $receipt, array( 'effect_hash', 'state', 'response', 'accepted_at' ) ) ) {
+            return false;
         }
-        return $response;
+        if ( ! is_string( $receipt['effect_hash'] ) || 1 !== preg_match( '/^[0-9a-f]{64}$/D', $receipt['effect_hash'] ) || ! is_int( $receipt['accepted_at'] ) || 0 >= $receipt['accepted_at'] ) {
+            return false;
+        }
+        if ( 'dispatching' === $receipt['state'] ) {
+            return null === $receipt['response'];
+        }
+        return 'settled' === $receipt['state'] && $this->abilities_v2_valid_receipt_response( $receipt['response'] );
     }
 
     /**
@@ -1195,8 +1253,16 @@ class MainWP_Child_WP_Rocket {//phpcs:ignore -- NOSONAR - multi methods.
      * @return bool
      */
     private function abilities_v2_valid_receipt_response( $response ) {
-        return is_array( $response )
-            && array( 'protocol', 'operation', 'ok', 'status', 'categories' ) === array_keys( $response )
+        if ( ! is_array( $response ) ) {
+            return false;
+        }
+        if ( array( 'protocol', 'operation', 'ok', 'error_code' ) === array_keys( $response ) ) {
+            return '2' === $response['protocol']
+                && 'optimize_database' === $response['operation']
+                && false === $response['ok']
+                && 'provider_failed' === $response['error_code'];
+        }
+        return array( 'protocol', 'operation', 'ok', 'status', 'categories' ) === array_keys( $response )
             && '2' === $response['protocol']
             && 'optimize_database' === $response['operation']
             && true === $response['ok']
@@ -1205,11 +1271,23 @@ class MainWP_Child_WP_Rocket {//phpcs:ignore -- NOSONAR - multi methods.
     }
 
     /**
+     * Validate a UUID request reference.
+     *
+     * @param mixed $value Candidate reference.
+     * @return bool
+     */
+    private function abilities_v2_valid_request_ref( $value ) {
+        return is_string( $value ) && 1 === preg_match( '/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/D', $value );
+    }
+
+    /**
      * Free one receipt slot without discarding an outcome a retry could still ask for.
      *
-     * Only receipts older than any plausible Dashboard retry are dropped, oldest first. A store
-     * that cannot free a slot refuses the request instead of evicting a receipt whose reference
-     * would then queue the optimization a second time.
+     * Receipts older than any plausible Dashboard retry are dropped oldest first. An entry the
+     * Child can no longer read goes before those: it can only answer storage_unavailable on replay,
+     * so keeping it protects nothing while letting hand-edited or truncated option data hold the
+     * store shut for good. A store that still cannot free a slot refuses the request rather than
+     * evict a live receipt whose reference would then queue the optimization a second time.
      *
      * @param array $receipts Stored receipts.
      * @return array|false Receipts with room for one more, or false when no slot can be freed.
@@ -1221,7 +1299,11 @@ class MainWP_Child_WP_Rocket {//phpcs:ignore -- NOSONAR - multi methods.
         $horizon   = time() - ( DAY_IN_SECONDS + 60 );
         $evictable = array();
         foreach ( $receipts as $reference => $receipt ) {
-            if ( is_array( $receipt ) && isset( $receipt['accepted_at'] ) && is_int( $receipt['accepted_at'] ) && $receipt['accepted_at'] < $horizon ) {
+            if ( ! $this->abilities_v2_valid_request_ref( $reference ) || ! $this->abilities_v2_valid_receipt( $receipt ) ) {
+                $evictable[ $reference ] = 0;
+                continue;
+            }
+            if ( $receipt['accepted_at'] < $horizon ) {
                 $evictable[ $reference ] = $receipt['accepted_at'];
             }
         }

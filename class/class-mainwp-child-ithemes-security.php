@@ -505,10 +505,11 @@ class MainWP_Child_IThemes_Security { //phpcs:ignore -- NOSONAR - multi methods.
      * Free one receipt slot without ever dropping a receipt a retry could still land on.
      *
      * A receipt is the only thing between a repeated Dashboard request and a second dispatch of
-     * the same mutation, so age is the one safe reason to drop one: past the retry horizon the
-     * Dashboard has stopped asking. An accepted file scan is exempt from that at any age, because
-     * its receipt is also the handle the Dashboard polls for the result. When nothing has aged
-     * out, the caller refuses the mutation instead of forcing room, which is why this must run
+     * the same mutation, so among readable receipts age is the one safe reason to drop one: past
+     * the retry horizon the Dashboard has stopped asking. An accepted file scan is exempt from
+     * that at any age, because its receipt is also the handle the Dashboard polls for the result.
+     * Entries that are not readable receipts at all are dropped first at any age. When nothing can
+     * be freed, the caller refuses the mutation instead of forcing room, which is why this must run
      * before the effect and not after it.
      *
      * @param array $receipts Stored receipts.
@@ -523,14 +524,15 @@ class MainWP_Child_IThemes_Security { //phpcs:ignore -- NOSONAR - multi methods.
         $horizon    = time() - DAY_IN_SECONDS;
         $candidates = array();
         foreach ( $receipts as $ref => $receipt ) {
-            if ( $this->abilities_v2_receipt_awaits_completion( $receipt ) ) {
+            // Structure decides first. A receipt the Child can no longer read answers
+            // storage_unavailable on replay anyway, so protecting it protects nothing, while a
+            // hand-edited entry that merely looks like an open scan would otherwise hold the store
+            // shut for good. Corrupt entries go first, ahead of anything genuinely aged out.
+            if ( ! $this->abilities_v2_valid_stored_receipt( $ref, $receipt ) ) {
+                $candidates[ $ref ] = 0;
                 continue;
             }
-            if ( ! is_array( $receipt ) || ! isset( $receipt['created_at'] ) || ! is_int( $receipt['created_at'] ) ) {
-                // A receipt the Child can no longer read answers storage_unavailable on replay
-                // anyway, and treating it as immovable would let corrupt entries hold the store
-                // shut for good. It goes first.
-                $candidates[ $ref ] = 0;
+            if ( $this->abilities_v2_receipt_awaits_completion( $receipt ) ) {
                 continue;
             }
             if ( $receipt['created_at'] < $horizon ) {
@@ -547,6 +549,27 @@ class MainWP_Child_IThemes_Security { //phpcs:ignore -- NOSONAR - multi methods.
         }
 
         return $limit > count( $receipts ) ? $receipts : false;
+    }
+
+    /**
+     * Whether one stored entry is a receipt at all, before anything is decided from it.
+     *
+     * The store is a WordPress option, so every entry is untrusted input. This asks only what the
+     * entry is, not what it says: the key has to be the reference the receipt is filed under, and
+     * the recorded response has to be a response the Child would have written for that reference.
+     *
+     * @param mixed $ref     Stored key.
+     * @param mixed $receipt Stored receipt.
+     * @return bool
+     */
+    private function abilities_v2_valid_stored_receipt( $ref, $receipt ) {
+        if ( ! $this->abilities_v2_valid_request_ref( $ref ) || ! is_array( $receipt ) || ! $this->abilities_v2_exact_keys( $receipt, array( 'effect_hash', 'created_at', 'response' ) ) ) {
+            return false;
+        }
+        if ( ! $this->abilities_v2_valid_hash( $receipt['effect_hash'] ) || ! is_int( $receipt['created_at'] ) || ! is_array( $receipt['response'] ) || ! isset( $receipt['response']['operation'] ) || ! is_string( $receipt['response']['operation'] ) ) {
+            return false;
+        }
+        return $this->abilities_v2_valid_receipt_response( $receipt['response']['operation'], strtolower( $ref ), $receipt['response'] );
     }
 
     /**

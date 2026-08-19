@@ -233,9 +233,10 @@ class Test_MainWP_Child_File_Deployment_V2 extends WP_UnitTestCase {
 		$deploy                 = $this->deploy_request( $preflight, 'deployed bytes' );
 		$this->assertTrue( $subject->deploy_v2( $deploy )['ok'] );
 
-		// A deployment to another destination sweeps the store the moment this rollback reserves
-		// its own reference: the settled deployment is past retention and its backup is old.
-		$subject->prune_during_reservation = $deploy['payload']['request_ref'];
+		// A deployment to another destination sweeps the store between this rollback reading the
+		// deployment and holding anything: the settled deployment is past retention, its backup
+		// is old, and no marker binds either.
+		$subject->prune_before_reservation = $deploy['payload']['request_ref'];
 
 		$result = $subject->rollback_v2( $this->rollback_request( $deploy['payload']['request_ref'], hash( 'sha256', 'deployed bytes' ) ) );
 
@@ -246,6 +247,39 @@ class Test_MainWP_Child_File_Deployment_V2 extends WP_UnitTestCase {
 
 		$subject->clean_store();
 		wp_delete_file( WP_CONTENT_DIR . '/uploads/mainwp-prune-race.txt' );
+	}
+
+	/**
+	 * Rechecking the deployment cannot protect the backup on its own: a sweep running for another
+	 * destination decides what is still bound from a file list taken before this rollback reserved
+	 * anything, so it can drop the backup after the recheck passed and before the restore reads it.
+	 * The rollback holds the store shared for exactly that span, so the sweep cannot run at all.
+	 */
+	public function test_rollback_keeps_its_backup_from_a_sweep_that_lands_after_the_recheck() {
+		$target  = WP_CONTENT_DIR . '/uploads/mainwp-sweep-race.txt';
+		$subject = new Store_MainWP_Child_File_Deployment();
+		wp_mkdir_p( WP_CONTENT_DIR . '/uploads' );
+		file_put_contents( $target, 'prior bytes' ); // phpcs:ignore WordPress.WP.AlternativeFunctions -- Fixture byte placement.
+
+		$preflight = $this->preflight_request();
+		$preflight['payload']['relative_destination'] = 'wp-content/uploads/mainwp-sweep-race.txt';
+		$preflight                                    = $subject->preflight_v2( $preflight );
+		$this->assertTrue( $preflight['ok'] );
+
+		$subject->gateway_bytes = 'deployed bytes';
+		$deploy                 = $this->deploy_request( $preflight, 'deployed bytes' );
+		$this->assertTrue( $subject->deploy_v2( $deploy )['ok'] );
+
+		$subject->prune_before_restore = $deploy['payload']['request_ref'];
+
+		$result = $subject->rollback_v2( $this->rollback_request( $deploy['payload']['request_ref'], hash( 'sha256', 'deployed bytes' ) ) );
+
+		$this->assertTrue( $result['ok'], wp_json_encode( $result ) );
+		$this->assertSame( 'rolled_back', $result['status'] );
+		$this->assertSame( 'prior bytes', file_get_contents( $target ) ); // phpcs:ignore WordPress.WP.AlternativeFunctions -- Fixture readback.
+
+		$subject->clean_store();
+		wp_delete_file( $target );
 	}
 
 	public function test_authenticated_callable_map_exposes_the_four_v2_operations() {
@@ -396,6 +430,11 @@ class Testable_MainWP_Child_File_Deployment extends MainWP_Child_File_Deployment
 		unset( $lock );
 	}
 
+	protected function acquire_store_lock( $exclusive ) {
+		unset( $exclusive );
+		return true;
+	}
+
 	public function seed_dispatching( $request ) {
 		$this->receipts[ $request['payload']['request_ref'] ] = $this->dispatching_receipt_for_test( $request['payload'] );
 	}
@@ -425,8 +464,11 @@ class Store_MainWP_Child_File_Deployment extends MainWP_Child_File_Deployment {
 
 	public $gateway_bytes = '';
 
-	/** @var string|null Deployment a concurrent prune sweeps while this request reserves its own reference. */
-	public $prune_during_reservation = null;
+	/** @var string|null Deployment a concurrent sweep reaches after this request read it and before it holds the store. */
+	public $prune_before_reservation = null;
+
+	/** @var string|null Deployment a concurrent sweep reaches after this rollback rechecked it and before it restores. */
+	public $prune_before_restore = null;
 
 	/** @var string */
 	private $root;
@@ -465,13 +507,44 @@ class Store_MainWP_Child_File_Deployment extends MainWP_Child_File_Deployment {
 		return $this->gateway_bytes;
 	}
 
-	protected function create_receipt( $request_ref, $receipt ) {
-		if ( null !== $this->prune_during_reservation ) {
-			$this->age_deployment( $this->prune_during_reservation );
-			$this->prune_during_reservation = null;
+	protected function acquire_destination_lock( $destination_class, $relative_destination ) {
+		$lock = parent::acquire_destination_lock( $destination_class, $relative_destination );
+		if ( false !== $lock && null !== $this->prune_before_reservation ) {
+			$this->age_deployment( $this->prune_before_reservation );
+			$this->prune_before_reservation = null;
 			$this->prune_expired_storage();
 		}
-		return parent::create_receipt( $request_ref, $receipt );
+		return $lock;
+	}
+
+	protected function apply_rollback( $receipt ) {
+		if ( null !== $this->prune_before_restore ) {
+			$deployment_ref             = $this->prune_before_restore;
+			$this->prune_before_restore = null;
+			$this->sweep_without_marker( $deployment_ref );
+		}
+		return parent::apply_rollback( $receipt );
+	}
+
+	/**
+	 * Sweep the store the way a deployment to another destination does when the file list it works
+	 * from was taken before this rollback reserved anything: the live rollback marker is not in
+	 * that list, so nothing the sweep sees binds the backup being restored.
+	 */
+	private function sweep_without_marker( $deployment_ref ) {
+		$this->age_deployment( $deployment_ref );
+		$unlisted = array();
+		foreach ( glob( $this->root . '/receipt-*.json' ) as $path ) {
+			$receipt = json_decode( file_get_contents( $path ), true ); // phpcs:ignore WordPress.WP.AlternativeFunctions -- Fixture store read.
+			if ( isset( $receipt['kind'], $receipt['state'] ) && 'rollback' === $receipt['kind'] && 'dispatching' === $receipt['state'] ) {
+				$unlisted[ $path ] = $path . '.unlisted';
+				rename( $path, $path . '.unlisted' );
+			}
+		}
+		$this->prune_expired_storage();
+		foreach ( $unlisted as $path => $hidden ) {
+			rename( $hidden, $path );
+		}
 	}
 
 	/** Put one settled deployment and its backup past retention, as the clock would. */

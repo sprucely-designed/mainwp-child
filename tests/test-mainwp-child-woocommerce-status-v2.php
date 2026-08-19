@@ -495,7 +495,9 @@ class Test_MainWP_Child_WooCommerce_Status_V2 extends WP_UnitTestCase {
 
 	/**
 	 * Reclaiming is only allowed on proof. A lease whose update has not reached its target version
-	 * is still guarding running work, and the second request must be refused without starting one.
+	 * is still guarding running work, and the request must be refused without starting one - but
+	 * refused because of what the evidence says, not because reclaiming never happens. The same
+	 * request, retried once the site reaches that target, has to get through.
 	 */
 	public function test_start_refuses_a_lease_whose_update_has_not_reached_its_target() {
 		$prior = '123e4567-e89b-42d3-a456-426614174007';
@@ -505,6 +507,43 @@ class Test_MainWP_Child_WooCommerce_Status_V2 extends WP_UnitTestCase {
 		$subject->runtime['current_db_version'] = '10.7.0';
 
 		$identity = array( 'request_ref' => '123e4567-e89b-42d3-a456-426614174008', 'site_fingerprint' => str_repeat( 'a', 64 ) );
+		$prepare  = $subject->abilities_v2( $this->envelope( 'db_update_v2_prepare', $identity ) );
+		$refused  = $subject->abilities_v2( $this->envelope( 'db_update_v2_start', $this->start_payload( $identity, $prepare ) ) );
+
+		$this->assertFalse( $refused['ok'] );
+		$this->assertSame( 'lease_conflict', $refused['code'] );
+		$this->assertSame( 0, $subject->started );
+		$this->assertSame( $lease, get_option( 'mainwp_wc_status_db_update_v2_lease' ) );
+
+		// The held update drains and stamps its target version; nothing else about the request
+		// changes, so only the evidence moved.
+		$subject->runtime['current_db_version'] = '10.8.0';
+		$prepare                                = $subject->abilities_v2( $this->envelope( 'db_update_v2_prepare', $identity ) );
+		$started                                = $subject->abilities_v2( $this->envelope( 'db_update_v2_start', $this->start_payload( $identity, $prepare ) ) );
+
+		$this->assertTrue( $started['ok'], wp_json_encode( $started ) );
+		$this->assertSame( 'requested', $started['state'] );
+		$this->assertSame( 1, $subject->started );
+		$this->assertSame( $identity['request_ref'], get_option( 'mainwp_wc_status_db_update_v2_lease' )['request_ref'] );
+	}
+
+	/**
+	 * A receipt filed under the lease holder's key but carrying another request's reference is
+	 * evidence about that other update, not about the holder. Reclaiming on it would release a
+	 * live lease and let a second update run beside the one it guards.
+	 */
+	public function test_start_refuses_to_reclaim_a_lease_on_another_requests_receipt() {
+		$prior = '123e4567-e89b-42d3-a456-426614174009';
+		$this->seed_db_lease( $prior, '10.8.0' );
+		$receipts = get_option( 'mainwp_wc_status_db_update_v2_receipts' );
+		// Everything about this receipt is well formed and terminal - it just belongs to someone else.
+		$receipts[ $prior ]['response']['request_ref'] = '123e4567-e89b-42d3-a456-42661417400a';
+		update_option( 'mainwp_wc_status_db_update_v2_receipts', $receipts, false );
+		$lease                                  = get_option( 'mainwp_wc_status_db_update_v2_lease' );
+		$subject                                = $this->lease_subject();
+		$subject->runtime['current_db_version'] = '10.8.0';
+
+		$identity = array( 'request_ref' => '123e4567-e89b-42d3-a456-42661417400b', 'site_fingerprint' => str_repeat( 'a', 64 ) );
 		$prepare  = $subject->abilities_v2( $this->envelope( 'db_update_v2_prepare', $identity ) );
 		$refused  = $subject->abilities_v2( $this->envelope( 'db_update_v2_start', $this->start_payload( $identity, $prepare ) ) );
 

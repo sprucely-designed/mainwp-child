@@ -661,7 +661,12 @@ class Test_MainWP_Child_IThemes_Security_V2 extends WP_UnitTestCase {
 		$this->assertSame( 'plugin_unavailable', $repoll['code'] );
 	}
 
-	/** Receipts past the retry horizon are the ones eviction is allowed to take, so the store cannot lock shut. */
+	/**
+	 * Receipts past the retry horizon are the ones eviction is allowed to take, so the store cannot lock shut.
+	 *
+	 * The unconfirmed scan is deliberately the first entry: insertion order must not decide what
+	 * goes, or making room would drop the one receipt the Dashboard is still waiting on.
+	 */
 	public function test_receipts_past_the_retry_horizon_make_room_for_a_new_mutation() {
 		$fixture = new IThemes_Security_V2_Protocol_Fixture();
 		$fixture->results['ability_solid_release_lockouts_v2'] = array(
@@ -672,9 +677,10 @@ class Test_MainWP_Child_IThemes_Security_V2 extends WP_UnitTestCase {
 			'failed_count'         => 0,
 			'revision'             => str_repeat( 'c', 64 ),
 		);
-		$oldest   = sprintf( '123e4567-e89b-42d3-a456-%012d', 1 );
-		$receipts = array();
-		for ( $index = 1; $index <= 100; $index++ ) {
+		$scan_ref         = '123e4567-e89b-42d3-a456-426614174803';
+		$oldest_evictable = sprintf( '123e4567-e89b-42d3-a456-%012d', 1 );
+		$receipts         = array( $scan_ref => $this->accepted_scan_receipt( $scan_ref, time() ) );
+		for ( $index = 1; $index < 100; $index++ ) {
 			$ref              = sprintf( '123e4567-e89b-42d3-a456-%012d', $index );
 			$receipts[ $ref ] = $this->completed_scan_receipt( $ref, time() - ( 2 * DAY_IN_SECONDS ) - ( 101 - $index ) );
 		}
@@ -698,7 +704,59 @@ class Test_MainWP_Child_IThemes_Security_V2 extends WP_UnitTestCase {
 		$this->assertCount( 1, $fixture->calls );
 		$this->assertCount( 100, $stored );
 		$this->assertArrayHasKey( $new_ref, $stored );
-		$this->assertArrayNotHasKey( $oldest, $stored, 'The oldest receipt past the horizon is the one that goes.' );
+		$this->assertArrayHasKey( $scan_ref, $stored, 'The unconfirmed scan is not the receipt eviction may take, whatever its position in the store.' );
+		$this->assertArrayNotHasKey( $oldest_evictable, $stored, 'The oldest receipt past the horizon is the one that goes.' );
+	}
+
+	/**
+	 * Entries that are not readable receipts must never be mistaken for protected open scans.
+	 *
+	 * A stored option is untrusted input, and an entry whose response merely looks accepted carries
+	 * no reference binding of its own. Protecting those would refuse every future mutation on the
+	 * site until someone repaired the option by hand.
+	 */
+	public function test_unreadable_receipts_never_hold_the_mutation_store_shut() {
+		$fixture = new IThemes_Security_V2_Protocol_Fixture();
+		$fixture->results['ability_solid_release_lockouts_v2'] = array(
+			'requested_count'      => 1,
+			'releasable_count'     => 1,
+			'released_count'       => 1,
+			'already_absent_count' => 0,
+			'failed_count'         => 0,
+			'revision'             => str_repeat( 'c', 64 ),
+		);
+		$receipts = array();
+		for ( $index = 1; $index <= 100; $index++ ) {
+			// No effect_hash, no created_at, no operation or reference binding: only the three
+			// fields that make abilities_v2_receipt_awaits_completion() say "still open".
+			$receipts[ sprintf( '123e4567-e89b-42d3-a456-%012d', $index ) ] = array(
+				'response' => array(
+					'accepted'  => true,
+					'completed' => false,
+					'outcome'   => 'accepted',
+				),
+			);
+		}
+		update_option( 'mainwp_solid_abilities_v2_receipts', $receipts, false );
+
+		$new_ref = '123e4567-e89b-42d3-a456-426614174804';
+		$result  = $fixture->abilities_v2(
+			array(
+				'protocol'    => '2',
+				'operation'   => 'ability_solid_release_lockouts_v2',
+				'request_ref' => $new_ref,
+				'payload'     => array(
+					'lockout_refs' => array( str_repeat( 'a', 64 ) ),
+					'if_match'     => str_repeat( 'b', 64 ),
+				),
+			)
+		);
+		$stored  = get_option( 'mainwp_solid_abilities_v2_receipts', array() );
+
+		$this->assertTrue( $result['ok'], wp_json_encode( $result ) );
+		$this->assertCount( 1, $fixture->calls );
+		$this->assertArrayHasKey( $new_ref, $stored );
+		$this->assertLessThanOrEqual( 100, count( $stored ) );
 	}
 
 	/**

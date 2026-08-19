@@ -833,8 +833,9 @@ class MainWP_Child_WooCommerce_Status {
      * finished update would otherwise block the next real one for the rest of that hour.
      * WooCommerce stamps woocommerce_db_version only once the background queue drains, so the
      * site having reached the held lease's target version is proof that its work is over.
-     * Anything short of that - no receipt, an unreadable one, or a version still behind - is
-     * work the lease still guards, and the caller keeps getting lease_conflict.
+     * Anything short of that - no receipt, an unreadable one, one that belongs to a different
+     * request, or a version still behind - is work the lease still guards, and the caller keeps
+     * getting lease_conflict.
      *
      * @param array $runtime Runtime identity.
      * @return bool Whether a terminal lease was released.
@@ -845,7 +846,10 @@ class MainWP_Child_WooCommerce_Status {
             return false;
         }
         $receipt = $this->abilities_v2_db_receipt( $lease['request_ref'] );
-        if ( ! is_array( $receipt ) || ! $this->abilities_v2_valid_db_receipt( $receipt, null ) || ! version_compare( $runtime['current_db_version'], $receipt['response']['target_version'], '>=' ) ) {
+        // The stored option is untrusted, so the entry filed under the holder's key is only proof
+        // about the holder if it says so itself. A receipt carrying someone else's request is
+        // evidence about someone else's update, and cannot retire this lease.
+        if ( ! is_array( $receipt ) || ! $this->abilities_v2_valid_db_receipt( $receipt, null ) || ! hash_equals( $lease['request_ref'], $receipt['response']['request_ref'] ) || ! version_compare( $runtime['current_db_version'], $receipt['response']['target_version'], '>=' ) ) {
             return false;
         }
         return $this->abilities_v2_release_db_lease( $lease['request_ref'] );

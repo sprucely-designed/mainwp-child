@@ -1381,7 +1381,22 @@ class MainWP_Child_Back_Up_Buddy { //phpcs:ignore -- NOSONAR - multi methods.
         return null;
     }
 
-    /** @return array */
+    /**
+     * Read the ledger, settle what has gone quiet, and drop what has aged out.
+     *
+     * Removing an operation is not bookkeeping. The record is also the replay proof for its
+     * request_ref, so once it is gone the Dashboard retrying that request dispatches the effect a
+     * second time. Reads probe BackupBuddy for liveness but never write the ledger, so a stored
+     * timestamp can be a week behind an operation that is still running. A record nothing has ever
+     * reported an outcome for therefore gets one probe before this pass destroys it, and only on the
+     * records the pass would actually remove, so an ordinary mutation never pays to probe the whole
+     * ledger. Writing the pass back is the only place a refreshed observation becomes durable.
+     *
+     * The probe has to find advancing evidence for a record to survive: a run BackupBuddy stopped
+     * stepping keeps its old timestamp, settles, and ages out exactly as it did before.
+     *
+     * @return array
+     */
     private function abilities_v2_prepare_records() {
         $records = $this->abilities_v2_normalize_records( $this->abilities_v2_read_records() );
         if ( $this->abilities_v2_is_error( $records ) ) {
@@ -1389,6 +1404,12 @@ class MainWP_Child_Back_Up_Buddy { //phpcs:ignore -- NOSONAR - multi methods.
         }
         $cutoff  = $this->abilities_v2_now() - 604800;
         foreach ( $records['operations'] as $key => $record ) {
+            if ( $this->abilities_v2_prune_needs_evidence( $record, $cutoff ) ) {
+                $probed = $this->abilities_v2_probe_operation( $record );
+                if ( $this->abilities_v2_valid_operation_record( $probed ) ) {
+                    $record = $probed;
+                }
+            }
             $record = $this->abilities_v2_settle_stale_operation( $record );
             $records['operations'][ $key ] = $record;
             if ( in_array( isset( $record['state'] ) ? $record['state'] : '', array( 'succeeded', 'failed', 'cancelled', 'unknown' ), true ) && isset( $record['updated_at'] ) && $record['updated_at'] < $cutoff ) {
@@ -1404,6 +1425,22 @@ class MainWP_Child_Back_Up_Buddy { //phpcs:ignore -- NOSONAR - multi methods.
             return $this->abilities_v2_error( 'operation_limit_reached' );
         }
         return $records;
+    }
+
+    /**
+     * Whether the age-out pass is about to destroy a record it holds no outcome for.
+     *
+     * queued, running and cancel_requested all mean nothing has reported an ending, and 'unknown' is
+     * what the staleness horizon writes when nothing has reported at all, so none of the four is an
+     * observed outcome. Only records already past the cutoff are worth a probe, because they are the
+     * only ones this pass can remove.
+     *
+     * @param mixed $record Stored operation record.
+     * @param int   $cutoff Age-out cutoff.
+     * @return bool
+     */
+    private function abilities_v2_prune_needs_evidence( $record, $cutoff ) {
+        return is_array( $record ) && isset( $record['state'], $record['updated_at'] ) && is_int( $record['updated_at'] ) && $record['updated_at'] < $cutoff && in_array( $record['state'], array( 'queued', 'running', 'cancel_requested', 'unknown' ), true );
     }
 
     /**
@@ -1784,11 +1821,17 @@ class MainWP_Child_Back_Up_Buddy { //phpcs:ignore -- NOSONAR - multi methods.
             } elseif ( isset( $data['status'] ) && in_array( $data['status'], array( 'failure', 'timeout', 'aborted' ), true ) ) {
                 $record['state'] = 'failed';
             } elseif ( isset( $data['status'] ) && 'running' === $data['status'] ) {
-                // The send says it is running right now, so this read is an observation and dates
-                // the record accordingly. Without it abilities_v2_settle_stale_operation() would
-                // overwrite live evidence with 'unknown' on any transfer older than a day.
-                $record['state']      = 'running';
-                $record['updated_at'] = $this->abilities_v2_now();
+                $record['state'] = 'running';
+                // 'running' is written once when the send is dispatched and nothing clears it if the
+                // worker dies, so the status on its own says nothing about liveness: dating the record
+                // by it would keep a dead send fresh on every read and it could never age out. What
+                // does advance is the send record itself, which BackupBuddy rewrites as the transfer
+                // progresses, so that is the observation time - the same discipline the backup branch
+                // takes from updated_time below.
+                $activity = $this->abilities_v2_send_activity_time( $data, $file );
+                if ( null !== $activity ) {
+                    $record['updated_at'] = max( $record['updated_at'], min( $this->abilities_v2_now(), $activity ) );
+                }
             }
             return $record;
         }
@@ -1813,6 +1856,25 @@ class MainWP_Child_Back_Up_Buddy { //phpcs:ignore -- NOSONAR - multi methods.
             }
         }
         return $record;
+    }
+
+    /**
+     * Last time BackupBuddy itself touched a remote send record.
+     *
+     * A send stamps update_time as it works through the file. Where a build does not carry that key
+     * the record is still rewritten on every chunk, so the file's own modification time states the
+     * same fact, and a send that died stops moving either way.
+     *
+     * @param array  $data Send record contents.
+     * @param string $file Send record path.
+     * @return int|null
+     */
+    private function abilities_v2_send_activity_time( $data, $file ) {
+        if ( isset( $data['update_time'] ) && is_numeric( $data['update_time'] ) ) {
+            return (int) $data['update_time'];
+        }
+        $modified = filemtime( $file );
+        return false === $modified ? null : (int) $modified;
     }
 
     /**

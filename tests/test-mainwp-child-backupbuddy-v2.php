@@ -623,17 +623,144 @@ class Test_MainWP_Child_BackupBuddy_V2_Provider_Boundary extends WP_UnitTestCase
 	}
 
 	/**
-	 * @param int $index      Record index.
-	 * @param int $updated_at Last time the Child observed the operation.
+	 * A mutation ages the ledger out, and the last thing the Child heard about an operation can be a
+	 * week old because reads never write. Nothing may be removed on that timestamp alone: the record
+	 * is the replay proof for its request_ref, so deleting a run that is still going lets the same
+	 * request start a second backup.
+	 */
+	public function test_a_mutation_cannot_age_out_a_backup_backupbuddy_is_still_running() {
+		$now         = time();
+		$live        = $this->long_running_operation_record( 3, $now - ( 8 * DAY_IN_SECONDS ) );
+		$abandoned   = $this->long_running_operation_record( 4, $now - ( 8 * DAY_IN_SECONDS ) );
+		$fileoptions = Test_MainWP_BackupBuddy_Core_Stub::$log_directory . 'fileoptions/';
+		update_option(
+			'mainwp_backupbuddy_ability_operations_v1',
+			array(
+				'operations' => array(
+					$live['operation_ref']      => $live,
+					$abandoned['operation_ref'] => $abandoned,
+				),
+				'receipts'   => array(),
+			)
+		);
+		file_put_contents( $fileoptions . $live['serial'] . '.txt', wp_json_encode( array( 'updated_time' => $now - 90, 'finish_time' => 0, 'archive_file' => '' ) ) );
+		file_put_contents( $fileoptions . $abandoned['serial'] . '.txt', wp_json_encode( array( 'updated_time' => $now - ( 9 * DAY_IN_SECONDS ), 'finish_time' => 0, 'archive_file' => '' ) ) );
+
+		$fixture = new Test_MainWP_Child_BackupBuddy_V2_Effect_Fixture();
+		$deleted = $this->delete_one_archive( $fixture, 'serial09', $this->request_ref );
+		$this->assertTrue( $deleted['deleted'], 'The mutation itself must still succeed.' );
+
+		$stored = get_option( 'mainwp_backupbuddy_ability_operations_v1' );
+		$this->assertArrayHasKey( $live['operation_ref'], $stored['operations'], 'A backup BackupBuddy stepped a minute ago must survive the age-out an unrelated mutation performs.' );
+		$this->assertSame( 'running', $stored['operations'][ $live['operation_ref'] ]['state'] );
+		$this->assertSame( $now - 90, $stored['operations'][ $live['operation_ref'] ]['updated_at'], 'The mutation writes back what it observed, so the next one starts from the fresh time.' );
+		$this->assertArrayNotHasKey( $abandoned['operation_ref'], $stored['operations'], 'A run nothing has stepped for nine days still ages out of the ledger.' );
+
+		$status = $fixture->abilities_v2(
+			array(
+				'operation'     => 'get_operation',
+				'operation_ref' => $live['operation_ref'],
+			)
+		);
+		$this->assertSame( 'running', $status['operation']['state'], 'The surviving record is what stops the original request being dispatched twice.' );
+	}
+
+	/**
+	 * A transfer's stored status is written once at dispatch and never cleared, so a send whose
+	 * worker died stays 'running' on disk forever. Reading that status is not observing the send.
+	 */
+	public function test_a_transfer_status_alone_is_not_evidence_the_send_is_alive() {
+		$now     = time();
+		$live    = $this->long_running_operation_record( 5, $now - ( 8 * DAY_IN_SECONDS ), 'transfer' );
+		$zombie  = $this->long_running_operation_record( 6, $now - ( 8 * DAY_IN_SECONDS ), 'transfer' );
+		$sends   = Test_MainWP_BackupBuddy_Core_Stub::$log_directory . 'fileoptions/send-mainwp-ability-';
+		update_option(
+			'mainwp_backupbuddy_ability_operations_v1',
+			array(
+				'operations' => array(
+					$live['operation_ref']   => $live,
+					$zombie['operation_ref'] => $zombie,
+				),
+				'receipts'   => array(),
+			)
+		);
+		file_put_contents( $sends . $live['serial'] . '.txt', wp_json_encode( array( 'status' => 'running', 'update_time' => $now - 120 ) ) );
+		// The dead send carries no stamp of its own, so the only thing left to date it by is when
+		// BackupBuddy last rewrote the record.
+		file_put_contents( $sends . $zombie['serial'] . '.txt', wp_json_encode( array( 'status' => 'running' ) ) );
+		touch( $sends . $zombie['serial'] . '.txt', $now - ( 9 * DAY_IN_SECONDS ) );
+		clearstatcache();
+
+		$fixture = new Test_MainWP_Child_BackupBuddy_V2_Effect_Fixture();
+		$running = $fixture->abilities_v2(
+			array(
+				'operation'     => 'get_operation',
+				'operation_ref' => $live['operation_ref'],
+			)
+		);
+		$settled = $fixture->abilities_v2(
+			array(
+				'operation'     => 'get_operation',
+				'operation_ref' => $zombie['operation_ref'],
+			)
+		);
+
+		$this->assertSame( 'running', $running['operation']['state'] );
+		$this->assertSame( $now - 120, $running['operation']['updated_at'], 'A send still moving files is dated by its own activity.' );
+		$this->assertSame( 'unknown', $settled['operation']['state'], 'A send nothing has touched for days is not running just because the record still says so.' );
+		$this->assertSame( $now - ( 8 * DAY_IN_SECONDS ), $settled['operation']['updated_at'], 'Reading a dead send must not refresh when the Child last saw it.' );
+
+		$deleted = $this->delete_one_archive( $fixture, 'serial11', $this->request_ref );
+		$this->assertTrue( $deleted['deleted'] );
+		$stored = get_option( 'mainwp_backupbuddy_ability_operations_v1' );
+		$this->assertArrayHasKey( $live['operation_ref'], $stored['operations'], 'A live send must survive the age-out too.' );
+		$this->assertArrayNotHasKey( $zombie['operation_ref'], $stored['operations'], 'A dead send must still age out, or a hundred of them refuse every new mutation.' );
+	}
+
+	/**
+	 * Delete an archive through the real dispatcher. Any mutation runs the ledger age-out pass; this
+	 * is the cheapest one to drive against the real filesystem.
+	 *
+	 * @param Test_MainWP_Child_BackupBuddy_V2_Effect_Fixture $fixture     Fixture.
+	 * @param string                                          $serial      Archive serial.
+	 * @param string                                          $request_ref Request reference.
 	 * @return array
 	 */
-	private function long_running_operation_record( $index, $updated_at ) {
+	private function delete_one_archive( $fixture, $serial, $request_ref ) {
+		file_put_contents( Test_MainWP_BackupBuddy_Core_Stub::$backup_directory . 'backup-example_com-full-' . $serial . '.zip', str_repeat( 'z', 32 ) );
+		$archives = $fixture->abilities_v2(
+			array(
+				'operation' => 'list_archives',
+				'page'      => 1,
+				'per_page'  => 25,
+				'type'      => 'all',
+			)
+		);
+		$this->assertSame( 1, $archives['total'] );
+		return $fixture->abilities_v2(
+			array(
+				'operation'            => 'delete_archive',
+				'archive_ref'          => $archives['archives'][0]['archive_ref'],
+				'expected_size_bytes'  => $archives['archives'][0]['size_bytes'],
+				'expected_modified_at' => $archives['archives'][0]['modified_at'],
+				'request_ref'          => $request_ref,
+			)
+		);
+	}
+
+	/**
+	 * @param int    $index      Record index.
+	 * @param int    $updated_at Last time the Child observed the operation.
+	 * @param string $kind       Operation kind.
+	 * @return array
+	 */
+	private function long_running_operation_record( $index, $updated_at, $kind = 'backup' ) {
 		$digest = hash( 'sha256', 'boundary-operation-' . $index );
 		return array(
 			'operation_ref'   => 'op.v1.' . $digest,
 			'request_ref'     => sprintf( '123e4567-e89b-42d3-a456-%012d', $index ),
 			'request_hash'    => $digest,
-			'kind'            => 'backup',
+			'kind'            => $kind,
 			'state'           => 'running',
 			'created_at'      => $updated_at,
 			'updated_at'      => $updated_at,

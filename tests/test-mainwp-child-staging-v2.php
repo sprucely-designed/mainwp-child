@@ -33,6 +33,9 @@ class Test_MainWP_Child_Staging_V2_Fixture extends MainWP_Child_Staging {
 	/** @var array */
 	public $operation_calls = array();
 
+	/** @var bool */
+	public $jobs_ready = true;
+
 	/** Avoid installed-plugin lookup. */
 	public function __construct() {
 		$this->is_plugin_installed = true;
@@ -56,7 +59,7 @@ class Test_MainWP_Child_Staging_V2_Fixture extends MainWP_Child_Staging {
 
 	/** @return bool */
 	protected function abilities_v2_provider_supports_mutation() {
-		return true;
+		return $this->jobs_ready;
 	}
 
 	/** @return array */
@@ -346,7 +349,7 @@ class Test_MainWP_Child_Staging_V2 extends WP_UnitTestCase {
 				'payload'   => array(),
 			)
 		);
-		$this->assertSame( array( 'inventory', 'settings', 'preview', 'operation_status' ), $capabilities['operations'] );
+		$this->assertSame( array( 'inventory', 'settings', 'preview' ), $capabilities['operations'] );
 		$this->assertFalse( $capabilities['mutation_supported'] );
 
 		$current = $subject->abilities_v2(
@@ -382,6 +385,20 @@ class Test_MainWP_Child_Staging_V2 extends WP_UnitTestCase {
 		$this->assertSame( 'unsupported_operation', $result['error_code'] );
 		$this->assertFalse( get_option( 'wpstg_settings', false ), 'A provider-absent site must not gain WP Staging settings.' );
 		$this->assertSame( array(), get_option( 'mainwp_staging_abilities_v2_receipts', array() ) );
+	}
+
+	/** Job status is an adapter read, so a Child without the adapter must not offer it. */
+	public function test_operation_status_is_neither_advertised_nor_dispatched_without_the_job_adapter() {
+		$this->staging->jobs_ready = false;
+
+		$capabilities = $this->invoke_v2( 'capabilities', array() );
+		$this->assertSame( array( 'inventory', 'settings', 'preview', 'replace_settings' ), $capabilities['operations'] );
+
+		$status = $this->invoke_v2( 'operation_status', array( 'operation_ref' => '123e4567-e89b-42d3-a456-426614174937' ) );
+
+		$this->assertFalse( $status['ok'] );
+		$this->assertSame( 'unsupported_operation', $status['error_code'] );
+		$this->assertSame( array(), $this->staging->operation_calls, 'A refused operation must never reach the provider seam.' );
 	}
 
 	/** Clone mutations use MCP-safe request references and exact receipt replay. */

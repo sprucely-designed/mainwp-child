@@ -19,6 +19,9 @@ class Test_MainWP_Child_WP_Rocket_V2_Fixture extends MainWP_Child_WP_Rocket {
 	/** @var string|null IS_FREE_LOCK() observed while the provider ran. */
 	public $lock_free_during_dispatch = null;
 
+	/** @var mixed Receipt store as it stood on disk while the provider ran. */
+	public $receipts_during_dispatch = null;
+
 	/** Avoid the installed-plugin lookup. */
 	public function __construct() {
 		$this->is_plugin_installed = true;
@@ -34,6 +37,9 @@ class Test_MainWP_Child_WP_Rocket_V2_Fixture extends MainWP_Child_WP_Rocket {
 		global $wpdb;
 		$this->provider_calls[]          = $categories;
 		$this->lock_free_during_dispatch = $wpdb->get_var( $wpdb->prepare( 'SELECT IS_FREE_LOCK(%s)', $this->abilities_v2_lock_name() ) );
+		wp_cache_delete( 'mainwp_wp_rocket_abilities_v2_receipts', 'options' );
+		wp_cache_delete( 'alloptions', 'options' );
+		$this->receipts_during_dispatch = get_option( 'mainwp_wp_rocket_abilities_v2_receipts', array() );
 		return $this->provider_result;
 	}
 
@@ -264,17 +270,7 @@ class Test_MainWP_Child_WP_Rocket_V2 extends WP_UnitTestCase {
 	public function test_a_full_receipt_store_refuses_before_queueing_an_unrecordable_optimization() {
 		$receipts = array();
 		for ( $index = 0; $index < 100; $index++ ) {
-			$receipts[ sprintf( '123e4567-e89b-42d3-a456-4266141750%02d', $index ) ] = array(
-				'effect_hash' => str_repeat( 'a', 64 ),
-				'response'    => array(
-					'protocol'   => '2',
-					'operation'  => 'optimize_database',
-					'ok'         => true,
-					'status'     => 'requested',
-					'categories' => array( 'revisions' ),
-				),
-				'accepted_at' => time(),
-			);
+			$receipts[ sprintf( '123e4567-e89b-42d3-a456-4266141750%02d', $index ) ] = $this->settled_receipt( time() );
 		}
 		update_option( 'mainwp_wp_rocket_abilities_v2_receipts', $receipts, false );
 
@@ -299,6 +295,95 @@ class Test_MainWP_Child_WP_Rocket_V2 extends WP_UnitTestCase {
 		$this->assertTrue( $this->invoke_v2( $request )['ok'] );
 		$this->assertCount( 1, $this->rocket->provider_calls );
 		$this->assertArrayHasKey( $request['request_ref'], get_option( 'mainwp_wp_rocket_abilities_v2_receipts' ) );
+	}
+
+	/**
+	 * A store full of entries the Child cannot read must not lock the ability out.
+	 *
+	 * A WordPress option is untrusted input: truncated or hand-edited receipts answer nothing on
+	 * replay, so treating them as receipts worth keeping would refuse every future optimization
+	 * until someone repaired the option by hand.
+	 */
+	public function test_unreadable_receipts_never_hold_the_optimization_store_shut() {
+		$receipts = array();
+		for ( $index = 0; $index < 100; $index++ ) {
+			$receipts[ sprintf( '123e4567-e89b-42d3-a456-4266141751%02d', $index ) ] = array(
+				'effect_hash' => 'not-a-hash',
+				'response'    => 'truncated',
+			);
+		}
+		update_option( 'mainwp_wp_rocket_abilities_v2_receipts', $receipts, false );
+
+		$request = array(
+			'protocol'    => '2',
+			'operation'   => 'optimize_database',
+			'request_ref' => '123e4567-e89b-42d3-a456-426614174922',
+			'payload'     => array( 'categories' => array( 'revisions' ) ),
+		);
+		$result  = $this->invoke_v2( $request );
+		$stored  = get_option( 'mainwp_wp_rocket_abilities_v2_receipts' );
+
+		$this->assertTrue( $result['ok'], wp_json_encode( $result ) );
+		$this->assertCount( 1, $this->rocket->provider_calls );
+		$this->assertArrayHasKey( $request['request_ref'], $stored );
+		$this->assertLessThanOrEqual( 100, count( $stored ) );
+	}
+
+	/**
+	 * The reservation that stops a second dispatch has to be on disk before the queue is touched.
+	 *
+	 * A request that dies after WP Rocket accepted the work leaves nothing else behind, and its
+	 * retry would queue the same destructive optimization again.
+	 */
+	public function test_the_reservation_is_durable_before_the_optimization_is_queued() {
+		$request = array(
+			'protocol'    => '2',
+			'operation'   => 'optimize_database',
+			'request_ref' => '123e4567-e89b-42d3-a456-426614174923',
+			'payload'     => array( 'categories' => array( 'revisions' ) ),
+		);
+
+		$result = $this->invoke_v2( $request );
+
+		$this->assertTrue( $result['ok'] );
+		$this->assertCount( 1, $this->rocket->provider_calls );
+		$this->assertIsArray( $this->rocket->receipts_during_dispatch );
+		$this->assertArrayHasKey(
+			$request['request_ref'],
+			$this->rocket->receipts_during_dispatch,
+			'The receipt has to survive a crash during dispatch, so it must already be stored when the provider runs.'
+		);
+		$this->assertSame( 'dispatching', $this->rocket->receipts_during_dispatch[ $request['request_ref'] ]['state'] );
+		$this->assertNull( $this->rocket->receipts_during_dispatch[ $request['request_ref'] ]['response'] );
+		$this->assertSame( 'settled', get_option( 'mainwp_wp_rocket_abilities_v2_receipts' )[ $request['request_ref'] ]['state'] );
+	}
+
+	/** A retry that lands on an unsettled reservation reports the outcome as unknown instead of optimizing again. */
+	public function test_an_interrupted_request_is_answered_unknown_and_never_dispatched_twice() {
+		$request = array(
+			'protocol'    => '2',
+			'operation'   => 'optimize_database',
+			'request_ref' => '123e4567-e89b-42d3-a456-426614174924',
+			'payload'     => array( 'categories' => array( 'revisions' ) ),
+		);
+		update_option(
+			'mainwp_wp_rocket_abilities_v2_receipts',
+			array(
+				$request['request_ref'] => array(
+					'effect_hash' => hash( 'sha256', wp_json_encode( array( 'optimize_database', array( 'revisions' ) ) ) ),
+					'state'       => 'dispatching',
+					'response'    => null,
+					'accepted_at' => time(),
+				),
+			),
+			false
+		);
+
+		$result = $this->invoke_v2( $request );
+
+		$this->assertFalse( $result['ok'] );
+		$this->assertSame( 'outcome_unknown', $result['error_code'] );
+		$this->assertSame( array(), $this->rocket->provider_calls, 'A request that may already be queued must never be queued again.' );
 	}
 
 	/** A corrupted receipt is never replayed as an answer and never re-runs the optimization. */
@@ -367,6 +452,27 @@ class Test_MainWP_Child_WP_Rocket_V2 extends WP_UnitTestCase {
 		$this->assertSame( 'lock_busy', $result['error_code'] );
 		$this->assertSame( array(), $this->rocket->provider_calls );
 		$this->assertSame( array(), get_option( 'mainwp_wp_rocket_abilities_v2_receipts', array() ) );
+	}
+
+	/**
+	 * Build one settled receipt in the exact stored shape.
+	 *
+	 * @param int $accepted_at Receipt age.
+	 * @return array
+	 */
+	private function settled_receipt( $accepted_at ) {
+		return array(
+			'effect_hash' => str_repeat( 'a', 64 ),
+			'state'       => 'settled',
+			'response'    => array(
+				'protocol'   => '2',
+				'operation'  => 'optimize_database',
+				'ok'         => true,
+				'status'     => 'requested',
+				'categories' => array( 'revisions' ),
+			),
+			'accepted_at' => $accepted_at,
+		);
 	}
 
 	/**

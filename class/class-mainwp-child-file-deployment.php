@@ -187,7 +187,17 @@ class MainWP_Child_File_Deployment {
         if ( false === $lock ) {
             return $this->error( 'rollback', 'lock_busy' );
         }
+        $store = false;
         try {
+            // Locks are per destination, so a deployment elsewhere can sweep the whole store while
+            // this one runs. That sweep decides what a backup is still bound to from a file list it
+            // took earlier, so a marker written after the list was taken does not protect the backup
+            // this restore needs. Holding the store shared keeps any sweep out of the restore.
+            $store = $this->acquire_store_lock( false );
+            if ( false === $store ) {
+                return $this->error( 'rollback', 'lock_busy' );
+            }
+
             $effect_hash = $this->rollback_effect_hash( $payload, $deployment );
             $existing    = $this->load_receipt( $payload['request_ref'] );
             if ( false === $existing ) {
@@ -208,10 +218,10 @@ class MainWP_Child_File_Deployment {
                 return is_array( $existing ) ? $this->replay_receipt( $existing, $effect_hash, 'rollback' ) : $this->error( 'rollback', 'storage_unavailable' );
             }
 
-            // The deployment was read before this lock was taken, and a deployment to any other
-            // destination prunes the whole store under its own lock. Only this rollback's own
-            // dispatch marker binds the backup, so re-read the deployment now that it exists:
-            // if the prune got there first, nothing has been written and saying so is honest.
+            // A sweep can still have landed between reading the deployment and holding the store,
+            // and it drops a settled deployment past retention together with the backup nothing
+            // binds any more. Re-read it now that this rollback is reserved: if the sweep got
+            // there first, nothing has been written and saying so is honest.
             $bound = $this->load_receipt( $payload['deployment_ref'] );
             if ( ! is_array( $bound ) || $bound !== $deployment ) {
                 return $this->settle_failure( $dispatching, 'rollback', 'not_found' );
@@ -227,6 +237,7 @@ class MainWP_Child_File_Deployment {
             $result = $this->result( 'rollback', $payload['request_ref'], 'rolled_back', $after['bytes'], $after['sha256'], false, null );
             return $this->settle_result( $dispatching, $result );
         } finally {
+            $this->release_store_lock( $store );
             $this->release_destination_lock( $lock );
         }
     }
@@ -409,6 +420,22 @@ class MainWP_Child_File_Deployment {
         if ( false === $root ) {
             return;
         }
+        // Housekeeping never runs beside a restore. A rollback in flight holds the store shared,
+        // and this sweep would otherwise judge its backup against a file list taken before that
+        // rollback reserved anything. Skipping costs nothing: the next deployment sweeps instead.
+        $store = $this->acquire_store_lock( true );
+        if ( false === $store ) {
+            return;
+        }
+        try {
+            $this->sweep_expired_storage( $root );
+        } finally {
+            $this->release_store_lock( $store );
+        }
+    }
+
+    /** Sweep one exact store while it is held exclusively. */
+    private function sweep_expired_storage( $root ) {
         $now    = time();
         $bound  = array();
         $stored = glob( $root . '/receipt-*.json' );
@@ -502,6 +529,30 @@ class MainWP_Child_File_Deployment {
 
     /** Release one exact destination lane. */
     protected function release_destination_lock( $lock ) {
+        if ( is_resource( $lock ) ) {
+            flock( $lock, LOCK_UN );
+            fclose( $lock );
+        }
+    }
+
+    /** Hold the whole store without waiting: exclusively to sweep it, shared to restore from it. */
+    protected function acquire_store_lock( $exclusive ) {
+        $root = $this->storage_root( false );
+        if ( false === $root ) {
+            return false;
+        }
+        $file = @fopen( $root . '/store.lock', 'c+b' ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged -- Lock acquisition outcome is checked.
+        if ( false === $file || ! flock( $file, ( $exclusive ? LOCK_EX : LOCK_SH ) | LOCK_NB ) ) {
+            if ( is_resource( $file ) ) {
+                fclose( $file );
+            }
+            return false;
+        }
+        return $file;
+    }
+
+    /** Release the whole store. */
+    protected function release_store_lock( $lock ) {
         if ( is_resource( $lock ) ) {
             flock( $lock, LOCK_UN );
             fclose( $lock );

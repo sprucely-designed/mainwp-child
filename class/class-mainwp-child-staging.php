@@ -521,12 +521,14 @@ class MainWP_Child_Staging { //phpcs:ignore -- NOSONAR - multi methods.
      * Settings replacement is an option write the Child performs and verifies by readback itself, so
      * it needs WP Staging on the site rather than the durable step adapter; without the plugin there
      * is no provider state to replace and creating `wpstg_settings` would invent some. Clone jobs need
-     * that adapter, so they are neither advertised nor dispatched until a build wires it.
+     * that adapter, so they are neither advertised nor dispatched until a build wires it. Reading a
+     * job's status needs it just as much: the adapter owns the step records, so without it there is
+     * no operation to report on and every read would answer provider_unavailable.
      *
      * @return array Executable operation names.
      */
     protected function abilities_v2_supported_operations() {
-        $clone_jobs = array( 'create_clone', 'update_clone', 'delete_clone', 'cancel_operation', 'reconcile_operation' );
+        $clone_jobs = array( 'create_clone', 'update_clone', 'delete_clone', 'operation_status', 'cancel_operation', 'reconcile_operation' );
         $jobs_ready = $this->abilities_v2_provider_supports_mutation();
         $supported  = array();
         foreach ( array( 'inventory', 'settings', 'preview', 'replace_settings', 'create_clone', 'update_clone', 'delete_clone', 'operation_status', 'cancel_operation', 'reconcile_operation' ) as $operation ) {
@@ -583,7 +585,7 @@ class MainWP_Child_Staging { //phpcs:ignore -- NOSONAR - multi methods.
 
     /** @param string $operation Operation. @param array $payload Payload. @return array */
     private function abilities_v2_provider_result( $operation, $payload ) {
-        if ( ! $this->abilities_v2_provider_supports_mutation() && 'operation_status' !== $operation ) {
+        if ( ! $this->abilities_v2_provider_supports_mutation() ) {
             return $this->abilities_v2_error( $operation, 'provider_unavailable' );
         }
         try {

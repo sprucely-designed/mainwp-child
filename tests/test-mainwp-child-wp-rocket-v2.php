@@ -16,6 +16,9 @@ class Test_MainWP_Child_WP_Rocket_V2_Fixture extends MainWP_Child_WP_Rocket {
 	/** @var mixed */
 	public $provider_result = true;
 
+	/** @var string|null IS_FREE_LOCK() observed while the provider ran. */
+	public $lock_free_during_dispatch = null;
+
 	/** Avoid the installed-plugin lookup. */
 	public function __construct() {
 		$this->is_plugin_installed = true;
@@ -28,8 +31,15 @@ class Test_MainWP_Child_WP_Rocket_V2_Fixture extends MainWP_Child_WP_Rocket {
 	 * @return mixed
 	 */
 	protected function abilities_v2_provider_optimize_database( $categories ) {
-		$this->provider_calls[] = $categories;
+		global $wpdb;
+		$this->provider_calls[]          = $categories;
+		$this->lock_free_during_dispatch = $wpdb->get_var( $wpdb->prepare( 'SELECT IS_FREE_LOCK(%s)', $this->abilities_v2_lock_name() ) );
 		return $this->provider_result;
+	}
+
+	/** @return string */
+	public function fixture_lock_name() {
+		return $this->abilities_v2_lock_name();
 	}
 }
 
@@ -42,7 +52,14 @@ class Test_MainWP_Child_WP_Rocket_V2 extends WP_UnitTestCase {
 	/** Set up a provider-free protocol handler. */
 	public function setUp(): void {
 		parent::setUp();
+		delete_option( 'mainwp_wp_rocket_abilities_v2_receipts' );
 		$this->rocket = new Test_MainWP_Child_WP_Rocket_V2_Fixture();
+	}
+
+	/** Leave no receipts behind. */
+	public function tearDown(): void {
+		delete_option( 'mainwp_wp_rocket_abilities_v2_receipts' );
+		parent::tearDown();
 	}
 
 	/** Capability negotiation publishes the exact additive protocol. */
@@ -217,6 +234,148 @@ class Test_MainWP_Child_WP_Rocket_V2 extends WP_UnitTestCase {
 		foreach ( array( 'optimize_database', 'purge_cloudflare', 'set_showhide', '' ) as $mwp_action ) {
 			$this->assertNull( $respond->invoke( $subject, $mwp_action ), $mwp_action );
 		}
+	}
+
+	/** A repeated request reference replays the stored outcome instead of queueing the work again. */
+	public function test_a_repeated_request_reference_never_optimizes_twice() {
+		$request = array(
+			'protocol'    => '2',
+			'operation'   => 'optimize_database',
+			'request_ref' => '123e4567-e89b-42d3-a456-426614174917',
+			'payload'     => array( 'categories' => array( 'revisions', 'all_transients' ) ),
+		);
+
+		$first  = $this->invoke_v2( $request );
+		$second = $this->invoke_v2( $request );
+
+		$this->assertTrue( $first['ok'] );
+		$this->assertSame( $first, $second );
+		$this->assertCount( 1, $this->rocket->provider_calls );
+
+		// The same reference carrying different work is a Dashboard bug, not a replay.
+		$request['payload']['categories'] = array( 'revisions' );
+		$conflict                         = $this->invoke_v2( $request );
+		$this->assertFalse( $conflict['ok'] );
+		$this->assertSame( 'request_conflict', $conflict['error_code'] );
+		$this->assertCount( 1, $this->rocket->provider_calls );
+	}
+
+	/** A store with no retryable slot to free refuses rather than running work it cannot record. */
+	public function test_a_full_receipt_store_refuses_before_queueing_an_unrecordable_optimization() {
+		$receipts = array();
+		for ( $index = 0; $index < 100; $index++ ) {
+			$receipts[ sprintf( '123e4567-e89b-42d3-a456-4266141750%02d', $index ) ] = array(
+				'effect_hash' => str_repeat( 'a', 64 ),
+				'response'    => array(
+					'protocol'   => '2',
+					'operation'  => 'optimize_database',
+					'ok'         => true,
+					'status'     => 'requested',
+					'categories' => array( 'revisions' ),
+				),
+				'accepted_at' => time(),
+			);
+		}
+		update_option( 'mainwp_wp_rocket_abilities_v2_receipts', $receipts, false );
+
+		$request = array(
+			'protocol'    => '2',
+			'operation'   => 'optimize_database',
+			'request_ref' => '123e4567-e89b-42d3-a456-426614174918',
+			'payload'     => array( 'categories' => array( 'revisions' ) ),
+		);
+		$result  = $this->invoke_v2( $request );
+
+		$this->assertFalse( $result['ok'] );
+		$this->assertSame( 'storage_unavailable', $result['error_code'] );
+		$this->assertSame( array(), $this->rocket->provider_calls );
+
+		// Receipts older than any live retry are the only ones a new request may drop.
+		foreach ( array_keys( $receipts ) as $reference ) {
+			$receipts[ $reference ]['accepted_at'] = time() - ( DAY_IN_SECONDS + 3600 );
+		}
+		update_option( 'mainwp_wp_rocket_abilities_v2_receipts', $receipts, false );
+
+		$this->assertTrue( $this->invoke_v2( $request )['ok'] );
+		$this->assertCount( 1, $this->rocket->provider_calls );
+		$this->assertArrayHasKey( $request['request_ref'], get_option( 'mainwp_wp_rocket_abilities_v2_receipts' ) );
+	}
+
+	/** A corrupted receipt is never replayed as an answer and never re-runs the optimization. */
+	public function test_an_unreadable_receipt_refuses_instead_of_replaying_or_rerunning() {
+		$request = array(
+			'protocol'    => '2',
+			'operation'   => 'optimize_database',
+			'request_ref' => '123e4567-e89b-42d3-a456-426614174919',
+			'payload'     => array( 'categories' => array( 'revisions' ) ),
+		);
+		update_option(
+			'mainwp_wp_rocket_abilities_v2_receipts',
+			array(
+				$request['request_ref'] => array(
+					'effect_hash' => str_repeat( 'a', 64 ),
+					'response'    => array( 'ok' => true ),
+					'accepted_at' => time(),
+				),
+			),
+			false
+		);
+
+		$result = $this->invoke_v2( $request );
+
+		$this->assertFalse( $result['ok'] );
+		$this->assertSame( 'storage_unavailable', $result['error_code'] );
+		$this->assertSame( array(), $this->rocket->provider_calls );
+	}
+
+	/** The receipt check and the dispatch it guards run under one held lock. */
+	public function test_the_optimization_runs_under_the_named_request_lock() {
+		$result = $this->invoke_v2(
+			array(
+				'protocol'    => '2',
+				'operation'   => 'optimize_database',
+				'request_ref' => '123e4567-e89b-42d3-a456-426614174920',
+				'payload'     => array( 'categories' => array( 'revisions' ) ),
+			)
+		);
+
+		$this->assertTrue( $result['ok'] );
+		$this->assertSame( '0', (string) $this->rocket->lock_free_during_dispatch );
+		$this->assertSame( '1', (string) $this->lock_state( $this->rocket->fixture_lock_name() ) );
+	}
+
+	/** A concurrent holder of the lock is refused without dispatching or storing anything. */
+	public function test_a_held_lock_refuses_the_request_without_dispatching() {
+		$name  = $this->rocket->fixture_lock_name();
+		$other = new wpdb( DB_USER, DB_PASSWORD, DB_NAME, DB_HOST );
+		$other->suppress_errors( true );
+		$this->assertSame( '1', (string) $other->get_var( $other->prepare( 'SELECT GET_LOCK(%s,0)', $name ) ) );
+
+		$result = $this->invoke_v2(
+			array(
+				'protocol'    => '2',
+				'operation'   => 'optimize_database',
+				'request_ref' => '123e4567-e89b-42d3-a456-426614174921',
+				'payload'     => array( 'categories' => array( 'revisions' ) ),
+			)
+		);
+
+		$other->get_var( $other->prepare( 'SELECT RELEASE_LOCK(%s)', $name ) );
+		$other->close();
+
+		$this->assertFalse( $result['ok'] );
+		$this->assertSame( 'lock_busy', $result['error_code'] );
+		$this->assertSame( array(), $this->rocket->provider_calls );
+		$this->assertSame( array(), get_option( 'mainwp_wp_rocket_abilities_v2_receipts', array() ) );
+	}
+
+	/**
+	 * @param string $name Lock name.
+	 * @return string|null
+	 */
+	private function lock_state( $name ) {
+		global $wpdb;
+		return $wpdb->get_var( $wpdb->prepare( 'SELECT IS_FREE_LOCK(%s)', $name ) );
 	}
 
 	/** @return \ReflectionMethod */

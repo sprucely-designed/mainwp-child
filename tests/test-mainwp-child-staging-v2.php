@@ -126,6 +126,7 @@ class Test_MainWP_Child_Staging_V2 extends WP_UnitTestCase {
 	/** Finish the fixture. */
 	public function tearDown(): void {
 		delete_option( 'mainwp_staging_abilities_v2_operation_receipts' );
+		delete_option( 'wpstg_settings' );
 		parent::tearDown();
 	}
 
@@ -330,6 +331,57 @@ class Test_MainWP_Child_Staging_V2 extends WP_UnitTestCase {
 		$this->assertFalse( $conflict['ok'] );
 		$this->assertSame( 'request_conflict', $conflict['error_code'] );
 		$this->assertSame( 1, $this->staging->settings_writes );
+	}
+
+	/** Without WP Staging the Child neither advertises nor performs the settings write. */
+	public function test_replace_settings_is_refused_and_writes_nothing_without_wp_staging() {
+		delete_option( 'wpstg_settings' );
+		$subject = ( new ReflectionClass( MainWP_Child_Staging::class ) )->newInstanceWithoutConstructor();
+		$this->assertFalse( $subject->is_plugin_installed, 'WP Staging must be absent for this test to mean anything.' );
+
+		$capabilities = $subject->abilities_v2(
+			array(
+				'protocol'  => '2',
+				'operation' => 'capabilities',
+				'payload'   => array(),
+			)
+		);
+		$this->assertSame( array( 'inventory', 'settings', 'preview', 'operation_status' ), $capabilities['operations'] );
+		$this->assertFalse( $capabilities['mutation_supported'] );
+
+		$current = $subject->abilities_v2(
+			array(
+				'protocol'  => '2',
+				'operation' => 'settings',
+				'payload'   => array(),
+			)
+		);
+		$this->assertTrue( $current['ok'] );
+
+		$result = $subject->abilities_v2(
+			array(
+				'protocol'    => '2',
+				'operation'   => 'replace_settings',
+				'request_ref' => '123e4567-e89b-42d3-a456-426614174936',
+				'payload'     => array(
+					'if_match' => $current['revision'],
+					'settings' => array(
+						'query_limit'      => 900,
+						'file_limit'       => 250,
+						'batch_size_mb'    => 20,
+						'max_file_size_mb' => 100,
+						'cpu_load'         => 'low',
+						'delay_seconds'    => 2,
+						'debug_enabled'    => true,
+					),
+				),
+			)
+		);
+
+		$this->assertFalse( $result['ok'] );
+		$this->assertSame( 'unsupported_operation', $result['error_code'] );
+		$this->assertFalse( get_option( 'wpstg_settings', false ), 'A provider-absent site must not gain WP Staging settings.' );
+		$this->assertSame( array(), get_option( 'mainwp_staging_abilities_v2_receipts', array() ) );
 	}
 
 	/** Clone mutations use MCP-safe request references and exact receipt replay. */

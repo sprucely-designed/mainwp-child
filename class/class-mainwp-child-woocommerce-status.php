@@ -317,7 +317,7 @@ class MainWP_Child_WooCommerce_Status {
         if ( 'conflict' === $fresh['state'] ) {
             return $this->abilities_v2_error( 'db_update_v2_start', 'update_conflict' );
         }
-        if ( ! $this->abilities_v2_acquire_db_lease( $payload['request_ref'] ) ) {
+        if ( ! $this->abilities_v2_acquire_db_lease( $payload['request_ref'] ) && ( ! $this->abilities_v2_release_terminal_db_lease( $runtime ) || ! $this->abilities_v2_acquire_db_lease( $payload['request_ref'] ) ) ) {
             return $this->abilities_v2_error( 'db_update_v2_start', 'lease_conflict' );
         }
         $started = 'current' === $fresh['state'] ? 0 : $this->abilities_v2_start_db_update();
@@ -824,6 +824,31 @@ class MainWP_Child_WooCommerce_Status {
             'expires_at'  => $now + 3600,
         );
         return add_option( 'mainwp_wc_status_db_update_v2_lease', $next, '', false ) && get_option( 'mainwp_wc_status_db_update_v2_lease', null ) === $next;
+    }
+
+    /**
+     * Release a live lease whose update is provably finished.
+     *
+     * A queued update holds its lease for an hour, and the status read must not write, so a
+     * finished update would otherwise block the next real one for the rest of that hour.
+     * WooCommerce stamps woocommerce_db_version only once the background queue drains, so the
+     * site having reached the held lease's target version is proof that its work is over.
+     * Anything short of that - no receipt, an unreadable one, or a version still behind - is
+     * work the lease still guards, and the caller keeps getting lease_conflict.
+     *
+     * @param array $runtime Runtime identity.
+     * @return bool Whether a terminal lease was released.
+     */
+    protected function abilities_v2_release_terminal_db_lease( $runtime ) {
+        $lease = get_option( 'mainwp_wc_status_db_update_v2_lease', null );
+        if ( ! is_array( $lease ) || ! isset( $lease['request_ref'] ) || ! is_string( $lease['request_ref'] ) ) {
+            return false;
+        }
+        $receipt = $this->abilities_v2_db_receipt( $lease['request_ref'] );
+        if ( ! is_array( $receipt ) || ! $this->abilities_v2_valid_db_receipt( $receipt, null ) || ! version_compare( $runtime['current_db_version'], $receipt['response']['target_version'], '>=' ) ) {
+            return false;
+        }
+        return $this->abilities_v2_release_db_lease( $lease['request_ref'] );
     }
 
     /**

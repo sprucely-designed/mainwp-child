@@ -429,6 +429,7 @@ class MainWP_Child_Staging { //phpcs:ignore -- NOSONAR - multi methods.
             return $this->abilities_v2_error( $operation );
         }
 
+        $supported = $this->abilities_v2_supported_operations();
         if ( 'capabilities' === $operation ) {
             if ( array() !== $request['payload'] ) {
                 return $this->abilities_v2_error( $operation );
@@ -438,10 +439,15 @@ class MainWP_Child_Staging { //phpcs:ignore -- NOSONAR - multi methods.
                 'protocol'           => '2',
                 'operation'          => 'capabilities',
                 'ok'                 => true,
-                'operations'         => array( 'inventory', 'settings', 'preview', 'replace_settings', 'create_clone', 'update_clone', 'delete_clone', 'operation_status', 'cancel_operation', 'reconcile_operation' ),
-                'mutation_supported' => $this->abilities_v2_provider_supports_mutation(),
+                'operations'         => $supported,
+                'mutation_supported' => array() !== array_intersect( $mutations, $supported ),
                 'wp_staging_version' => $this->abilities_v2_plugin_version(),
             );
+        }
+
+        // Anything this Child cannot carry out is refused by name instead of being advertised and then run anyway.
+        if ( ! in_array( $operation, $supported, true ) ) {
+            return $this->abilities_v2_error( $operation, 'unsupported_operation' );
         }
 
         if ( 'replace_settings' === $operation ) {
@@ -507,6 +513,32 @@ class MainWP_Child_Staging { //phpcs:ignore -- NOSONAR - multi methods.
             ),
             $preview
         );
+    }
+
+    /**
+     * List the operations this Child can actually carry out.
+     *
+     * Settings replacement is an option write the Child performs and verifies by readback itself, so
+     * it needs WP Staging on the site rather than the durable step adapter; without the plugin there
+     * is no provider state to replace and creating `wpstg_settings` would invent some. Clone jobs need
+     * that adapter, so they are neither advertised nor dispatched until a build wires it.
+     *
+     * @return array Executable operation names.
+     */
+    protected function abilities_v2_supported_operations() {
+        $clone_jobs = array( 'create_clone', 'update_clone', 'delete_clone', 'cancel_operation', 'reconcile_operation' );
+        $jobs_ready = $this->abilities_v2_provider_supports_mutation();
+        $supported  = array();
+        foreach ( array( 'inventory', 'settings', 'preview', 'replace_settings', 'create_clone', 'update_clone', 'delete_clone', 'operation_status', 'cancel_operation', 'reconcile_operation' ) as $operation ) {
+            if ( 'replace_settings' === $operation && ! $this->is_plugin_installed ) {
+                continue;
+            }
+            if ( ! $jobs_ready && in_array( $operation, $clone_jobs, true ) ) {
+                continue;
+            }
+            $supported[] = $operation;
+        }
+        return $supported;
     }
 
     /**

@@ -361,9 +361,11 @@ class MainWP_Child_Favorites {
         return $this->valid_install_receipt( $receipt ) ? $receipt : false;
     }
 
-    /** Report whether a stored receipt is past its retention window. */
+    /** Report whether a settled receipt is past its retention window. */
     private function install_receipt_expired( $receipt ) {
-        return is_array( $receipt ) && isset( $receipt['expires_at'] ) && is_int( $receipt['expires_at'] ) && $receipt['expires_at'] <= time();
+        // A dispatch marker never expires into silence: its effect is still unresolved, so dropping
+        // it is exactly what would let a resent request install the package a second time.
+        return is_array( $receipt ) && isset( $receipt['state'], $receipt['expires_at'] ) && 'settled' === $receipt['state'] && is_int( $receipt['expires_at'] ) && $receipt['expires_at'] <= time();
     }
 
     /** Drop one receipt a mutation has proven past retention. */

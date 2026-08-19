@@ -233,6 +233,15 @@ class MainWP_Child_Early_Access_Release {
         );
     }
 
+    /** Reclaim the superseded private backup tree of one verified replacement. */
+    protected function remove_backup( $backup_ref ) {
+        $root = $this->storage_root( false );
+        if ( false === $root || ! $this->safe_ref( $backup_ref ) || 0 !== strpos( $backup_ref, 'backup-' ) ) {
+            return false;
+        }
+        return $this->remove_tree( $root . '/' . $backup_ref );
+    }
+
     /** Delete a downloaded private package. */
     protected function cleanup_package( $package ) {
         return ! is_array( $package ) || ! isset( $package['path'] ) || $this->delete_file( $package['path'] );
@@ -347,6 +356,10 @@ class MainWP_Child_Early_Access_Release {
             if ( 'unknown' === $applied['status'] || ! $after['installed'] || $payload['target_version'] !== $after['version'] || $before['active'] !== $after['active'] ) {
                 return $this->settle_failure( $dispatching, 'outcome_unknown', 'unknown', $after );
             }
+            // The replacement is verified and no result ever hands the backup reference out, so nothing
+            // can still roll back to it. A reclaim that fails leaves the tree behind rather than
+            // reporting a transition that did happen as a failure.
+            $this->remove_backup( $applied['backup_ref'] );
             return $this->settle_result( $dispatching, $this->result( $payload, 'applied', $before['version'], $after['version'], $after['active'], 'installed', false, null ) );
         } finally {
             $this->release_transition_lock( $lock );
@@ -594,7 +607,7 @@ class MainWP_Child_Early_Access_Release {
     }
 
     /** Return/create the private release root. */
-    private function storage_root( $create ) {
+    protected function storage_root( $create ) {
         if ( ! defined( 'ABSPATH' ) ) {
             return false;
         }

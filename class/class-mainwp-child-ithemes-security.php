@@ -427,9 +427,9 @@ class MainWP_Child_IThemes_Security { //phpcs:ignore -- NOSONAR - multi methods.
                 $response = $this->abilities_v2_error( $operation, 'storage_unavailable' );
             } elseif ( ! $preview && isset( $receipts[ $request_ref ] ) ) {
                 $receipt = $receipts[ $request_ref ];
-                if ( ! is_array( $receipt ) || ! $this->abilities_v2_exact_keys( $receipt, array( 'effect_hash', 'response' ) ) || ! $this->abilities_v2_valid_hash( $receipt['effect_hash'] ) || ! $this->abilities_v2_valid_receipt_response( $operation, $request_ref, $receipt['response'] ) ) {
+                if ( ! is_array( $receipt ) || ! $this->abilities_v2_exact_keys( $receipt, array( 'effect_hash', 'created_at', 'response' ) ) || ! $this->abilities_v2_valid_hash( $receipt['effect_hash'] ) || ! is_int( $receipt['created_at'] ) || ! $this->abilities_v2_valid_receipt_response( $operation, $request_ref, $receipt['response'] ) ) {
                     $response = $this->abilities_v2_error( $operation, 'storage_unavailable' );
-                } elseif ( 'ability_solid_file_scan_v2' === $operation && true === $receipt['response']['accepted'] && false === $receipt['response']['completed'] && 'accepted' === $receipt['response']['outcome'] ) {
+                } elseif ( 'ability_solid_file_scan_v2' === $operation && $this->abilities_v2_receipt_awaits_completion( $receipt ) ) {
                     $result = $this->abilities_v2_poll_file_scan();
                     if ( is_wp_error( $result ) ) {
                         $response = $this->abilities_v2_provider_error( $operation, $result );
@@ -454,35 +454,41 @@ class MainWP_Child_IThemes_Security { //phpcs:ignore -- NOSONAR - multi methods.
                     $response = hash_equals( $receipt['effect_hash'], $effect_hash ) ? $receipt['response'] : $this->abilities_v2_error( $operation, 'request_conflict' );
                 }
             } else {
-                try {
-                    $result = $this->abilities_v2_provider_operation( $operation, $payload );
-                } catch ( \Throwable $throwable ) {
-                    $result = new \WP_Error( 'outcome_unknown' );
-                }
-                if ( is_wp_error( $result ) ) {
-                    $response = $this->abilities_v2_provider_error( $operation, $result );
-                } elseif ( ! $this->abilities_v2_valid_provider_result( $operation, $result ) ) {
-                    $response = $this->abilities_v2_error( $operation, 'provider_schema_invalid' );
+                // Room is made before the effect runs, never after: a full store has to refuse the
+                // mutation rather than dispatch it and then find nowhere to record what it did.
+                $room = $preview ? $receipts : $this->abilities_v2_receipt_room( $receipts );
+                if ( false === $room ) {
+                    $response = $this->abilities_v2_error( $operation, 'storage_unavailable' );
                 } else {
-                    $response = array_merge(
-                        array(
-                            'protocol'    => '2',
-                            'operation'   => $operation,
-                            'ok'          => true,
-                            'request_ref' => $request_ref,
-                        ),
-                        $result
-                    );
-                    if ( ! $preview ) {
-                        if ( 100 <= count( $receipts ) ) {
-                            array_shift( $receipts );
-                        }
-                        $receipts[ $request_ref ] = array(
-                            'effect_hash' => $effect_hash,
-                            'response'    => $response,
+                    $receipts = $room;
+                    try {
+                        $result = $this->abilities_v2_provider_operation( $operation, $payload );
+                    } catch ( \Throwable $throwable ) {
+                        $result = new \WP_Error( 'outcome_unknown' );
+                    }
+                    if ( is_wp_error( $result ) ) {
+                        $response = $this->abilities_v2_provider_error( $operation, $result );
+                    } elseif ( ! $this->abilities_v2_valid_provider_result( $operation, $result ) ) {
+                        $response = $this->abilities_v2_error( $operation, 'provider_schema_invalid' );
+                    } else {
+                        $response = array_merge(
+                            array(
+                                'protocol'    => '2',
+                                'operation'   => $operation,
+                                'ok'          => true,
+                                'request_ref' => $request_ref,
+                            ),
+                            $result
                         );
-                        if ( ! update_option( 'mainwp_solid_abilities_v2_receipts', $receipts, false ) && get_option( 'mainwp_solid_abilities_v2_receipts', array() ) !== $receipts ) {
-                            $response = $this->abilities_v2_error( $operation, 'outcome_unknown' );
+                        if ( ! $preview ) {
+                            $receipts[ $request_ref ] = array(
+                                'effect_hash' => $effect_hash,
+                                'created_at'  => time(),
+                                'response'    => $response,
+                            );
+                            if ( ! update_option( 'mainwp_solid_abilities_v2_receipts', $receipts, false ) && get_option( 'mainwp_solid_abilities_v2_receipts', array() ) !== $receipts ) {
+                                $response = $this->abilities_v2_error( $operation, 'outcome_unknown' );
+                            }
                         }
                     }
                 }
@@ -493,6 +499,69 @@ class MainWP_Child_IThemes_Security { //phpcs:ignore -- NOSONAR - multi methods.
             }
         }
         return $response;
+    }
+
+    /**
+     * Free one receipt slot without ever dropping a receipt a retry could still land on.
+     *
+     * A receipt is the only thing between a repeated Dashboard request and a second dispatch of
+     * the same mutation, so age is the one safe reason to drop one: past the retry horizon the
+     * Dashboard has stopped asking. An accepted file scan is exempt from that at any age, because
+     * its receipt is also the handle the Dashboard polls for the result. When nothing has aged
+     * out, the caller refuses the mutation instead of forcing room, which is why this must run
+     * before the effect and not after it.
+     *
+     * @param array $receipts Stored receipts.
+     * @return array|false Receipts with a free slot, or false when none can be freed.
+     */
+    private function abilities_v2_receipt_room( $receipts ) {
+        $limit = 100;
+        if ( $limit > count( $receipts ) ) {
+            return $receipts;
+        }
+
+        $horizon    = time() - DAY_IN_SECONDS;
+        $candidates = array();
+        foreach ( $receipts as $ref => $receipt ) {
+            if ( $this->abilities_v2_receipt_awaits_completion( $receipt ) ) {
+                continue;
+            }
+            if ( ! is_array( $receipt ) || ! isset( $receipt['created_at'] ) || ! is_int( $receipt['created_at'] ) ) {
+                // A receipt the Child can no longer read answers storage_unavailable on replay
+                // anyway, and treating it as immovable would let corrupt entries hold the store
+                // shut for good. It goes first.
+                $candidates[ $ref ] = 0;
+                continue;
+            }
+            if ( $receipt['created_at'] < $horizon ) {
+                $candidates[ $ref ] = $receipt['created_at'];
+            }
+        }
+
+        asort( $candidates, SORT_NUMERIC );
+        foreach ( array_keys( $candidates ) as $ref ) {
+            if ( $limit > count( $receipts ) ) {
+                break;
+            }
+            unset( $receipts[ $ref ] );
+        }
+
+        return $limit > count( $receipts ) ? $receipts : false;
+    }
+
+    /**
+     * Whether a receipt records an accepted operation whose outcome is still open.
+     *
+     * @param mixed $receipt Stored receipt.
+     * @return bool
+     */
+    private function abilities_v2_receipt_awaits_completion( $receipt ) {
+        if ( ! is_array( $receipt ) || ! isset( $receipt['response'] ) || ! is_array( $receipt['response'] ) ) {
+            return false;
+        }
+
+        $response = $receipt['response'];
+        return isset( $response['accepted'], $response['completed'], $response['outcome'] ) && true === $response['accepted'] && false === $response['completed'] && 'accepted' === $response['outcome'];
     }
 
     /**

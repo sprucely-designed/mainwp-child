@@ -212,6 +212,42 @@ class Test_MainWP_Child_File_Deployment_V2 extends WP_UnitTestCase {
 		$this->assertSame( 1, $subject->gateway_reads );
 	}
 
+	/**
+	 * Rollback reads its deployment before it can take the destination lock, and a deployment to
+	 * any other destination prunes the whole store under a different lock. When that prune lands
+	 * in between, the rollback must say so instead of reporting an unknown outcome for a target
+	 * it never touched.
+	 */
+	public function test_rollback_reports_a_pruned_deployment_instead_of_an_unknown_outcome() {
+		$destination = 'wp-content/uploads/mainwp-prune-race.txt';
+		$subject     = new Store_MainWP_Child_File_Deployment();
+		wp_mkdir_p( WP_CONTENT_DIR . '/uploads' );
+		file_put_contents( WP_CONTENT_DIR . '/uploads/mainwp-prune-race.txt', 'prior bytes' ); // phpcs:ignore WordPress.WP.AlternativeFunctions -- Fixture byte placement.
+
+		$preflight = $this->preflight_request();
+		$preflight['payload']['relative_destination'] = $destination;
+		$preflight                                    = $subject->preflight_v2( $preflight );
+		$this->assertTrue( $preflight['ok'] );
+
+		$subject->gateway_bytes = 'deployed bytes';
+		$deploy                 = $this->deploy_request( $preflight, 'deployed bytes' );
+		$this->assertTrue( $subject->deploy_v2( $deploy )['ok'] );
+
+		// A deployment to another destination sweeps the store the moment this rollback reserves
+		// its own reference: the settled deployment is past retention and its backup is old.
+		$subject->prune_during_reservation = $deploy['payload']['request_ref'];
+
+		$result = $subject->rollback_v2( $this->rollback_request( $deploy['payload']['request_ref'], hash( 'sha256', 'deployed bytes' ) ) );
+
+		$this->assertFalse( $result['ok'] );
+		$this->assertSame( 'failed', $result['status'] );
+		$this->assertSame( 'not_found', $result['code'] );
+		$this->assertSame( 'deployed bytes', file_get_contents( WP_CONTENT_DIR . '/uploads/mainwp-prune-race.txt' ) ); // phpcs:ignore WordPress.WP.AlternativeFunctions -- Fixture readback.
+
+		$subject->clean_store();
+		wp_delete_file( WP_CONTENT_DIR . '/uploads/mainwp-prune-race.txt' );
+	}
+
 	public function test_authenticated_callable_map_exposes_the_four_v2_operations() {
 		$callable   = MainWP_Child_Callable::get_instance();
 		$reflection = new \ReflectionClass( $callable );
@@ -379,6 +415,74 @@ class Storage_MainWP_Child_File_Deployment extends MainWP_Child_File_Deployment 
 
 	protected function storage_root_absent() {
 		return $this->storage_absent;
+	}
+}
+
+/**
+ * Drive the real receipt, backup and pruning code against a disposable private store.
+ */
+class Store_MainWP_Child_File_Deployment extends MainWP_Child_File_Deployment {
+
+	public $gateway_bytes = '';
+
+	/** @var string|null Deployment a concurrent prune sweeps while this request reserves its own reference. */
+	public $prune_during_reservation = null;
+
+	/** @var string */
+	private $root;
+
+	public function __construct() {
+		$this->root = rtrim( get_temp_dir(), '/' ) . '/mainwp-file-deployment-' . wp_generate_password( 12, false, false );
+		wp_mkdir_p( $this->root );
+	}
+
+	public function clean_store() {
+		foreach ( array_diff( scandir( $this->root ), array( '.', '..' ) ) as $entry ) {
+			wp_delete_file( $this->root . '/' . $entry );
+		}
+		rmdir( $this->root ); // phpcs:ignore WordPress.WP.AlternativeFunctions -- Fixture store teardown.
+	}
+
+	protected function storage_root( $create ) {
+		unset( $create );
+		return $this->root;
+	}
+
+	protected function storage_root_absent() {
+		return false;
+	}
+
+	protected function backup_storage_available() {
+		return true;
+	}
+
+	protected function gateway_allowed( $url ) {
+		return 'https://dashboard.example/mainwp-file-object' === $url;
+	}
+
+	protected function download_gateway_bytes( $url, $token, $expected_bytes ) {
+		unset( $url, $token, $expected_bytes );
+		return $this->gateway_bytes;
+	}
+
+	protected function create_receipt( $request_ref, $receipt ) {
+		if ( null !== $this->prune_during_reservation ) {
+			$this->age_deployment( $this->prune_during_reservation );
+			$this->prune_during_reservation = null;
+			$this->prune_expired_storage();
+		}
+		return parent::create_receipt( $request_ref, $receipt );
+	}
+
+	/** Put one settled deployment and its backup past retention, as the clock would. */
+	private function age_deployment( $deployment_ref ) {
+		$path    = $this->root . '/receipt-' . hash( 'sha256', $deployment_ref ) . '.json';
+		$receipt = json_decode( file_get_contents( $path ), true ); // phpcs:ignore WordPress.WP.AlternativeFunctions -- Fixture store rewrite.
+		$backup  = $this->root . '/' . $receipt['backup_ref'];
+		$receipt['updated_at'] = time() - 100;
+		$receipt['expires_at'] = time() - 1;
+		file_put_contents( $path, wp_json_encode( $receipt, JSON_UNESCAPED_SLASHES ) ); // phpcs:ignore WordPress.WP.AlternativeFunctions -- Fixture store rewrite.
+		touch( $backup, time() - MainWP_Child_File_Deployment::RECEIPT_TTL - 1 );
 	}
 }
 

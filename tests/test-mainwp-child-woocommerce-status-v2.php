@@ -115,6 +115,32 @@ class WooCommerce_Status_V2_Storage_Fixture extends MainWP_Child_WooCommerce_Sta
 	}
 }
 
+/** Fixture that keeps the real lease and receipt storage while stubbing the provider. */
+class WooCommerce_Status_V2_Lease_Fixture extends MainWP_Child_WooCommerce_Status {
+
+	/** @var mixed */
+	public $runtime;
+
+	/** @var mixed */
+	public $readiness;
+
+	/** @var int */
+	public $started = 0;
+
+	protected function abilities_v2_runtime() {
+		return $this->runtime;
+	}
+
+	protected function abilities_v2_db_readiness( $runtime ) {
+		return $this->readiness;
+	}
+
+	protected function abilities_v2_start_db_update() {
+		++$this->started;
+		return 2;
+	}
+}
+
 /** Fixture that keeps the real aggregation and generation code. */
 class WooCommerce_Status_V2_Order_Fixture extends MainWP_Child_WooCommerce_Status {
 
@@ -444,6 +470,91 @@ class Test_MainWP_Child_WooCommerce_Status_V2 extends WP_UnitTestCase {
 
 		$this->assertSame( 'completed', $status['state'] );
 		$this->assertSame( $lease, get_option( 'mainwp_wc_status_db_update_v2_lease', null ) );
+	}
+
+	/**
+	 * The status read cannot release the lease it did not take, so a finished update would hold
+	 * its hour-long lease against every later request. A start whose predecessor provably reached
+	 * its target version reclaims that lease instead of refusing forever.
+	 */
+	public function test_start_reclaims_the_lease_of_an_update_that_reached_its_target() {
+		$prior = '123e4567-e89b-42d3-a456-426614174005';
+		$this->seed_db_lease( $prior, '10.8.0' );
+		$subject                                = $this->lease_subject();
+		$subject->runtime['current_db_version'] = '10.8.0';
+
+		$identity = array( 'request_ref' => '123e4567-e89b-42d3-a456-426614174006', 'site_fingerprint' => str_repeat( 'a', 64 ) );
+		$prepare  = $subject->abilities_v2( $this->envelope( 'db_update_v2_prepare', $identity ) );
+		$started  = $subject->abilities_v2( $this->envelope( 'db_update_v2_start', $this->start_payload( $identity, $prepare ) ) );
+
+		$this->assertTrue( $started['ok'], wp_json_encode( $started ) );
+		$this->assertSame( 'requested', $started['state'] );
+		$this->assertSame( 1, $subject->started );
+		$this->assertSame( $identity['request_ref'], get_option( 'mainwp_wc_status_db_update_v2_lease' )['request_ref'] );
+	}
+
+	/**
+	 * Reclaiming is only allowed on proof. A lease whose update has not reached its target version
+	 * is still guarding running work, and the second request must be refused without starting one.
+	 */
+	public function test_start_refuses_a_lease_whose_update_has_not_reached_its_target() {
+		$prior = '123e4567-e89b-42d3-a456-426614174007';
+		$this->seed_db_lease( $prior, '10.8.0' );
+		$lease                                  = get_option( 'mainwp_wc_status_db_update_v2_lease' );
+		$subject                                = $this->lease_subject();
+		$subject->runtime['current_db_version'] = '10.7.0';
+
+		$identity = array( 'request_ref' => '123e4567-e89b-42d3-a456-426614174008', 'site_fingerprint' => str_repeat( 'a', 64 ) );
+		$prepare  = $subject->abilities_v2( $this->envelope( 'db_update_v2_prepare', $identity ) );
+		$refused  = $subject->abilities_v2( $this->envelope( 'db_update_v2_start', $this->start_payload( $identity, $prepare ) ) );
+
+		$this->assertFalse( $refused['ok'] );
+		$this->assertSame( 'lease_conflict', $refused['code'] );
+		$this->assertSame( 0, $subject->started );
+		$this->assertSame( $lease, get_option( 'mainwp_wc_status_db_update_v2_lease' ) );
+	}
+
+	private function seed_db_lease( $request_ref, $target_version ) {
+		update_option( 'mainwp_wc_status_db_update_v2_lease', array( 'request_ref' => $request_ref, 'expires_at' => time() + 3600 ), false );
+		update_option(
+			'mainwp_wc_status_db_update_v2_receipts',
+			array(
+				$request_ref => array(
+					'request_hash' => str_repeat( 'a', 64 ),
+					'response'     => array(
+						'protocol'         => '2',
+						'operation'        => 'db_update_v2_start',
+						'ok'               => true,
+						'request_ref'      => $request_ref,
+						'site_fingerprint' => str_repeat( 'a', 64 ),
+						'current_version'  => '10.7.0',
+						'target_version'   => $target_version,
+						'queued_callbacks' => 2,
+						'state'            => 'requested',
+					),
+					'requested_at' => 100,
+				),
+			),
+			false
+		);
+	}
+
+	private function lease_subject() {
+		$subject            = ( new ReflectionClass( WooCommerce_Status_V2_Lease_Fixture::class ) )->newInstanceWithoutConstructor();
+		$subject->runtime   = $this->subject->runtime;
+		$subject->readiness = $this->subject->readiness;
+		return $subject;
+	}
+
+	private function start_payload( $identity, $prepare ) {
+		return array_merge(
+			$identity,
+			array(
+				'current_version'      => $prepare['current_version'],
+				'target_version'       => $prepare['target_version'],
+				'readiness_generation' => $prepare['readiness_generation'],
+			)
+		);
 	}
 
 	public function test_status_page_truncates_top_sellers_to_the_requested_limit() {

@@ -1418,7 +1418,10 @@ class MainWP_Child_Back_Up_Buddy { //phpcs:ignore -- NOSONAR - multi methods.
      * make every new operation fail with operation_limit_reached.
      *
      * updated_at is left alone on purpose: it records the last time the Child actually observed
-     * the operation, and settling it is not an observation.
+     * the operation, and settling it is not an observation. Probing is, so
+     * abilities_v2_probe_operation() moves updated_at forward whenever BackupBuddy's own record
+     * shows the run is still going. That is what keeps this horizon from overruling live evidence:
+     * a record the provider just reported as active is never stale here.
      *
      * @param mixed $record Stored operation record.
      * @return mixed
@@ -1781,7 +1784,11 @@ class MainWP_Child_Back_Up_Buddy { //phpcs:ignore -- NOSONAR - multi methods.
             } elseif ( isset( $data['status'] ) && in_array( $data['status'], array( 'failure', 'timeout', 'aborted' ), true ) ) {
                 $record['state'] = 'failed';
             } elseif ( isset( $data['status'] ) && 'running' === $data['status'] ) {
-                $record['state'] = 'running';
+                // The send says it is running right now, so this read is an observation and dates
+                // the record accordingly. Without it abilities_v2_settle_stale_operation() would
+                // overwrite live evidence with 'unknown' on any transfer older than a day.
+                $record['state']      = 'running';
+                $record['updated_at'] = $this->abilities_v2_now();
             }
             return $record;
         }
@@ -1791,8 +1798,19 @@ class MainWP_Child_Back_Up_Buddy { //phpcs:ignore -- NOSONAR - multi methods.
             $record['archive_ref'] = $this->abilities_v2_ref( 'arc', basename( $data['archive_file'] ) );
         } elseif ( ! empty( $data['error'] ) ) {
             $record['state'] = 'failed';
-        } elseif ( 'queued' === $record['state'] ) {
-            $record['state'] = 'running';
+        } else {
+            if ( in_array( $record['state'], array( 'queued', 'unknown' ), true ) ) {
+                $record['state'] = 'running';
+            }
+            // A backup fileoptions file with no finish and no error says nothing about liveness on
+            // its own: a crashed run leaves exactly that behind. BackupBuddy stamps updated_time on
+            // every step and judges its own timeouts by it (see get_backup_status()), so it is the
+            // one signal that separates a long backup from an abandoned one. Adopting it as the
+            // observation time keeps a genuine long run out of the staleness settle below while an
+            // abandoned run still ages out of the ledger.
+            if ( isset( $data['updated_time'] ) && is_numeric( $data['updated_time'] ) ) {
+                $record['updated_at'] = max( $record['updated_at'], min( $this->abilities_v2_now(), (int) $data['updated_time'] ) );
+            }
         }
         return $record;
     }

@@ -40,6 +40,20 @@ class MainWP_Child_WP_Rocket {//phpcs:ignore -- NOSONAR - multi methods.
     public static $instance = null;
 
     /**
+     * Option holding the abilities-v2 request receipts.
+     *
+     * @var string
+     */
+    private const ABILITIES_V2_RECEIPTS_OPTION = 'mainwp_wp_rocket_abilities_v2_receipts';
+
+    /**
+     * Receipt count at which a new request has to free a slot before it may run.
+     *
+     * @var int
+     */
+    private const ABILITIES_V2_MAX_RECEIPTS = 100;
+
+    /**
      * Public variable to hold the infomration if the WP Rocket plugin is installed on the child site.
      *
      * @var bool If WP Rocket intalled, return true, if not, return false.
@@ -1098,9 +1112,51 @@ class MainWP_Child_WP_Rocket {//phpcs:ignore -- NOSONAR - multi methods.
             $provider_categories[] = $map[ $category ];
         }
 
+        // The receipt lookup and the dispatch it guards have to be one atomic step, or a Dashboard
+        // retry racing its own lost request queues the same destructive optimization twice.
+        if ( ! $this->abilities_v2_begin_lock() ) {
+            return $this->abilities_v2_error( $operation, 'lock_busy' );
+        }
+        try {
+            return $this->abilities_v2_optimize_database( $request['request_ref'], $categories, $provider_categories );
+        } finally {
+            $this->abilities_v2_end_lock();
+        }
+    }
+
+    /**
+     * Run one optimization request at most once, under the held request lock.
+     *
+     * @param string $request_ref Validated request reference.
+     * @param array  $categories Public category names.
+     * @param array  $provider_categories WP Rocket category keys.
+     * @return array Closed protocol result.
+     */
+    private function abilities_v2_optimize_database( $request_ref, $categories, $provider_categories ) {
+        $operation   = 'optimize_database';
+        $effect_hash = hash( 'sha256', wp_json_encode( array( $operation, $categories ) ) );
+        $receipts    = get_option( self::ABILITIES_V2_RECEIPTS_OPTION, array() );
+        if ( ! is_array( $receipts ) ) {
+            return $this->abilities_v2_error( $operation, 'storage_unavailable' );
+        }
+        if ( isset( $receipts[ $request_ref ] ) ) {
+            $receipt = $receipts[ $request_ref ];
+            if ( ! is_array( $receipt ) || ! $this->abilities_v2_exact_keys( $receipt, array( 'effect_hash', 'response', 'accepted_at' ) ) || ! is_string( $receipt['effect_hash'] ) || ! $this->abilities_v2_valid_receipt_response( $receipt['response'] ) ) {
+                return $this->abilities_v2_error( $operation, 'storage_unavailable' );
+            }
+            return hash_equals( $receipt['effect_hash'], $effect_hash ) ? $receipt['response'] : $this->abilities_v2_error( $operation, 'request_conflict' );
+        }
+
         // The request is well formed, so a missing WP Rocket is refused for what it is rather than blamed on the payload.
         if ( ! $this->is_plugin_installed ) {
             return $this->abilities_v2_error( $operation, 'provider_unavailable' );
+        }
+
+        // Room is made before the queue is touched: an optimization the store cannot record is one a
+        // retry would run again.
+        $receipts = $this->abilities_v2_evict_receipts( $receipts );
+        if ( false === $receipts ) {
+            return $this->abilities_v2_error( $operation, 'storage_unavailable' );
         }
 
         try {
@@ -1114,13 +1170,108 @@ class MainWP_Child_WP_Rocket {//phpcs:ignore -- NOSONAR - multi methods.
 
         // WP Rocket runs the categories on its own background queue and the Child never reads the outcome back,
         // so the only claim this response can support is that the request was accepted for processing.
-        return array(
+        $response                 = array(
             'protocol'   => '2',
             'operation'  => 'optimize_database',
             'ok'         => true,
             'status'     => 'requested',
             'categories' => $categories,
         );
+        $receipts[ $request_ref ] = array(
+            'effect_hash' => $effect_hash,
+            'response'    => $response,
+            'accepted_at' => time(),
+        );
+        if ( ! update_option( self::ABILITIES_V2_RECEIPTS_OPTION, $receipts, false ) && get_option( self::ABILITIES_V2_RECEIPTS_OPTION, array() ) !== $receipts ) {
+            return $this->abilities_v2_error( $operation, 'outcome_unknown' );
+        }
+        return $response;
+    }
+
+    /**
+     * Validate a stored optimization outcome before it is replayed as this request's answer.
+     *
+     * @param mixed $response Stored response.
+     * @return bool
+     */
+    private function abilities_v2_valid_receipt_response( $response ) {
+        return is_array( $response )
+            && array( 'protocol', 'operation', 'ok', 'status', 'categories' ) === array_keys( $response )
+            && '2' === $response['protocol']
+            && 'optimize_database' === $response['operation']
+            && true === $response['ok']
+            && 'requested' === $response['status']
+            && is_array( $response['categories'] );
+    }
+
+    /**
+     * Free one receipt slot without discarding an outcome a retry could still ask for.
+     *
+     * Only receipts older than any plausible Dashboard retry are dropped, oldest first. A store
+     * that cannot free a slot refuses the request instead of evicting a receipt whose reference
+     * would then queue the optimization a second time.
+     *
+     * @param array $receipts Stored receipts.
+     * @return array|false Receipts with room for one more, or false when no slot can be freed.
+     */
+    private function abilities_v2_evict_receipts( $receipts ) {
+        if ( self::ABILITIES_V2_MAX_RECEIPTS > count( $receipts ) ) {
+            return $receipts;
+        }
+        $horizon   = time() - ( DAY_IN_SECONDS + 60 );
+        $evictable = array();
+        foreach ( $receipts as $reference => $receipt ) {
+            if ( is_array( $receipt ) && isset( $receipt['accepted_at'] ) && is_int( $receipt['accepted_at'] ) && $receipt['accepted_at'] < $horizon ) {
+                $evictable[ $reference ] = $receipt['accepted_at'];
+            }
+        }
+        asort( $evictable, SORT_NUMERIC );
+        foreach ( array_keys( $evictable ) as $reference ) {
+            if ( self::ABILITIES_V2_MAX_RECEIPTS > count( $receipts ) ) {
+                break;
+            }
+            unset( $receipts[ $reference ] );
+        }
+        return self::ABILITIES_V2_MAX_RECEIPTS > count( $receipts ) ? $receipts : false;
+    }
+
+    /**
+     * Return this installation's named optimization request lock.
+     *
+     * @return string
+     */
+    protected function abilities_v2_lock_name() {
+        return 'mainwp_wp_rocket_v2_' . substr( hash( 'sha256', home_url( '/' ) ), 0, 32 );
+    }
+
+    /**
+     * Acquire the Child-wide optimization request lock without waiting.
+     *
+     * @return bool
+     */
+    protected function abilities_v2_begin_lock() {
+        global $wpdb;
+        if ( ! is_object( $wpdb ) || ! is_callable( array( $wpdb, 'prepare' ) ) || ! is_callable( array( $wpdb, 'get_var' ) ) ) {
+            return false;
+        }
+        $wpdb->last_error = '';
+        $locked           = $wpdb->get_var( $wpdb->prepare( 'SELECT GET_LOCK(%s,0)', $this->abilities_v2_lock_name() ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery -- Named lock is the serialization primitive.
+        return empty( $wpdb->last_error ) && '1' === (string) $locked;
+    }
+
+    /**
+     * Release the Child-wide optimization request lock.
+     *
+     * @return bool
+     */
+    protected function abilities_v2_end_lock() {
+        global $wpdb;
+        if ( ! is_object( $wpdb ) || ! is_callable( array( $wpdb, 'prepare' ) ) || ! is_callable( array( $wpdb, 'get_var' ) ) ) {
+            return false;
+        }
+        $wpdb->last_error = '';
+        $released         = $wpdb->get_var( $wpdb->prepare( 'SELECT RELEASE_LOCK(%s)', $this->abilities_v2_lock_name() ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery -- Named lock release must be checked.
+        return empty( $wpdb->last_error ) && '1' === (string) $released;
     }
 
     /**

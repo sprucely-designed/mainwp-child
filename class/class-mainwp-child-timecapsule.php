@@ -387,16 +387,47 @@ class MainWP_Child_Timecapsule { //phpcs:ignore -- NOSONAR - multi methods.
             return 'site' === $operation ? $this->abilities_v2_site( $config ) : $this->abilities_v2_policy( $config );
         }
 
-        $effect_hash = hash( 'sha256', wp_json_encode( array( $operation, $request['payload'] ) ) );
-        $receipts    = array();
+        $is_mutation = in_array( $operation, $mutations, true );
         $request_ref = null;
-        if ( in_array( $operation, $mutations, true ) ) {
+        if ( $is_mutation ) {
             if ( ! $this->abilities_v2_valid_request_ref( $request['request_ref'] ) ) {
                 return $this->abilities_v2_error( $operation );
             }
             // The reference is validated case-insensitively, so it has to be folded before it keys a receipt.
             $request_ref = strtolower( $request['request_ref'] );
-            $receipts    = get_option( 'mainwp_timecapsule_abilities_v2_receipts', array() );
+        }
+
+        if ( ! $is_mutation ) {
+            return $this->abilities_v2_execute( $operation, $request['payload'], null, false );
+        }
+
+        // The receipt check, the provider effect and the operation-row write have to be one
+        // atomic step: without it two concurrent starts both read in_progress=false, both start
+        // a backup, and the second read-modify-write of the operations option loses the first row.
+        if ( ! $this->abilities_v2_begin_mutation_lock() ) {
+            return $this->abilities_v2_error( $operation, 'lock_busy' );
+        }
+        try {
+            return $this->abilities_v2_execute( $operation, $request['payload'], $request_ref, true );
+        } finally {
+            $this->abilities_v2_end_mutation_lock();
+        }
+    }
+
+    /**
+     * Execute one validated operation, under the mutation lock when it mutates.
+     *
+     * @param string      $operation   Operation name.
+     * @param array       $payload     Validated payload.
+     * @param string|null $request_ref Folded request reference, or null for reads.
+     * @param bool        $is_mutation Whether the operation mutates.
+     * @return array Closed protocol response.
+     */
+    private function abilities_v2_execute( $operation, $payload, $request_ref, $is_mutation ) {
+        $effect_hash = hash( 'sha256', wp_json_encode( array( $operation, $payload ) ) );
+        $receipts    = array();
+        if ( $is_mutation ) {
+            $receipts = get_option( 'mainwp_timecapsule_abilities_v2_receipts', array() );
             if ( ! is_array( $receipts ) ) {
                 return $this->abilities_v2_error( $operation, 'storage_unavailable' );
             }
@@ -410,9 +441,9 @@ class MainWP_Child_Timecapsule { //phpcs:ignore -- NOSONAR - multi methods.
         }
 
         try {
-            $result = $this->abilities_v2_provider_call( $operation, $request['payload'] );
+            $result = $this->abilities_v2_provider_call( $operation, $payload );
         } catch ( \Throwable $throwable ) {
-            return $this->abilities_v2_error( $operation, in_array( $operation, $mutations, true ) ? 'outcome_unknown' : 'provider_unavailable' );
+            return $this->abilities_v2_error( $operation, $is_mutation ? 'outcome_unknown' : 'provider_unavailable' );
         }
         if ( is_wp_error( $result ) ) {
             $code = $result->get_error_code();
@@ -428,10 +459,10 @@ class MainWP_Child_Timecapsule { //phpcs:ignore -- NOSONAR - multi methods.
                 'operation' => $operation,
                 'ok'        => true,
             ),
-            in_array( $operation, $mutations, true ) ? array( 'request_ref' => $request_ref ) : array(),
+            $is_mutation ? array( 'request_ref' => $request_ref ) : array(),
             $result
         );
-        if ( in_array( $operation, $mutations, true ) ) {
+        if ( $is_mutation ) {
             if ( 100 <= count( $receipts ) ) {
                 array_shift( $receipts );
             }
@@ -454,6 +485,45 @@ class MainWP_Child_Timecapsule { //phpcs:ignore -- NOSONAR - multi methods.
      */
     protected function abilities_v2_supported_operations() {
         return array( 'site', 'policy', 'list_backups', 'operation_status', 'preview_restore', 'list_staging', 'replace_policy', 'start_backup', 'cancel_operation' );
+    }
+
+    /**
+     * Return this installation's named Time Capsule mutation lock.
+     *
+     * @return string Lock name.
+     */
+    protected function abilities_v2_lock_name() {
+        return 'mainwp_timecapsule_v2_' . substr( hash( 'sha256', home_url( '/' ) ), 0, 32 );
+    }
+
+    /**
+     * Acquire the Child-wide Time Capsule mutation lock without waiting.
+     *
+     * @return bool Whether the lock is held.
+     */
+    protected function abilities_v2_begin_mutation_lock() {
+        global $wpdb;
+        if ( ! is_object( $wpdb ) || ! is_callable( array( $wpdb, 'prepare' ) ) || ! is_callable( array( $wpdb, 'get_var' ) ) ) {
+            return false;
+        }
+        $wpdb->last_error = '';
+        $locked           = $wpdb->get_var( $wpdb->prepare( 'SELECT GET_LOCK(%s,0)', $this->abilities_v2_lock_name() ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery -- Named lock is the serialization primitive.
+        return empty( $wpdb->last_error ) && '1' === (string) $locked;
+    }
+
+    /**
+     * Release the Child-wide Time Capsule mutation lock.
+     *
+     * @return bool Whether the lock was released.
+     */
+    protected function abilities_v2_end_mutation_lock() {
+        global $wpdb;
+        if ( ! is_object( $wpdb ) || ! is_callable( array( $wpdb, 'prepare' ) ) || ! is_callable( array( $wpdb, 'get_var' ) ) ) {
+            return false;
+        }
+        $wpdb->last_error = '';
+        $released         = $wpdb->get_var( $wpdb->prepare( 'SELECT RELEASE_LOCK(%s)', $this->abilities_v2_lock_name() ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery -- Named lock release must be checked.
+        return empty( $wpdb->last_error ) && '1' === (string) $released;
     }
 
     /**

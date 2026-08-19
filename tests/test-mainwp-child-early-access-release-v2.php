@@ -146,6 +146,32 @@ class Test_MainWP_Child_Early_Access_Release_V2 extends WP_UnitTestCase {
 		$this->assertSame( 'install_failed_restored', $result['code'] );
 	}
 
+	public function test_verified_apply_reclaims_its_backup_and_an_unresolved_one_survives() {
+		$root = $this->private_root();
+
+		$applied            = new Testable_MainWP_Child_Early_Access_Release();
+		$applied->test_root = $root;
+		$result             = $applied->release_v2( $this->apply_request() );
+
+		$this->assertTrue( $result['ok'] );
+		$this->assertSame( 'applied', $result['status'] );
+		$this->assertNotSame( '', $applied->last_backup_ref );
+		$this->assertDirectoryDoesNotExist( $root . '/' . $applied->last_backup_ref );
+
+		$unresolved               = new Testable_MainWP_Child_Early_Access_Release();
+		$unresolved->test_root    = $root;
+		$unresolved->apply_status = 'unknown';
+		$ambiguous                = $unresolved->release_v2( $this->apply_request() );
+
+		$this->assertSame( 'unknown', $ambiguous['status'] );
+		$this->assertDirectoryExists( $root . '/' . $unresolved->last_backup_ref );
+		$this->assertFileExists( $root . '/' . $unresolved->last_backup_ref . '/mainwp-child.php' );
+
+		unlink( $root . '/' . $unresolved->last_backup_ref . '/mainwp-child.php' );
+		rmdir( $root . '/' . $unresolved->last_backup_ref );
+		rmdir( $root );
+	}
+
 	public function test_uuid_alias_untrusted_gateway_and_changed_replay_fail_closed() {
 		$subject = new Testable_MainWP_Child_Early_Access_Release();
 		$request = $this->apply_request();
@@ -198,6 +224,14 @@ class Test_MainWP_Child_Early_Access_Release_V2 extends WP_UnitTestCase {
 		$this->assertSame( 'early_access_release_v2', $callables['early_access_release_v2'] );
 	}
 
+	private function private_root() {
+		$root = rtrim( get_temp_dir(), '/' ) . '/mainwp-early-access-' . wp_generate_password( 12, false, false );
+		if ( ! mkdir( $root, 0700, true ) ) {
+			$this->markTestSkipped( 'A private release root could not be created.' );
+		}
+		return $root;
+	}
+
 	private function apply_request() {
 		return $this->request(
 			'apply',
@@ -233,6 +267,8 @@ class Testable_MainWP_Child_Early_Access_Release extends MainWP_Child_Early_Acce
 	public $receipts = array();
 	public $lock_available = true;
 	public $state_reads = 0;
+	public $test_root = '';
+	public $last_backup_ref = '';
 
 	/** Version reported by the post-download state re-read, or false for a tree that no longer parses. */
 	public $recheck_state = null;
@@ -270,7 +306,24 @@ class Testable_MainWP_Child_Early_Access_Release extends MainWP_Child_Early_Acce
 			$this->installed = true;
 			$this->version   = $target_version;
 		}
-		return array( 'status' => $this->apply_status, 'backup_ref' => 'fixture-backup' );
+		return array( 'status' => $this->apply_status, 'backup_ref' => $this->stage_backup_tree() );
+	}
+
+	protected function storage_root( $create ) {
+		unset( $create );
+		return '' === $this->test_root ? false : $this->test_root;
+	}
+
+	/** Rename fixture: leave a real superseded tree in the private root the way the production apply does. */
+	private function stage_backup_tree() {
+		if ( '' === $this->test_root ) {
+			return 'fixture-backup';
+		}
+		$this->last_backup_ref = 'backup-' . wp_generate_password( 12, false, false );
+		$path                  = $this->test_root . '/' . $this->last_backup_ref;
+		mkdir( $path, 0700, true );
+		file_put_contents( $path . '/mainwp-child.php', "<?php\n/*\nPlugin Name: MainWP Child\nVersion: 5.4.1\n*/\n" );
+		return $this->last_backup_ref;
 	}
 
 	protected function cleanup_package( $package ) {

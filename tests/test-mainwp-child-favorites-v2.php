@@ -155,6 +155,38 @@ class Test_MainWP_Child_Favorites_V2 extends WP_UnitTestCase {
 		delete_option( 'mainwp_child_favorites_receipt_' . hash( 'sha256', $ref ) );
 	}
 
+	public function test_aged_dispatching_receipt_is_unknown_and_never_installs_again() {
+		$subject                   = new Testable_MainWP_Child_Favorites_V2( array(), array(), array() );
+		$subject->durable_receipts = true;
+		$request                   = $this->install_request();
+		$ref                       = $request['payload']['request_ref'];
+		$receipt                   = $subject->dispatching_receipt_for_test( $request );
+		$receipt['updated_at']     = time() - 8 * DAY_IN_SECONDS;
+		$receipt['expires_at']     = time() - DAY_IN_SECONDS;
+		$this->assertTrue( $subject->seed_durable_receipt( $ref, $receipt ) );
+
+		$result = $subject->install_verified_v2( $request );
+
+		$this->assertFalse( $result['ok'] );
+		$this->assertSame( 'unknown', $result['status'] );
+		$this->assertSame( 'outcome_unknown', $result['code'] );
+		$this->assertSame( 0, $subject->download_count );
+		$this->assertSame( 0, $subject->install_count );
+		$this->assertSame( $receipt, get_option( 'mainwp_child_favorites_receipt_' . hash( 'sha256', $ref ), false ) );
+
+		$status = $subject->install_verified_v2(
+			array(
+				'protocol'  => '2',
+				'operation' => 'status',
+				'payload'   => array( 'request_ref' => $ref ),
+			)
+		);
+		$this->assertSame( 'unknown', $status['status'] );
+		$this->assertSame( 'outcome_unknown', $status['code'] );
+
+		delete_option( 'mainwp_child_favorites_receipt_' . hash( 'sha256', $ref ) );
+	}
+
 	public function test_single_file_plugin_archive_must_stay_at_the_archive_root() {
 		if ( ! class_exists( '\ZipArchive' ) ) {
 			$this->markTestSkipped( 'ZipArchive is unavailable.' );
@@ -377,7 +409,11 @@ class Testable_MainWP_Child_Favorites_V2 extends MainWP_Child_Favorites {
 	}
 
 	public function seed_dispatching( $request ) {
-		$this->receipts[ $request['payload']['request_ref'] ] = array(
+		$this->receipts[ $request['payload']['request_ref'] ] = $this->dispatching_receipt_for_test( $request );
+	}
+
+	public function dispatching_receipt_for_test( $request ) {
+		return array(
 			'effect_hash'      => $this->effect_hash_for_test( $request['payload'] ),
 			'state'            => 'dispatching',
 			'request_ref'      => $request['payload']['request_ref'],

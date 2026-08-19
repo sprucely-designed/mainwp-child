@@ -240,6 +240,36 @@ class Test_MainWP_BackupBuddy_Core_Stub {
 	}
 }
 
+/**
+ * Stand-in for the fileoptions reader the operation probe uses. BackupBuddy stores these as
+ * serialized PHP behind a lock; the probe only ever asks is_ok() and reads ->options, so the
+ * stub keeps the same surface over a format the test can write by hand.
+ */
+class Test_MainWP_BackupBuddy_Fileoptions_Stub {
+
+	/** @var array */
+	public $options = array();
+
+	/** @var bool */
+	private $ok = false;
+
+	/**
+	 * @param string $file      Fileoptions file.
+	 * @param bool   $read_only Read-only flag, as BackupBuddy takes it.
+	 */
+	public function __construct( $file, $read_only = false ) {
+		unset( $read_only );
+		$data          = file_exists( $file ) ? json_decode( (string) file_get_contents( $file ), true ) : null;
+		$this->ok      = is_array( $data );
+		$this->options = $this->ok ? $data : array();
+	}
+
+	/** @return bool */
+	public function is_ok() {
+		return $this->ok;
+	}
+}
+
 /** Runs the real provider-facing v2 code: real options read, real archive scan, real file effects. */
 class Test_MainWP_Child_BackupBuddy_V2_Effect_Fixture extends MainWP_Child_Back_Up_Buddy {
 
@@ -272,8 +302,9 @@ class Test_MainWP_Child_BackupBuddy_V2_Provider_Boundary extends WP_UnitTestCase
 		// those names here rather than at file scope, and refuse to run against anyone else's version.
 		foreach (
 			array(
-				'pb_backupbuddy'   => Test_MainWP_BackupBuddy_Provider_Stub::class,
-				'backupbuddy_core' => Test_MainWP_BackupBuddy_Core_Stub::class,
+				'pb_backupbuddy'             => Test_MainWP_BackupBuddy_Provider_Stub::class,
+				'backupbuddy_core'           => Test_MainWP_BackupBuddy_Core_Stub::class,
+				'pb_backupbuddy_fileoptions' => Test_MainWP_BackupBuddy_Fileoptions_Stub::class,
 			) as $provider => $stub
 		) {
 			if ( ! class_exists( $provider, false ) ) {
@@ -544,6 +575,74 @@ class Test_MainWP_Child_BackupBuddy_V2_Provider_Boundary extends WP_UnitTestCase
 		$this->assertInstanceOf( RuntimeException::class, $thrown, 'v1 must reach the required core file instead of failing on the path expression.' );
 		$this->assertSame( 'mainwp-test-v1-core-loaded', $thrown->getMessage() );
 		$this->assertSame( $core_file, $GLOBALS['mainwp_test_bb_v1_core_path'] );
+	}
+
+	/**
+	 * A backup BackupBuddy is still stepping outranks the one-day staleness horizon, while one it
+	 * stopped touching days ago still settles. Only the production probe reads BackupBuddy's own
+	 * record, so the protocol fixture's identity probe cannot tell these two apart.
+	 */
+	public function test_live_provider_evidence_outranks_the_staleness_horizon() {
+		$now         = time();
+		$live        = $this->long_running_operation_record( 1, $now - ( 2 * DAY_IN_SECONDS ) );
+		$abandoned   = $this->long_running_operation_record( 2, $now - ( 2 * DAY_IN_SECONDS ) );
+		$fileoptions = Test_MainWP_BackupBuddy_Core_Stub::$log_directory . 'fileoptions/';
+		update_option(
+			'mainwp_backupbuddy_ability_operations_v1',
+			array(
+				'operations' => array(
+					$live['operation_ref']      => $live,
+					$abandoned['operation_ref'] => $abandoned,
+				),
+				'receipts'   => array(),
+			)
+		);
+		// Neither run has finished or errored. The only thing separating them is the step time
+		// BackupBuddy stamps on its own record.
+		file_put_contents( $fileoptions . $live['serial'] . '.txt', wp_json_encode( array( 'updated_time' => $now - 90, 'finish_time' => 0, 'archive_file' => '' ) ) );
+		file_put_contents( $fileoptions . $abandoned['serial'] . '.txt', wp_json_encode( array( 'updated_time' => $now - ( 3 * DAY_IN_SECONDS ), 'finish_time' => 0, 'archive_file' => '' ) ) );
+
+		$fixture = new Test_MainWP_Child_BackupBuddy_V2_Effect_Fixture();
+		$running = $fixture->abilities_v2(
+			array(
+				'operation'     => 'get_operation',
+				'operation_ref' => $live['operation_ref'],
+			)
+		);
+		$settled = $fixture->abilities_v2(
+			array(
+				'operation'     => 'get_operation',
+				'operation_ref' => $abandoned['operation_ref'],
+			)
+		);
+
+		$this->assertSame( 'running', $running['operation']['state'], 'A backup the Child just observed running must not be reported unknown.' );
+		$this->assertSame( $now - 90, $running['operation']['updated_at'], 'The provider step time is what the Child observed.' );
+		$this->assertSame( 'unknown', $settled['operation']['state'], 'A run nothing has stepped for days still settles.' );
+		$this->assertSame( $now - ( 2 * DAY_IN_SECONDS ), $settled['operation']['updated_at'] );
+	}
+
+	/**
+	 * @param int $index      Record index.
+	 * @param int $updated_at Last time the Child observed the operation.
+	 * @return array
+	 */
+	private function long_running_operation_record( $index, $updated_at ) {
+		$digest = hash( 'sha256', 'boundary-operation-' . $index );
+		return array(
+			'operation_ref'   => 'op.v1.' . $digest,
+			'request_ref'     => sprintf( '123e4567-e89b-42d3-a456-%012d', $index ),
+			'request_hash'    => $digest,
+			'kind'            => 'backup',
+			'state'           => 'running',
+			'created_at'      => $updated_at,
+			'updated_at'      => $updated_at,
+			'progress'        => 0,
+			'archive_ref'     => null,
+			'destination_ref' => null,
+			'warnings'        => array(),
+			'serial'          => substr( $digest, 0, 10 ),
+		);
 	}
 }
 

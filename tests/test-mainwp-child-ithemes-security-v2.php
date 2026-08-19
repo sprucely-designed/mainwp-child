@@ -600,6 +600,149 @@ class Test_MainWP_Child_IThemes_Security_V2 extends WP_UnitTestCase {
 		$this->assertSame( 'unsupported_operation', $unknown['code'] );
 	}
 
+	/**
+	 * The receipt store is what stops a repeated request from running the same mutation twice, so a
+	 * full store must refuse the new mutation rather than evict an accepted scan nobody has an
+	 * answer for yet.
+	 */
+	public function test_a_full_receipt_store_refuses_a_mutation_instead_of_evicting_an_unconfirmed_one() {
+		$scan_ref                                      = '123e4567-e89b-42d3-a456-426614174800';
+		$fixture                                       = new IThemes_Security_V2_Protocol_Fixture();
+		$fixture->results['ability_solid_file_scan_v2'] = array(
+			'accepted'   => true,
+			'completed'  => false,
+			'outcome'    => 'accepted',
+			'generation' => str_repeat( 'a', 64 ),
+		);
+		$fixture->results['ability_solid_release_lockouts_v2'] = array(
+			'requested_count'      => 1,
+			'releasable_count'     => 1,
+			'released_count'       => 1,
+			'already_absent_count' => 0,
+			'failed_count'         => 0,
+			'revision'             => str_repeat( 'c', 64 ),
+		);
+		// The accepted scan is the oldest entry, so a store that makes room by force drops exactly it.
+		$receipts = array( $scan_ref => $this->accepted_scan_receipt( $scan_ref, time() - ( 3 * DAY_IN_SECONDS ) ) );
+		for ( $index = 1; $index < 100; $index++ ) {
+			$ref              = sprintf( '123e4567-e89b-42d3-a456-%012d', $index );
+			$receipts[ $ref ] = $this->completed_scan_receipt( $ref, time() );
+		}
+		update_option( 'mainwp_solid_abilities_v2_receipts', $receipts, false );
+
+		$refused = $fixture->abilities_v2(
+			array(
+				'protocol'    => '2',
+				'operation'   => 'ability_solid_release_lockouts_v2',
+				'request_ref' => '123e4567-e89b-42d3-a456-426614174801',
+				'payload'     => array(
+					'lockout_refs' => array( str_repeat( 'a', 64 ) ),
+					'if_match'     => str_repeat( 'b', 64 ),
+				),
+			)
+		);
+
+		$this->assertFalse( $refused['ok'] );
+		$this->assertSame( 'storage_unavailable', $refused['code'] );
+		$this->assertSame( array(), $fixture->calls, 'A mutation the Child cannot record must not reach the provider.' );
+		$this->assertArrayHasKey( $scan_ref, get_option( 'mainwp_solid_abilities_v2_receipts', array() ) );
+
+		$repoll = $fixture->abilities_v2(
+			array(
+				'protocol'    => '2',
+				'operation'   => 'ability_solid_file_scan_v2',
+				'request_ref' => $scan_ref,
+				'payload'     => array(),
+			)
+		);
+
+		$this->assertSame( array(), $fixture->calls, 'The accepted scan still has its receipt, so retrying it must not submit a second scan.' );
+		$this->assertFalse( $repoll['ok'] );
+		$this->assertSame( 'plugin_unavailable', $repoll['code'] );
+	}
+
+	/** Receipts past the retry horizon are the ones eviction is allowed to take, so the store cannot lock shut. */
+	public function test_receipts_past_the_retry_horizon_make_room_for_a_new_mutation() {
+		$fixture = new IThemes_Security_V2_Protocol_Fixture();
+		$fixture->results['ability_solid_release_lockouts_v2'] = array(
+			'requested_count'      => 1,
+			'releasable_count'     => 1,
+			'released_count'       => 1,
+			'already_absent_count' => 0,
+			'failed_count'         => 0,
+			'revision'             => str_repeat( 'c', 64 ),
+		);
+		$oldest   = sprintf( '123e4567-e89b-42d3-a456-%012d', 1 );
+		$receipts = array();
+		for ( $index = 1; $index <= 100; $index++ ) {
+			$ref              = sprintf( '123e4567-e89b-42d3-a456-%012d', $index );
+			$receipts[ $ref ] = $this->completed_scan_receipt( $ref, time() - ( 2 * DAY_IN_SECONDS ) - ( 101 - $index ) );
+		}
+		update_option( 'mainwp_solid_abilities_v2_receipts', $receipts, false );
+
+		$new_ref = '123e4567-e89b-42d3-a456-426614174802';
+		$result  = $fixture->abilities_v2(
+			array(
+				'protocol'    => '2',
+				'operation'   => 'ability_solid_release_lockouts_v2',
+				'request_ref' => $new_ref,
+				'payload'     => array(
+					'lockout_refs' => array( str_repeat( 'a', 64 ) ),
+					'if_match'     => str_repeat( 'b', 64 ),
+				),
+			)
+		);
+		$stored  = get_option( 'mainwp_solid_abilities_v2_receipts', array() );
+
+		$this->assertTrue( $result['ok'] );
+		$this->assertCount( 1, $fixture->calls );
+		$this->assertCount( 100, $stored );
+		$this->assertArrayHasKey( $new_ref, $stored );
+		$this->assertArrayNotHasKey( $oldest, $stored, 'The oldest receipt past the horizon is the one that goes.' );
+	}
+
+	/**
+	 * @param string $request_ref Request reference.
+	 * @param int    $created_at  Receipt age.
+	 * @return array
+	 */
+	private function accepted_scan_receipt( $request_ref, $created_at ) {
+		return $this->scan_receipt( $request_ref, $created_at, false, 'accepted' );
+	}
+
+	/**
+	 * @param string $request_ref Request reference.
+	 * @param int    $created_at  Receipt age.
+	 * @return array
+	 */
+	private function completed_scan_receipt( $request_ref, $created_at ) {
+		return $this->scan_receipt( $request_ref, $created_at, true, 'clean' );
+	}
+
+	/**
+	 * @param string $request_ref Request reference.
+	 * @param int    $created_at  Receipt age.
+	 * @param bool   $completed   Whether the scan finished.
+	 * @param string $outcome     Recorded outcome.
+	 * @return array
+	 */
+	private function scan_receipt( $request_ref, $created_at, $completed, $outcome ) {
+		return array(
+			'effect_hash' => hash( 'sha256', wp_json_encode( array( 'ability_solid_file_scan_v2', array() ) ) ),
+			'created_at'  => $created_at,
+			'response'    => array(
+				'protocol'    => '2',
+				'operation'   => 'ability_solid_file_scan_v2',
+				'ok'          => true,
+				'request_ref' => $request_ref,
+				'accepted'    => true,
+				'completed'   => $completed,
+				'outcome'     => $outcome,
+				'generation'  => str_repeat( 'a', 64 ),
+			),
+		);
+	}
+
 	private function action_response_method() {
 		$method = ( new ReflectionClass( MainWP_Child_IThemes_Security::class ) )->getMethod( 'abilities_v2_action_response' );
 		$method->setAccessible( true );

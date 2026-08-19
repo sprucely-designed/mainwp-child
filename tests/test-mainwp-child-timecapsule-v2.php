@@ -59,13 +59,22 @@ class Timecapsule_V2_Default_Provider_Fixture extends MainWP_Child_Timecapsule {
 	/** @var array */
 	public $backups = array();
 
+	/** @var string|null IS_FREE_LOCK() observed while the provider effect ran. */
+	public $lock_free_during_effect = null;
+
 	protected function get_backups( $last_time = false ) {
 		return $this->backups;
 	}
 
 	public function start_fresh_backup_tc_callback_wptc() {
+		global $wpdb;
+		$this->lock_free_during_effect = $wpdb->get_var( $wpdb->prepare( 'SELECT IS_FREE_LOCK(%s)', $this->abilities_v2_lock_name() ) );
 		Timecapsule_V2_Factory::$config->set_option( 'in_progress', true );
 		return array( 'result' => 'success' );
+	}
+
+	public function lock_name() {
+		return $this->abilities_v2_lock_name();
 	}
 
 	public function stop_fresh_backup_tc_callback_wptc() {
@@ -504,6 +513,72 @@ class Test_MainWP_Child_Timecapsule_V2 extends WP_UnitTestCase {
 		$this->assertNull( $preview['preview_token'] );
 		$this->assertNull( $preview['expires_at'] );
 		$this->assertSame( 'blocked', $preview['preflight'] );
+	}
+
+	/**
+	 * Two concurrent starts would both read in_progress=false and both start a backup, and the
+	 * second read-modify-write of the operations option would drop the first row. The provider
+	 * effect and the row write have to happen while this Child holds the named lock.
+	 */
+	public function test_start_backup_runs_the_provider_effect_under_the_named_lock() {
+		$fixture                      = new Timecapsule_V2_Default_Provider_Fixture();
+		$fixture->is_plugin_installed = true;
+		$policy                       = $this->request( 'policy' );
+
+		$start = $fixture->abilities_v2( $this->start_backup_request( $policy['policy_generation'] ) );
+
+		$this->assertTrue( $start['ok'] );
+		$this->assertSame( '0', (string) $fixture->lock_free_during_effect, 'The provider effect must run while the lock is held.' );
+		$this->assertSame( '1', (string) $this->lock_state( $fixture->lock_name() ), 'The lock must be released on the success path.' );
+	}
+
+	/**
+	 * A start that cannot take the lock has to refuse honestly, without touching the provider,
+	 * the operations store or the receipt store. Reads stay available.
+	 */
+	public function test_a_held_lock_refuses_the_start_without_starting_a_backup_or_storing() {
+		$fixture                      = new Timecapsule_V2_Default_Provider_Fixture();
+		$fixture->is_plugin_installed = true;
+		$policy                       = $this->request( 'policy' );
+		$holder                       = $this->hold_lock_elsewhere( $fixture->lock_name() );
+
+		$result = $fixture->abilities_v2( $this->start_backup_request( $policy['policy_generation'] ) );
+		$read   = $fixture->abilities_v2( array( 'protocol' => '2', 'operation' => 'policy', 'payload' => array() ) );
+		$this->release_lock_elsewhere( $holder, $fixture->lock_name() );
+
+		$this->assertFalse( $result['ok'] );
+		$this->assertSame( 'lock_busy', $result['code'] );
+		$this->assertNull( $fixture->lock_free_during_effect, 'The provider effect must not run when the lock is held elsewhere.' );
+		$this->assertFalse( Timecapsule_V2_Factory::$config->get_option( 'in_progress' ) );
+		$this->assertSame( array(), get_option( 'mainwp_timecapsule_abilities_v2_operations', array() ) );
+		$this->assertSame( array(), get_option( 'mainwp_timecapsule_abilities_v2_receipts', array() ) );
+		$this->assertTrue( $read['ok'] );
+	}
+
+	private function start_backup_request( $policy_generation ) {
+		return array(
+			'protocol'    => '2',
+			'operation'   => 'start_backup',
+			'request_ref' => '123e4567-e89b-42d3-a456-426614174967',
+			'payload'     => array( 'scope' => 'full', 'label' => null, 'policy_generation' => $policy_generation ),
+		);
+	}
+
+	private function lock_state( $name ) {
+		global $wpdb;
+		return $wpdb->get_var( $wpdb->prepare( 'SELECT IS_FREE_LOCK(%s)', $name ) );
+	}
+
+	private function hold_lock_elsewhere( $name ) {
+		$other = new \wpdb( DB_USER, DB_PASSWORD, DB_NAME, DB_HOST );
+		$other->suppress_errors( true );
+		$this->assertSame( '1', (string) $other->get_var( $other->prepare( 'SELECT GET_LOCK(%s,0)', $name ) ) );
+		return $other;
+	}
+
+	private function release_lock_elsewhere( $other, $name ) {
+		$other->get_var( $other->prepare( 'SELECT RELEASE_LOCK(%s)', $name ) );
+		$other->close();
 	}
 
 	private function request( $operation ) {

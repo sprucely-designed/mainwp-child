@@ -208,6 +208,15 @@ class MainWP_Child_File_Deployment {
                 return is_array( $existing ) ? $this->replay_receipt( $existing, $effect_hash, 'rollback' ) : $this->error( 'rollback', 'storage_unavailable' );
             }
 
+            // The deployment was read before this lock was taken, and a deployment to any other
+            // destination prunes the whole store under its own lock. Only this rollback's own
+            // dispatch marker binds the backup, so re-read the deployment now that it exists:
+            // if the prune got there first, nothing has been written and saying so is honest.
+            $bound = $this->load_receipt( $payload['deployment_ref'] );
+            if ( ! is_array( $bound ) || $bound !== $deployment ) {
+                return $this->settle_failure( $dispatching, 'rollback', 'not_found' );
+            }
+
             if ( true !== $this->apply_rollback( $deployment ) ) {
                 return $this->settle_failure( $dispatching, 'rollback', 'outcome_unknown', 'unknown' );
             }

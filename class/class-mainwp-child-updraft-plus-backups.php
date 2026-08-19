@@ -1113,12 +1113,13 @@ class MainWP_Child_Updraft_Plus_Backups { //phpcs:ignore -- NOSONAR - multi meth
             $token = $loopback_session['token'];
         }
 
-        $secure     = is_ssl();
-        $scheme     = $secure ? 'secure_auth' : 'auth';
+        $ajax_url = admin_url( 'admin-ajax.php' );
+        $secure   = 'https' === wp_parse_url( $ajax_url, PHP_URL_SCHEME );
+        $scheme   = $secure ? 'secure_auth' : 'auth';
 
         try {
             $response = wp_remote_post(
-                admin_url( 'admin-ajax.php' ),
+                $ajax_url,
                 array(
                     'timeout' => 30,
                     'body'    => $body,

@@ -196,8 +196,13 @@ class Test_Post_Plus_Child_V2 extends WP_UnitTestCase {
 		$reflection = new \ReflectionMethod( MainWP_Child_Callable::class, $method );
 		$lines      = file( $reflection->getFileName() );
 		$source     = implode( '', array_slice( $lines, $reflection->getStartLine() - 1, $reflection->getEndLine() - $reflection->getStartLine() + 1 ) );
-		$this->assertSame( 1, preg_match( '/([A-Za-z0-9_:]+)\s*<\s*strlen\(\s*\$raw\s*\)/', $source, $bound ) );
-		return 0 === strpos( $bound[1], 'self::' ) ? constant( MainWP_Child_Callable::class . '::' . substr( $bound[1], 6 ) ) : (int) $bound[1];
+		$this->assertSame( 1, preg_match( '/([A-Za-z0-9_:]+)\s*<\s*strlen\(\s*\$raw\s*\)|strlen\(\s*\$raw\s*\)\s*>\s*([A-Za-z0-9_:]+)/', $source, $bound ) );
+		$token = '' !== $bound[1] ? $bound[1] : $bound[2];
+		if ( 0 === strpos( $token, 'self::' ) ) {
+			return constant( MainWP_Child_Callable::class . '::' . substr( $token, 6 ) );
+		}
+		$this->assertTrue( ctype_digit( $token ), 'The transport size bound must be a literal or a self:: constant.' );
+		return (int) $token;
 	}
 
 	private function maximal_delivery_payload( $operation_ref ) {

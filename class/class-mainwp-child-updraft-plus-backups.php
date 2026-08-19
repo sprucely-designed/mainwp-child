@@ -1057,13 +1057,20 @@ class MainWP_Child_Updraft_Plus_Backups { //phpcs:ignore -- NOSONAR - multi meth
      * @return array|\WP_Error UpdraftPlus response or an error.
      */
     private function claim_and_install_premium_addons( $addons_options, $claim = true ) {  // phpcs:ignore -- NOSONAR - complex.
-        $install_response = $this->request_updraftplus_ajax(
-            array(
-                'action' => 'udaddons_claimaddon',
-                'nonce'  => $this->create_updraftplus_nonce( 'udmanager-nonce' ),
-                'key'    => 'all',
-            )
-        );
+        $loopback_session = array();
+        $current_user     = wp_get_current_user();
+        try {
+            $install_response = $this->request_updraftplus_ajax(
+                array(
+                    'action' => 'udaddons_claimaddon',
+                    'nonce'  => $this->create_updraftplus_nonce( 'udmanager-nonce', $loopback_session ),
+                    'key'    => 'all',
+                ),
+                $loopback_session
+            );
+        } finally {
+            $this->cleanup_updraftplus_loopback_session( $current_user, $loopback_session );
+        }
 
         if ( is_wp_error( $install_response ) ) {
             return $install_response;
@@ -1084,67 +1091,81 @@ class MainWP_Child_Updraft_Plus_Backups { //phpcs:ignore -- NOSONAR - multi meth
     /**
      * Send an authenticated request to UpdraftPlus's admin AJAX endpoint.
      *
-     * @param array $body POST fields.
+     * @param array $body             POST fields.
+     * @param array $loopback_session Session lifecycle state, passed by reference.
      *
      * @return array|\WP_Error Decoded response or an error.
      */
-    private function request_updraftplus_ajax( $body ) {  // phpcs:ignore -- NOSONAR - complex.
+    private function request_updraftplus_ajax( $body, &$loopback_session = array() ) {  // phpcs:ignore -- NOSONAR - complex.
         $current_user = wp_get_current_user();
         if ( ! $current_user || empty( $current_user->ID ) ) {
             return new \WP_Error( 'premium_activation_unauthorized', esc_html__( 'A logged-in administrator is required to activate UpdraftPlus Premium.', 'mainwp-child' ) );
         }
 
+        if ( ! user_can( $current_user, 'update_plugins' ) ) {
+            return new \WP_Error( 'premium_activation_unauthorized', esc_html__( 'A logged-in administrator is required to activate UpdraftPlus Premium.', 'mainwp-child' ) );
+        }
+
         $expiration = time() + HOUR_IN_SECONDS;
-        $token      = $this->ensure_updraftplus_loopback_session_token( $current_user, $expiration );
+        if ( empty( $loopback_session['token'] ) ) {
+            $token = $this->ensure_updraftplus_loopback_session_token( $current_user, $expiration, $loopback_session );
+        } else {
+            $token = $loopback_session['token'];
+        }
 
         $secure     = is_ssl();
         $scheme     = $secure ? 'secure_auth' : 'auth';
 
-        $response = wp_remote_post(
-            admin_url( 'admin-ajax.php' ),
-            array(
-                'timeout' => 30,
-                'body'    => $body,
-                'cookies' => array(
-                    new \WP_Http_Cookie(
-                        array(
-                            'name'  => $secure ? SECURE_AUTH_COOKIE : AUTH_COOKIE,
-                            'value' => wp_generate_auth_cookie( $current_user->ID, $expiration, $scheme, $token ),
-                        )
+        try {
+            $response = wp_remote_post(
+                admin_url( 'admin-ajax.php' ),
+                array(
+                    'timeout' => 30,
+                    'body'    => $body,
+                    'cookies' => array(
+                        new \WP_Http_Cookie(
+                            array(
+                                'name'  => $secure ? SECURE_AUTH_COOKIE : AUTH_COOKIE,
+                                'value' => wp_generate_auth_cookie( $current_user->ID, $expiration, $scheme, $token ),
+                            )
+                        ),
+                        new \WP_Http_Cookie(
+                            array(
+                                'name'  => LOGGED_IN_COOKIE,
+                                'value' => wp_generate_auth_cookie( $current_user->ID, $expiration, 'logged_in', $token ),
+                            )
+                        ),
                     ),
-                    new \WP_Http_Cookie(
-                        array(
-                            'name'  => LOGGED_IN_COOKIE,
-                            'value' => wp_generate_auth_cookie( $current_user->ID, $expiration, 'logged_in', $token ),
-                        )
-                    ),
-                ),
-            )
-        );
+                )
+            );
 
-        if ( is_wp_error( $response ) ) {
-            return new \WP_Error( 'premium_activation_request_failed', $response->get_error_message() );
+            if ( is_wp_error( $response ) ) {
+                return new \WP_Error( 'premium_activation_request_failed', $response->get_error_message() );
+            }
+
+            $decoded = json_decode( wp_remote_retrieve_body( $response ), true );
+            if ( ! is_array( $decoded ) ) {
+                return new \WP_Error( 'premium_activation_invalid_response', esc_html__( 'UpdraftPlus returned an invalid Premium activation response.', 'mainwp-child' ) );
+            }
+
+            return $decoded;
+        } finally {
+            $this->cleanup_updraftplus_loopback_session( $current_user, $loopback_session );
         }
-
-        $decoded = json_decode( wp_remote_retrieve_body( $response ), true );
-        if ( ! is_array( $decoded ) ) {
-            return new \WP_Error( 'premium_activation_invalid_response', esc_html__( 'UpdraftPlus returned an invalid Premium activation response.', 'mainwp-child' ) );
-        }
-
-        return $decoded;
     }
 
     /**
      * Create an UpdraftPlus AJAX nonce for the session used by the loopback request.
      *
-     * @param string $action Nonce action.
+     * @param string $action           Nonce action.
+     * @param array  $loopback_session Session lifecycle state, passed by reference.
      *
      * @return string Nonce value.
      */
-    private function create_updraftplus_nonce( $action ) {
+    private function create_updraftplus_nonce( $action, &$loopback_session = array() ) {
         $current_user = wp_get_current_user();
         if ( $current_user && ! empty( $current_user->ID ) ) {
-            $this->ensure_updraftplus_loopback_session_token( $current_user, time() + HOUR_IN_SECONDS );
+            $this->ensure_updraftplus_loopback_session_token( $current_user, time() + HOUR_IN_SECONDS, $loopback_session );
         }
 
         return wp_create_nonce( $action );
@@ -1155,10 +1176,11 @@ class MainWP_Child_Updraft_Plus_Backups { //phpcs:ignore -- NOSONAR - multi meth
      *
      * @param \WP_User $current_user Current user.
      * @param int      $expiration   Session expiration timestamp.
+     * @param array    $loopback_session Session lifecycle state, passed by reference.
      *
      * @return string Session token.
      */
-    private function ensure_updraftplus_loopback_session_token( $current_user, $expiration ) {
+    private function ensure_updraftplus_loopback_session_token( $current_user, $expiration, &$loopback_session = array() ) {
         $token = wp_get_session_token();
 
         if ( empty( $token ) ) {
@@ -1169,11 +1191,47 @@ class MainWP_Child_Updraft_Plus_Backups { //phpcs:ignore -- NOSONAR - multi meth
                 require_once ABSPATH . WPINC . '/class-wp-user-meta-session-tokens.php'; // NOSONAR - WP compatible.
             }
 
-            $token                       = \WP_Session_Tokens::get_instance( $current_user->ID )->create( $expiration );
+            $loopback_session['created_token']             = true;
+            $loopback_session['token']                     = \WP_Session_Tokens::get_instance( $current_user->ID )->create( $expiration );
+            $loopback_session['had_logged_in_cookie']      = array_key_exists( LOGGED_IN_COOKIE, $_COOKIE );
+            $loopback_session['original_logged_in_cookie'] = $loopback_session['had_logged_in_cookie'] ? $_COOKIE[ LOGGED_IN_COOKIE ] : null;
+            $token                                         = $loopback_session['token'];
             $_COOKIE[ LOGGED_IN_COOKIE ] = wp_generate_auth_cookie( $current_user->ID, $expiration, 'logged_in', $token );
+            $loopback_session['synthesized_logged_in_cookie'] = true;
         }
 
         return $token;
+    }
+
+    /**
+     * Restore request state and remove only the temporary loopback session.
+     *
+     * @param \WP_User $current_user    Current user.
+     * @param array    $loopback_session Session lifecycle state.
+     *
+     * @return void
+     */
+    private function cleanup_updraftplus_loopback_session( $current_user, &$loopback_session ) {
+        if ( ! $current_user || empty( $current_user->ID ) || ! empty( $loopback_session['cleaned'] ) ) {
+            return;
+        }
+
+        if ( ! empty( $loopback_session['created_token'] ) && ! empty( $loopback_session['token'] ) ) {
+            \WP_Session_Tokens::get_instance( $current_user->ID )->destroy( $loopback_session['token'] );
+        }
+
+        if ( empty( $loopback_session['synthesized_logged_in_cookie'] ) ) {
+            $loopback_session['cleaned'] = true;
+            return;
+        }
+
+        if ( ! empty( $loopback_session['had_logged_in_cookie'] ) ) {
+            $_COOKIE[ LOGGED_IN_COOKIE ] = $loopback_session['original_logged_in_cookie'];
+        } else {
+            unset( $_COOKIE[ LOGGED_IN_COOKIE ] );
+        }
+
+        $loopback_session['cleaned'] = true;
     }
 
     /**
@@ -1245,7 +1303,15 @@ class MainWP_Child_Updraft_Plus_Backups { //phpcs:ignore -- NOSONAR - multi meth
         }
 
         $addons_options = json_decode( $decoded_options, true );
-        return is_array( $addons_options ) ? $addons_options : array();
+        if ( ! is_array( $addons_options ) || ! isset( $addons_options['email'], $addons_options['password'] ) ) {
+            return array();
+        }
+
+        if ( ! is_scalar( $addons_options['email'] ) || ! is_scalar( $addons_options['password'] ) ) {
+            return array();
+        }
+
+        return $addons_options;
     }
 
     /**
@@ -1319,7 +1385,7 @@ class MainWP_Child_Updraft_Plus_Backups { //phpcs:ignore -- NOSONAR - multi meth
     private function get_premium_activation_status() {  // phpcs:ignore -- NOSONAR - complex.
         global $updraftplus_addons2;
 
-        $site_id       = $updraftplus_addons2->siteid();
+        $site_id       = is_callable( array( $updraftplus_addons2, 'siteid' ) ) ? $updraftplus_addons2->siteid() : '';
         $has_unclaimed = false;
         $is_assigned   = false;
         $assigned_keys = array();
@@ -1396,7 +1462,7 @@ class MainWP_Child_Updraft_Plus_Backups { //phpcs:ignore -- NOSONAR - multi meth
 
         return array(
             'result'  => 'success',
-            'status'  => 'connected_unclaimed',
+            'status'  => 'connected_no_purchase',
             'message' => esc_html__(
                 'The TeamUpdraft account is connected, but no active Premium purchase is assigned to this site. Open UpdraftPlus on this site to claim or assign a purchase.',
                 'mainwp-child'

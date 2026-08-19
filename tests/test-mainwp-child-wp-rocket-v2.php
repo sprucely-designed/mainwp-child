@@ -159,12 +159,72 @@ class Test_MainWP_Child_WP_Rocket_V2 extends WP_UnitTestCase {
 		$this->assertCount( 1, $this->rocket->provider_calls );
 	}
 
-	/** The original settings-driven action remains present for legacy callers. */
-	public function test_legacy_optimize_database_contract_remains_present() {
-		$source = file_get_contents( dirname( __DIR__ ) . '/class/class-mainwp-child-wp-rocket.php' );
-		$this->assertStringContainsString( "case 'optimize_database':", $source );
-		$this->assertStringContainsString( '$this->optimize_database();', $source );
-		$this->assertStringContainsString( 'array_filter( array_keys( $optimization->get_options() ), array( $options, \'get\' ) )', $source );
+	/** A v2 request on a site without WP Rocket is answered inside the protocol envelope, never as v1 display text. */
+	public function test_v2_requests_reach_the_protocol_on_a_site_without_wp_rocket() {
+		$subject = ( new ReflectionClass( MainWP_Child_WP_Rocket::class ) )->newInstanceWithoutConstructor();
+		$respond = $this->action_response_method();
+		$this->assertFalse( $subject->is_plugin_installed, 'WP Rocket must be absent, otherwise this test cannot see the v1 bail.' );
+
+		try {
+			$_POST['request'] = wp_json_encode(
+				array(
+					'protocol'  => '2',
+					'operation' => 'capabilities',
+					'payload'   => array(),
+				)
+			);
+			$capabilities     = $respond->invoke( $subject, 'abilities_v2' );
+
+			$_POST['request'] = wp_json_encode(
+				array(
+					'protocol'    => '2',
+					'operation'   => 'optimize_database',
+					'request_ref' => '123e4567-e89b-42d3-a456-426614174916',
+					'payload'     => array( 'categories' => array( 'revisions' ) ),
+				)
+			);
+			$optimize         = $respond->invoke( $subject, 'abilities_v2' );
+
+			$_POST['request'] = wp_json_encode(
+				array(
+					'protocol'    => '2',
+					'operation'   => 'optimize_database',
+					'request_ref' => 'not-a-uuid',
+					'payload'     => array( 'categories' => array( 'revisions' ) ),
+				)
+			);
+			$malformed        = $respond->invoke( $subject, 'abilities_v2' );
+		} finally {
+			unset( $_POST['request'] );
+		}
+
+		$this->assertSame( array( 'protocol', 'operation', 'ok', 'operations', 'categories' ), array_keys( $capabilities ) );
+		$this->assertTrue( $capabilities['ok'] );
+
+		$this->assertSame( array( 'protocol', 'operation', 'ok', 'error_code' ), array_keys( $optimize ) );
+		$this->assertFalse( $optimize['ok'] );
+		$this->assertSame( 'provider_unavailable', $optimize['error_code'] );
+
+		// A malformed payload is malformed whether or not WP Rocket is there to run it.
+		$this->assertSame( 'invalid_request', $malformed['error_code'] );
+	}
+
+	/** v1 actions keep the legacy provider-absent path instead of being answered by the protocol. */
+	public function test_v1_actions_are_not_diverted_into_the_v2_protocol() {
+		$subject = ( new ReflectionClass( MainWP_Child_WP_Rocket::class ) )->newInstanceWithoutConstructor();
+		$respond = $this->action_response_method();
+
+		foreach ( array( 'optimize_database', 'purge_cloudflare', 'set_showhide', '' ) as $mwp_action ) {
+			$this->assertNull( $respond->invoke( $subject, $mwp_action ), $mwp_action );
+		}
+	}
+
+	/** @return \ReflectionMethod */
+	private function action_response_method() {
+		$method = ( new ReflectionClass( MainWP_Child_WP_Rocket::class ) )->getMethod( 'abilities_v2_action_response' );
+		$method->setAccessible( true );
+
+		return $method;
 	}
 
 	/**

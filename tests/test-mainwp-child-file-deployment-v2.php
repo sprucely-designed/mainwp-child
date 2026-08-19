@@ -20,7 +20,12 @@ class Test_MainWP_Child_File_Deployment_V2 extends WP_UnitTestCase {
 		$this->assertSame( 'wp-content/uploads/report.txt', $result['relative_destination'] );
 		$this->assertFalse( $result['target_exists'] );
 		$this->assertTrue( $result['rollback_available'] );
-		$this->assertSame( 0, $subject->writes );
+
+		$production                              = new MainWP_Child_File_Deployment();
+		$probe                                   = $this->preflight_request();
+		$probe['payload']['relative_destination'] = 'wp-content/uploads/mainwp-preflight-probe/report.txt';
+		$this->assertTrue( $production->preflight_v2( $probe )['ok'] );
+		$this->assertFileDoesNotExist( WP_CONTENT_DIR . '/uploads/mainwp-preflight-probe' );
 
 		$request = $this->preflight_request();
 		$request['payload']['relative_destination'] = 'wp-content/uploads/../wp-config.php';
@@ -44,12 +49,14 @@ class Test_MainWP_Child_File_Deployment_V2 extends WP_UnitTestCase {
 		$this->assertSame( 'completed', $result['status'] );
 		$this->assertSame( 1, $subject->gateway_reads );
 		$this->assertSame( 1, $subject->writes );
+		$this->assertSame( 1, $subject->prunes );
 		$this->assertSame( $bytes, $subject->target_bytes );
 		$this->assertStringNotContainsString( 'one-use-private-token', wp_json_encode( $subject->receipts ) );
 
 		$this->assertSame( $result, $subject->deploy_v2( $request ) );
 		$this->assertSame( 1, $subject->gateway_reads );
 		$this->assertSame( 1, $subject->writes );
+		$this->assertSame( 1, $subject->prunes );
 
 		$status = $subject->deployment_state_v2( $this->status_request( $request['payload']['request_ref'] ) );
 		$this->assertSame( $result, $status );
@@ -68,7 +75,8 @@ class Test_MainWP_Child_File_Deployment_V2 extends WP_UnitTestCase {
 		$this->assertSame( 'unknown', $result['status'] );
 		$this->assertSame( 'outcome_unknown', $result['code'] );
 		$this->assertSame( 0, $subject->gateway_reads );
-		$this->assertSame( 0, $subject->writes );
+		$this->assertSame( 'dispatching', $subject->receipts[ $request['payload']['request_ref'] ]['state'] );
+		$this->assertNull( $subject->receipts[ $request['payload']['request_ref'] ]['result'] );
 
 		$status = $subject->deployment_state_v2( $this->status_request( $request['payload']['request_ref'] ) );
 		$this->assertSame( 'unknown', $status['status'] );
@@ -85,7 +93,8 @@ class Test_MainWP_Child_File_Deployment_V2 extends WP_UnitTestCase {
 
 		$this->assertSame( 'lock_busy', $result['code'] );
 		$this->assertSame( 0, $subject->gateway_reads );
-		$this->assertSame( 0, $subject->writes );
+		$this->assertSame( array(), $subject->receipts );
+		$this->assertSame( 0, $subject->prunes );
 	}
 
 	public function test_digest_failure_preserves_prior_target_and_settles_failed() {
@@ -101,7 +110,11 @@ class Test_MainWP_Child_File_Deployment_V2 extends WP_UnitTestCase {
 		$this->assertSame( 'failed', $result['status'] );
 		$this->assertSame( 'digest_mismatch', $result['code'] );
 		$this->assertSame( 'prior bytes', $subject->target_bytes );
-		$this->assertSame( 0, $subject->writes );
+		$this->assertSame( array(), $subject->backups );
+		$settled = $subject->receipts[ $request['payload']['request_ref'] ];
+		$this->assertSame( 'settled', $settled['state'] );
+		$this->assertNull( $settled['backup_ref'] );
+		$this->assertSame( 'failed', $settled['result']['status'] );
 	}
 
 	public function test_rollback_restores_prior_bytes_and_refuses_current_drift() {
@@ -145,6 +158,58 @@ class Test_MainWP_Child_File_Deployment_V2 extends WP_UnitTestCase {
 		$deploy['payload']['gateway_url'] = 'https://attacker.example/private';
 		$this->assertSame( 'gateway_rejected', $subject->deploy_v2( $deploy )['code'] );
 		$this->assertSame( 0, $subject->gateway_reads );
+	}
+
+	public function test_unreadable_receipt_storage_is_not_collapsed_into_not_found() {
+		$ref     = '123e4567-e89b-42d3-a456-426614174201';
+		$missing = new Storage_MainWP_Child_File_Deployment();
+		$broken  = new Storage_MainWP_Child_File_Deployment();
+		$broken->storage_absent = false;
+
+		$this->assertSame( 'not_found', $missing->deployment_state_v2( $this->status_request( $ref ) )['code'] );
+		$this->assertSame( 'storage_unavailable', $broken->deployment_state_v2( $this->status_request( $ref ) )['code'] );
+		$this->assertSame( 'not_found', $missing->rollback_v2( $this->rollback_request( $ref, hash( 'sha256', 'current' ) ) )['code'] );
+		$this->assertSame( 'storage_unavailable', $broken->rollback_v2( $this->rollback_request( $ref, hash( 'sha256', 'current' ) ) )['code'] );
+	}
+
+	public function test_rollback_available_tracks_whether_a_backup_can_be_retained() {
+		$path = WP_CONTENT_DIR . '/uploads/mainwp-rollback-capability.txt';
+		wp_mkdir_p( dirname( $path ) );
+		file_put_contents( $path, 'prior bytes' ); // phpcs:ignore WordPress.WP.AlternativeFunctions -- Fixture byte placement.
+		$request = $this->preflight_request();
+		$request['payload']['relative_destination'] = 'wp-content/uploads/mainwp-rollback-capability.txt';
+
+		$subject                         = new Snapshot_MainWP_Child_File_Deployment();
+		$retainable                      = $subject->preflight_v2( $request );
+		$subject->backup_storage_working = false;
+		$unretainable                    = $subject->preflight_v2( $request );
+		wp_delete_file( $path );
+
+		$this->assertTrue( $retainable['target_exists'] );
+		$this->assertTrue( $retainable['rollback_available'] );
+		$this->assertTrue( $unretainable['target_exists'] );
+		$this->assertTrue( $unretainable['writable'] );
+		$this->assertFalse( $unretainable['rollback_available'] );
+		$this->assertNotSame( $retainable['state_revision'], $unretainable['state_revision'] );
+	}
+
+	public function test_expired_receipt_is_never_replayed_as_live() {
+		$subject                = new Testable_MainWP_Child_File_Deployment();
+		$bytes                  = 'verified fixture bytes';
+		$subject->gateway_bytes = $bytes;
+		$preflight              = $subject->preflight_v2( $this->preflight_request() );
+		$request                = $this->deploy_request( $preflight, $bytes );
+		$this->assertTrue( $subject->deploy_v2( $request )['ok'] );
+
+		$ref = $request['payload']['request_ref'];
+		$subject->receipts[ $ref ]['updated_at'] = time() - 100;
+		$subject->receipts[ $ref ]['expires_at'] = time() - 1;
+
+		$this->assertSame( 'receipt_expired', $subject->deployment_state_v2( $this->status_request( $ref ) )['code'] );
+		$this->assertSame( 'receipt_expired', $subject->deploy_v2( $request )['code'] );
+		$this->assertSame( 'receipt_expired', $subject->rollback_v2( $this->rollback_request( $ref, hash( 'sha256', $bytes ) ) )['code'] );
+		$this->assertSame( 1, $subject->writes );
+		$this->assertSame( 1, $subject->gateway_reads );
 	}
 
 	public function test_authenticated_callable_map_exposes_the_four_v2_operations() {
@@ -220,6 +285,11 @@ class Testable_MainWP_Child_File_Deployment extends MainWP_Child_File_Deployment
 	public $receipts = array();
 	public $backups = array();
 	public $lock_available = true;
+	public $prunes = 0;
+
+	protected function prune_expired_storage() {
+		++$this->prunes;
+	}
 
 	protected function target_snapshot( $destination_class, $relative_destination ) {
 		unset( $destination_class, $relative_destination );
@@ -292,5 +362,34 @@ class Testable_MainWP_Child_File_Deployment extends MainWP_Child_File_Deployment
 
 	public function seed_dispatching( $request ) {
 		$this->receipts[ $request['payload']['request_ref'] ] = $this->dispatching_receipt_for_test( $request['payload'] );
+	}
+}
+
+/**
+ * Drive the production receipt reader against a storage root that cannot be used.
+ */
+class Storage_MainWP_Child_File_Deployment extends MainWP_Child_File_Deployment {
+
+	public $storage_absent = true;
+
+	protected function storage_root( $create ) {
+		unset( $create );
+		return false;
+	}
+
+	protected function storage_root_absent() {
+		return $this->storage_absent;
+	}
+}
+
+/**
+ * Drive the production target snapshot against a known backup-storage capability.
+ */
+class Snapshot_MainWP_Child_File_Deployment extends MainWP_Child_File_Deployment {
+
+	public $backup_storage_working = true;
+
+	protected function backup_storage_available() {
+		return $this->backup_storage_working;
 	}
 }

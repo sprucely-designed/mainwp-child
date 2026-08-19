@@ -166,6 +166,25 @@ class MainWP_Child_Virusdie {
         return $this->valid_receipt( $value ) ? $value : false;
     }
 
+    /** Report whether a stored receipt is past its retention window. */
+    private function receipt_expired( $receipt ) {
+        return is_array( $receipt ) && isset( $receipt['expires_at'] ) && is_int( $receipt['expires_at'] ) && $receipt['expires_at'] <= time();
+    }
+
+    /** Drop one receipt a mutation has proven past retention. */
+    protected function delete_receipt( $request_ref ) {
+        return delete_option( $this->receipt_key( $request_ref ) );
+    }
+
+    /** Take over one request reference whose receipt has expired, so nothing stale is replayed. */
+    private function evict_expired_receipt( $request_ref, $existing ) {
+        if ( ! is_array( $existing ) || ! $this->receipt_expired( $existing ) ) {
+            return $existing;
+        }
+        $this->delete_receipt( $request_ref );
+        return null;
+    }
+
     /** Reserve a request exactly once. */
     protected function create_receipt( $request_ref, $receipt ) {
         return $this->valid_receipt( $receipt ) && add_option( $this->receipt_key( $request_ref ), $receipt, '', false ) && $receipt === $this->load_receipt( $request_ref );
@@ -194,6 +213,8 @@ class MainWP_Child_Virusdie {
         if ( false === $existing ) {
             return $this->error( 'install', 'storage_unavailable' );
         }
+        // Only this mutation path evicts: status is a read and must never write.
+        $existing = $this->evict_expired_receipt( $payload['request_ref'], $existing );
         if ( is_array( $existing ) ) {
             return $this->replay( $existing, $effect_hash );
         }
@@ -238,6 +259,8 @@ class MainWP_Child_Virusdie {
         if ( false === $existing ) {
             return $this->error( 'remove', 'storage_unavailable' );
         }
+        // Only this mutation path evicts: status is a read and must never write.
+        $existing = $this->evict_expired_receipt( $payload['request_ref'], $existing );
         if ( is_array( $existing ) ) {
             return $this->replay( $existing, $effect_hash );
         }
@@ -276,7 +299,7 @@ class MainWP_Child_Virusdie {
         if ( false === $receipt ) {
             return $this->error( 'status', 'storage_unavailable' );
         }
-        if ( ! is_array( $receipt ) ) {
+        if ( ! is_array( $receipt ) || $this->receipt_expired( $receipt ) ) {
             return $this->error( 'status', 'not_found' );
         }
         return 'dispatching' === $receipt['state'] ? $this->unknown_result( $receipt ) : $receipt['result'];

@@ -21,11 +21,23 @@ class Test_MainWP_Child_Code_Snippets_V2_Fixture extends MainWP_Child_Misc {
 	/** @var bool */
 	public $write_fails = false;
 
+	/** @var bool */
+	public $release_fails = false;
+
 	/** @var string|false */
 	public $config_path = false;
 
 	/** @var array<int,string|false> Every staging attempt, recorded without altering the real result. */
 	public $staged = array();
+
+	/** @var string|null Lock file probed while a replacement is in flight. */
+	public $probe_lock_path = null;
+
+	/** @var bool|null Whether the probed lock was free mid-write; null when it was never probed. */
+	public $lock_free_during_write = null;
+
+	/** @var int|false|null Inode the probed lock had mid-write. */
+	public $lock_inode_during_write = null;
 
 	/** @return mixed */
 	protected function snippet_v2_get_option( $name, $fallback = false ) {
@@ -48,7 +60,7 @@ class Test_MainWP_Child_Code_Snippets_V2_Fixture extends MainWP_Child_Misc {
 
 	/** @return bool */
 	protected function snippet_v2_release_lock( $slug, $owner ) {
-		return 'fixture-owner' === $owner;
+		return ! $this->release_fails && 'fixture-owner' === $owner;
 	}
 
 	/** @return string|false */
@@ -63,14 +75,44 @@ class Test_MainWP_Child_Code_Snippets_V2_Fixture extends MainWP_Child_Misc {
 
 	/** @return string|false */
 	protected function snippet_v2_stage_file( $directory, $prefix, $contents, $permissions ) {
+		$this->probe_configuration_lock();
 		$staged         = parent::snippet_v2_stage_file( $directory, $prefix, $contents, $permissions );
 		$this->staged[] = $staged;
 		return $staged;
+	}
+
+	/**
+	 * Try to take the configuration lock from an independent handle while a replacement is in
+	 * flight. flock() conflicts between separate open file descriptions, so a lock that is really
+	 * held refuses this even inside the same process.
+	 *
+	 * @return void
+	 */
+	private function probe_configuration_lock() {
+		if ( ! is_string( $this->probe_lock_path ) || ! file_exists( $this->probe_lock_path ) ) {
+			return;
+		}
+		$this->lock_inode_during_write = fileinode( $this->probe_lock_path );
+		$probe                         = fopen( $this->probe_lock_path, 'c' ); // phpcs:ignore WordPress.WP.AlternativeFunctions -- Probing an advisory lock needs a real handle.
+		if ( false === $probe ) {
+			return;
+		}
+		$this->lock_free_during_write = flock( $probe, LOCK_EX | LOCK_NB );
+		if ( $this->lock_free_during_write ) {
+			flock( $probe, LOCK_UN );
+		}
+		fclose( $probe ); // phpcs:ignore WordPress.WP.AlternativeFunctions -- Pairs with the fopen above.
 	}
 }
 
 /** Code Snippets protocol-v2 contract tests. */
 class Test_MainWP_Child_Code_Snippets_V2 extends WP_UnitTestCase {
+
+	/**
+	 * Name of the lock file the configuration writer is expected to hold, spelled out here rather
+	 * than read back from the subject so a writer that stops locking fails instead of adapting.
+	 */
+	const LOCK_FILE = '.mainwp-snippets-config-lock.php';
 
 	/** @var string */
 	private $request_ref = '123e4567-e89b-42d3-a456-426614174000';
@@ -95,6 +137,10 @@ class Test_MainWP_Child_Code_Snippets_V2 extends WP_UnitTestCase {
 
 	/** Remove the temporary configuration fixture. */
 	public function tearDown(): void {
+		$shared_lock = rtrim( sys_get_temp_dir(), '/' ) . '/' . self::LOCK_FILE;
+		if ( file_exists( $shared_lock ) ) {
+			unlink( $shared_lock );
+		}
 		if ( is_string( $this->config_path ) && file_exists( $this->config_path ) ) {
 			unlink( $this->config_path );
 		}
@@ -123,7 +169,8 @@ class Test_MainWP_Child_Code_Snippets_V2 extends WP_UnitTestCase {
 		$path = $this->config_dir . '/wp-config.php';
 		file_put_contents( $path, $contents );
 		chmod( $path, 0644 );
-		$this->fixture->config_path = $path;
+		$this->fixture->config_path     = $path;
+		$this->fixture->probe_lock_path = $this->config_dir . '/' . self::LOCK_FILE;
 		return $path;
 	}
 
@@ -228,6 +275,10 @@ class Test_MainWP_Child_Code_Snippets_V2 extends WP_UnitTestCase {
 		$fallback = rtrim( sys_get_temp_dir(), '/' );
 		$before   = (array) glob( $fallback . '/.mainwp-cs-*' );
 
+		// Steady state on a site that has written before: the lock file already exists, so the
+		// writer gets past locking and the staging refusal is what stops it.
+		file_put_contents( $this->config_dir . '/' . self::LOCK_FILE, '' );
+
 		chmod( $this->config_dir, 0555 );
 		clearstatcache();
 		if ( is_writable( $this->config_dir ) ) {
@@ -272,5 +323,117 @@ class Test_MainWP_Child_Code_Snippets_V2 extends WP_UnitTestCase {
 		$this->assertStringNotContainsString( 'FIXTURE_VALUE', file_get_contents( $path ) );
 		$this->assertStringContainsString( '/* collateral */', file_get_contents( $path ) );
 		$this->assertSame( array(), (array) glob( $this->config_dir . '/.mainwp-cs-*' ) );
+	}
+
+	/** A committed write is reported as it happened when only the lock release failed. */
+	public function test_committed_write_survives_a_failed_lock_release() {
+		$this->fixture->release_fails = true;
+
+		$result = $this->fixture->snippet_v2( 'apply_snippet_v2', $this->request() );
+
+		$this->assertTrue( $result['success'] );
+		$this->assertSame( 'changed', $result['result'] );
+		$this->assertSame( 'confirmed', $result['installed_state'] );
+		$this->assertNull( $result['error_code'] );
+		$this->assertSame( array( 'lock_release_failed' ), $result['warning_codes'] );
+		$this->assertSame( "echo 'ok';", $this->fixture->options['mainwp_ext_code_snippets']['FixtureSlug1'] );
+
+		$remove = $this->request();
+		unset( $remove['code'] );
+		$removal = $this->fixture->snippet_v2( 'remove_snippet_v2', $remove );
+		$this->assertSame( 'removed', $removal['result'] );
+		$this->assertSame( array( 'lock_release_failed' ), $removal['warning_codes'] );
+
+		$this->fixture->write_fails = true;
+		$failed                     = $this->fixture->snippet_v2( 'apply_snippet_v2', $this->request() );
+		$this->assertFalse( $failed['success'], 'A write that really failed still reports the failure.' );
+		$this->assertSame( 'storage_failed', $failed['error_code'] );
+		$this->assertSame( array( 'lock_release_failed' ), $failed['warning_codes'] );
+	}
+
+	/** Every reply carries one envelope and correlates to the request that produced it. */
+	public function test_every_response_shares_one_envelope() {
+		$responses                  = array();
+		$responses['run_succeeded'] = $this->fixture->snippet_v2( 'run_snippet_v2', $this->request( 'R', "echo 'ok';" ) );
+		$responses['run_failed']    = $this->fixture->snippet_v2( 'run_snippet_v2', $this->request( 'R', "throw new Exception('x');" ) );
+		$responses['applied']       = $this->fixture->snippet_v2( 'apply_snippet_v2', $this->request() );
+		$responses['invalid_type']  = $this->fixture->snippet_v2( 'apply_snippet_v2', $this->request( 'X' ) );
+
+		$this->fixture->lock_busy = true;
+		$responses['lock_busy']   = $this->fixture->snippet_v2( 'apply_snippet_v2', $this->request() );
+		$this->fixture->lock_busy = false;
+
+		foreach ( $responses as $label => $response ) {
+			foreach ( array( 'success', 'request_ref', 'error_code', 'warning_codes' ) as $key ) {
+				$this->assertArrayHasKey( $key, $response, $label . ' is missing ' . $key );
+			}
+			$this->assertIsBool( $response['success'], $label );
+			$this->assertIsArray( $response['warning_codes'], $label );
+			$this->assertTrue( null === $response['error_code'] || is_string( $response['error_code'] ), $label );
+			$this->assertSame( $this->request_ref, $response['request_ref'], $label . ' must correlate to its request' );
+		}
+
+		$this->assertNull( $responses['applied']['error_code'] );
+		$this->assertSame( 'execution_failed', $responses['run_failed']['error_code'] );
+		$this->assertSame( 'invalid_request', $responses['invalid_type']['error_code'] );
+		$this->assertFalse( $responses['invalid_type']['success'] );
+		$this->assertSame( 'lock_busy', $responses['lock_busy']['error_code'] );
+		$this->assertNull(
+			$this->fixture->snippet_v2( 'apply_snippet_v2', array() )['request_ref'],
+			'A request carrying no usable reference must report none rather than invent one.'
+		);
+	}
+
+	/** Slugs v1 accepted with a hyphen or underscore stay addressable, in both storage backends. */
+	public function test_v1_style_slugs_round_trip() {
+		$stored         = $this->request();
+		$stored['slug'] = 'legacy-slug_01';
+		$this->assertSame( 'changed', $this->fixture->snippet_v2( 'apply_snippet_v2', $stored )['result'] );
+		$this->assertSame( "echo 'ok';", $this->fixture->options['mainwp_ext_code_snippets']['legacy-slug_01'] );
+
+		$remove = $stored;
+		unset( $remove['code'] );
+		$this->assertSame( 'removed', $this->fixture->snippet_v2( 'remove_snippet_v2', $remove )['result'] );
+		$this->assertArrayNotHasKey( 'legacy-slug_01', $this->fixture->options['mainwp_ext_code_snippets'] );
+
+		$config         = $this->request( 'C', "define( 'LEGACY_SLUG', true );" );
+		$config['slug'] = 'legacy-slug_01';
+		$this->assertSame( 'changed', $this->fixture->snippet_v2( 'apply_snippet_v2', $config )['result'] );
+		$this->assertStringContainsString( '/***snippet_legacy-slug_01***/', file_get_contents( $this->config_path ) );
+
+		$config_remove = $config;
+		unset( $config_remove['code'] );
+		$this->assertSame( 'removed', $this->fixture->snippet_v2( 'remove_snippet_v2', $config_remove )['result'] );
+		$this->assertStringNotContainsString( 'LEGACY_SLUG', file_get_contents( $this->config_path ) );
+		$this->assertStringContainsString( '/* collateral */', file_get_contents( $this->config_path ) );
+	}
+
+	/** Validation reads the key set, not the order the Dashboard happened to serialize it in. */
+	public function test_request_key_order_does_not_decide_validity() {
+		$reordered = array_reverse( $this->request(), true );
+		$this->assertSame( array( 'code', 'type', 'slug', 'request_ref', 'protocol_version' ), array_keys( $reordered ) );
+
+		$result = $this->fixture->snippet_v2( 'apply_snippet_v2', $reordered );
+		$this->assertTrue( $result['success'] );
+		$this->assertSame( 'changed', $result['result'] );
+
+		$missing = $this->request();
+		unset( $missing['type'] );
+		$this->assertSame( 'invalid_request', $this->fixture->snippet_v2( 'apply_snippet_v2', $missing )['error_code'] );
+	}
+
+	/** The configuration lock is held across the replace and is not the inode the rename swaps out. */
+	public function test_configuration_lock_is_held_across_the_replace_and_outlives_it() {
+		$path         = $this->isolated_config( "<?php\n\$table_prefix = 'wp_';\n/* collateral */\n" );
+		$lock         = $this->config_dir . '/' . self::LOCK_FILE;
+		$target_inode = fileinode( $path );
+
+		$result = $this->fixture->snippet_v2( 'apply_snippet_v2', $this->request( 'C', "define( 'FIXTURE_VALUE', true );" ) );
+
+		$this->assertSame( 'changed', $result['result'] );
+		$this->assertFileExists( $lock );
+		$this->assertFalse( $this->fixture->lock_free_during_write, 'The lock must be held while the replacement is staged and renamed.' );
+		$this->assertNotSame( $target_inode, fileinode( $path ), 'The replacement must arrive by rename.' );
+		$this->assertSame( $this->fixture->lock_inode_during_write, fileinode( $lock ), 'The lock must not sit on the inode the rename replaces.' );
 	}
 }

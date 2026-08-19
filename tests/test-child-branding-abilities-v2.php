@@ -30,6 +30,9 @@ class Test_MainWP_Child_Branding_V2_Fixture extends MainWP_Child_Branding {
 	/** @var bool */
 	public $receipt_write_succeeds = true;
 
+	/** @var string|null IS_FREE_LOCK() observed while the settings write ran. */
+	public $lock_free_during_write = null;
+
 	/**
 	 * Avoid WordPress hooks and seed deterministic state.
 	 *
@@ -50,10 +53,17 @@ class Test_MainWP_Child_Branding_V2_Fixture extends MainWP_Child_Branding {
 	 * @return bool
 	 */
 	protected function abilities_v2_write_settings( $settings ) {
+		global $wpdb;
+		$this->lock_free_during_write = $wpdb->get_var( $wpdb->prepare( 'SELECT IS_FREE_LOCK(%s)', $this->abilities_v2_lock_name() ) );
 		if ( $this->settings_write_succeeds ) {
 			$this->stored_settings = $settings;
 		}
 		return $this->settings_write_succeeds;
+	}
+
+	/** @return string */
+	public function lock_name() {
+		return $this->abilities_v2_lock_name();
 	}
 
 	/** @return array */
@@ -106,7 +116,6 @@ class Test_MainWP_Child_Branding_Abilities_V2 extends WP_UnitTestCase {
 	 * @return array
 	 */
 	private function invoke_v2( $object, $request ) {
-		$this->assertTrue( method_exists( MainWP_Child_Branding::class, 'apply_abilities_v2' ) );
 		$method = new ReflectionMethod( MainWP_Child_Branding::class, 'apply_abilities_v2' );
 		$method->setAccessible( true );
 		return $method->invoke( $object, $request );
@@ -358,11 +367,94 @@ class Test_MainWP_Child_Branding_Abilities_V2 extends WP_UnitTestCase {
 	}
 
 	/**
-	 * The legacy receiver remains present and its source body is unchanged around v2.
+	 * The legacy receiver still persists a posted settings map.
 	 */
-	public function test_legacy_update_branding_contract_remains_available() {
-		$this->assertTrue( method_exists( MainWP_Child_Branding::class, 'update_branding' ) );
-		$method = new ReflectionMethod( MainWP_Child_Branding::class, 'update_branding' );
-		$this->assertTrue( $method->isPublic() );
+	public function test_legacy_update_branding_persists_the_posted_settings() {
+		delete_option( 'mainwp_child_branding_settings' );
+		$fixture  = new Test_MainWP_Child_Branding_V2_Fixture( array( 'extra_settings' => array() ) );
+		$settings = $this->desired_settings(
+			array(
+				'child_plugin_name' => 'Legacy Connector',
+				'child_plugin_hide' => true,
+			)
+		);
+		$settings['child_remove_connection_detail'] = 1;
+		$_POST['settings']                          = base64_encode( wp_json_encode( $settings ) );
+
+		$result = $fixture->update_branding();
+		unset( $_POST['settings'] );
+
+		$this->assertSame( 'SUCCESS', $result['result'] );
+		$stored = get_option( 'mainwp_child_branding_settings' );
+		$this->assertSame( 'Legacy Connector', $stored['branding_header']['name'] );
+		$this->assertSame( 'T', $stored['hide'] );
+		$this->assertSame( 1, $stored['remove_connection_detail'] );
+		$this->assertSame( 'Y', $stored['branding_ext_enabled'] );
+		delete_option( 'mainwp_child_branding_settings' );
+	}
+
+	/**
+	 * The apply runs inside the named mutation lock and releases it afterwards.
+	 */
+	public function test_apply_holds_the_named_mutation_lock_and_releases_it() {
+		$fixture = new Test_MainWP_Child_Branding_V2_Fixture();
+		$this->assertNull( $fixture->lock_free_during_write );
+
+		$result = $this->invoke_v2( $fixture, $this->request( $this->desired_settings() ) );
+
+		$this->assertTrue( $result['ok'] );
+		$this->assertSame( '0', (string) $fixture->lock_free_during_write );
+		$this->assertSame( '1', (string) $this->lock_state( $fixture->lock_name() ) );
+	}
+
+	/**
+	 * A lock held by another request is refused honestly, with no settings or receipt effect.
+	 */
+	public function test_apply_refuses_honestly_while_another_request_holds_the_lock() {
+		$fixture = new Test_MainWP_Child_Branding_V2_Fixture();
+		$holder  = $this->hold_lock_elsewhere( $fixture->lock_name() );
+		$result  = $this->invoke_v2( $fixture, $this->request( $this->desired_settings() ) );
+		$this->release_lock_elsewhere( $holder, $fixture->lock_name() );
+
+		$this->assertFalse( $result['ok'] );
+		$this->assertSame( 'lock_busy', $result['error']['code'] );
+		$this->assertSame( array(), $fixture->stored_settings );
+		$this->assertSame( array(), $fixture->stored_receipts );
+		$this->assertNull( $fixture->lock_free_during_write );
+	}
+
+	/**
+	 * Read IS_FREE_LOCK() for one named lock.
+	 *
+	 * @param string $name Lock name.
+	 * @return string|null
+	 */
+	private function lock_state( $name ) {
+		global $wpdb;
+		return $wpdb->get_var( $wpdb->prepare( 'SELECT IS_FREE_LOCK(%s)', $name ) );
+	}
+
+	/**
+	 * Hold one named lock on a second database connection.
+	 *
+	 * @param string $name Lock name.
+	 * @return wpdb
+	 */
+	private function hold_lock_elsewhere( $name ) {
+		$other = new wpdb( DB_USER, DB_PASSWORD, DB_NAME, DB_HOST );
+		$other->suppress_errors( true );
+		$this->assertSame( '1', (string) $other->get_var( $other->prepare( 'SELECT GET_LOCK(%s,0)', $name ) ) );
+		return $other;
+	}
+
+	/**
+	 * Release the lock held on the second connection.
+	 *
+	 * @param wpdb   $other Second connection.
+	 * @param string $name  Lock name.
+	 */
+	private function release_lock_elsewhere( $other, $name ) {
+		$other->get_var( $other->prepare( 'SELECT RELEASE_LOCK(%s)', $name ) );
+		$other->close();
 	}
 }

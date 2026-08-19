@@ -44,6 +44,13 @@ class MainWP_Custom_Post_Type {
     private static $v2_action = false;
 
     /**
+     * Whether the current v2 action has already written child content.
+     *
+     * @var bool
+     */
+    private static $v2_mutation_started = false;
+
+    /**
      * Public variable to hold the information about the language domain.
      *
      * @var string 'mainwp-child' languge domain.
@@ -160,6 +167,23 @@ class MainWP_Custom_Post_Type {
 
 
     /**
+     * Return the truthful closed outcome for a fatal during a v2 import.
+     *
+     * `rejected` promises the child was left untouched, so it may only be reported while
+     * nothing has been written yet. Once the first row, meta delete or term unlink has run
+     * the request may have applied in part, which the Dashboard has to reconcile rather
+     * than retry.
+     *
+     * @return array Closed fatal outcome.
+     */
+    private static function v2_fatal_outcome() {
+        return array(
+            'outcome' => static::$v2_mutation_started ? 'unknown' : 'rejected',
+            'reason'  => 'child_failure',
+        );
+    }
+
+    /**
      * Method mainwp_custom_post_type_handle_fatal_error()
      *
      * Custom post type fatal error handler.
@@ -167,10 +191,7 @@ class MainWP_Custom_Post_Type {
     public static function mainwp_custom_post_type_handle_fatal_error() {
         $error = error_get_last();
         if ( self::$v2_action && isset( $error['type'] ) && E_ERROR === $error['type'] ) {
-            $data = array(
-                'outcome' => 'rejected',
-                'reason'  => 'child_failure',
-            );
+            $data = static::v2_fatal_outcome();
         } elseif ( isset( $error['type'] ) && E_ERROR === $error['type'] && isset( $error['message'] ) ) {
             $data = array( 'error' => 'MainWPChild fatal error : ' . $error['message'] . ' Line: ' . $error['line'] . ' File: ' . $error['file'] );
         } else {
@@ -254,6 +275,7 @@ class MainWP_Custom_Post_Type {
      * @return array Closed v2 result.
      */
     private function import_custom_post_v2() { // phpcs:ignore -- bounded orchestration is clearer in one method.
+        self::$v2_mutation_started = false;
         add_filter( 'http_request_host_is_external', '__return_true' );
 
         // phpcs:disable WordPress.Security.NonceVerification,WordPress.Security.ValidatedSanitizedInput.InputNotSanitized
@@ -284,9 +306,19 @@ class MainWP_Custom_Post_Type {
             return $this->v2_rejected( 'invalid_payload' );
         }
 
-        $post_type = $data['post']['post_type'];
-        if ( ! in_array( $post_type, get_post_types( array( '_builtin' => false ) ), true ) ) {
+        $post_type    = $data['post']['post_type'];
+        $custom_types = get_post_types( array( '_builtin' => false ) );
+        if ( ! in_array( $post_type, $custom_types, true ) ) {
             return $this->v2_rejected( 'unsupported_post_type' );
+        }
+        if ( isset( $data['product_variation'] ) ) {
+            foreach ( $data['product_variation'] as $variation_payload ) {
+                // Variations reach wp_insert_post through the same writer, so they need the same
+                // registered-and-not-builtin gate; without it any post type could be imported here.
+                if ( ! in_array( $variation_payload['post']['post_type'], $custom_types, true ) ) {
+                    return $this->v2_rejected( 'unsupported_post_type' );
+                }
+            }
         }
         $mode = 'created';
         if ( $edit_id > 0 ) {
@@ -444,6 +476,7 @@ class MainWP_Custom_Post_Type {
         if ( $parent_id > 0 ) {
             $insert['post_parent'] = $parent_id;
         }
+        self::$v2_mutation_started = true;
         if ( $edit_id > 0 ) {
             $insert['ID'] = $edit_id;
             $post_id      = wp_update_post( $insert, true );

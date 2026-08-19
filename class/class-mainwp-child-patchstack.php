@@ -187,8 +187,8 @@ class MainWP_Child_Patchstack { //phpcs:ignore -- NOSONAR - multi methods.
     /**
      * Negotiate the Patchstack abilities protocol.
      *
-     * No Patchstack mutation is advertised until its full preview, execute,
-     * status, and visibility contracts are implemented.
+     * Capabilities are derived from what this Child can actually carry out, so an
+     * operation this build cannot run is refused by name instead of advertised.
      *
      * @param mixed $request Decoded request envelope.
      * @return array Protocol response.
@@ -199,14 +199,26 @@ class MainWP_Child_Patchstack { //phpcs:ignore -- NOSONAR - multi methods.
         }
 
         $operation = $request['operation'];
-        if ( 'capabilities' === $operation && array() === $request['payload'] ) {
+        $mutations = array( 'patchstack_protection_execute_v2', 'patchstack_visibility_replace_v2' );
+        $supported = $this->abilities_v2_supported_operations();
+        if ( 'capabilities' === $operation ) {
+            // Negotiation is supported; a payload on it is a malformed request, not an unknown operation.
+            if ( array() !== $request['payload'] ) {
+                return $this->abilities_v2_error( $operation, 'invalid_request' );
+            }
+
             return array(
                 'protocol'           => '2',
                 'operation'          => 'capabilities',
                 'ok'                 => true,
-                'operations'         => array( 'patchstack_protection_preview_v2', 'patchstack_protection_execute_v2', 'patchstack_protection_status_v2', 'patchstack_visibility_replace_v2' ),
-                'mutation_supported' => true,
+                'operations'         => $supported,
+                'mutation_supported' => array() !== array_intersect( $mutations, $supported ),
             );
+        }
+
+        // Anything this Child cannot carry out is refused by name, before any payload is judged.
+        if ( ! in_array( $operation, $supported, true ) ) {
+            return $this->abilities_v2_error( $operation, 'unsupported_operation' );
         }
 
         if ( 'patchstack_protection_preview_v2' === $operation ) {
@@ -233,6 +245,21 @@ class MainWP_Child_Patchstack { //phpcs:ignore -- NOSONAR - multi methods.
         }
 
         return $this->abilities_v2_error( $operation, 'unsupported_operation' );
+    }
+
+    /**
+     * List the operations this Child can actually carry out.
+     *
+     * Protection execution needs a publisher-signed package plus a licensing
+     * adapter, and Patchstack exposes neither to the Child, so it is neither
+     * advertised nor dispatched. A build that wires
+     * abilities_v2_verified_package_manifest() and abilities_v2_apply_protection()
+     * extends this list.
+     *
+     * @return array Executable operation names.
+     */
+    protected function abilities_v2_supported_operations() {
+        return array( 'patchstack_protection_preview_v2', 'patchstack_protection_status_v2', 'patchstack_visibility_replace_v2' );
     }
 
     /**
@@ -300,7 +327,8 @@ class MainWP_Child_Patchstack { //phpcs:ignore -- NOSONAR - multi methods.
         if ( ! hash_equals( $revision, $payload['if_match'] ) ) {
             return $this->abilities_v2_error( $operation, 'stale_revision' );
         }
-        if ( 'protected' !== $state && 'verified_available' !== $package_state ) {
+        // 'not_needed' means the plugin is already on disk, so there is no package to verify before licensing it.
+        if ( 'protected' !== $state && 'verification_unavailable' === $package_state ) {
             return $this->abilities_v2_error( $operation, 'package_verification_unavailable' );
         }
 
@@ -333,10 +361,13 @@ class MainWP_Child_Patchstack { //phpcs:ignore -- NOSONAR - multi methods.
             return $this->abilities_v2_settle_protection_receipt( $receipts, $payload['operation_ref'], $dispatching, $result );
         }
 
-        $manifest = $this->abilities_v2_verified_package_manifest();
-        if ( ! $this->abilities_v2_valid_manifest( $manifest ) ) {
-            $result = $this->abilities_v2_protection_result( $payload['operation_ref'], 'failed', $state, false, 'package_verification_unavailable' );
-            return $this->abilities_v2_settle_protection_receipt( $receipts, $payload['operation_ref'], $dispatching, $result );
+        $manifest = null;
+        if ( 'not_needed' !== $package_state ) {
+            $manifest = $this->abilities_v2_verified_package_manifest();
+            if ( ! $this->abilities_v2_valid_manifest( $manifest ) ) {
+                $result = $this->abilities_v2_protection_result( $payload['operation_ref'], 'failed', $state, false, 'package_verification_unavailable' );
+                return $this->abilities_v2_settle_protection_receipt( $receipts, $payload['operation_ref'], $dispatching, $result );
+            }
         }
 
         $applied = $this->abilities_v2_apply_protection( $payload, $state, $manifest );
@@ -525,9 +556,9 @@ class MainWP_Child_Patchstack { //phpcs:ignore -- NOSONAR - multi methods.
      * The production implementation remains unavailable until the publisher
      * supplies the signed artifact and a direct supported licensing contract.
      *
-     * @param array  $payload  Closed execution payload.
-     * @param string $before   Prior plugin state.
-     * @param array  $manifest Verified package manifest.
+     * @param array      $payload  Closed execution payload.
+     * @param string     $before   Prior plugin state.
+     * @param array|null $manifest Verified package manifest, or null when the plugin is already installed.
      * @return array|false Apply result.
      */
     protected function abilities_v2_apply_protection( $payload, $before, $manifest ) {

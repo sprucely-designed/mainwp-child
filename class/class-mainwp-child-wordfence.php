@@ -836,9 +836,36 @@ class MainWP_Child_Wordfence { //phpcs:ignore -- NOSONAR - multi methods.
         }
 
         $request_ref = $request_bound ? strtolower( $request['request_ref'] ) : null;
-        $effect_hash = hash( 'sha256', wp_json_encode( array( $operation, $request['payload'] ) ) );
+        if ( ! in_array( $operation, $mutations, true ) ) {
+            return $this->abilities_v2_dispatch( $operation, $request['payload'], $request_ref, false, $request_bound );
+        }
+
+        // The receipt check and the dispatch it guards have to be one atomic step, or two
+        // concurrent requests carrying the same reference both reach the provider.
+        if ( ! $this->abilities_v2_begin_mutation_lock() ) {
+            return $this->abilities_v2_error( $operation, 'lock_busy' );
+        }
+        try {
+            return $this->abilities_v2_dispatch( $operation, $request['payload'], $request_ref, true, $request_bound );
+        } finally {
+            $this->abilities_v2_end_mutation_lock();
+        }
+    }
+
+    /**
+     * Execute one validated operation, under the mutation lock when it mutates.
+     *
+     * @param string      $operation     Operation name.
+     * @param array       $payload       Validated operation payload.
+     * @param string|null $request_ref   Canonical request reference.
+     * @param bool        $is_mutation   Whether the operation mutates.
+     * @param bool        $request_bound Whether the response echoes the request reference.
+     * @return array<string,mixed> Closed response.
+     */
+    private function abilities_v2_dispatch( $operation, $payload, $request_ref, $is_mutation, $request_bound ) {
+        $effect_hash = hash( 'sha256', wp_json_encode( array( $operation, $payload ) ) );
         $receipts    = array();
-        if ( in_array( $operation, $mutations, true ) ) {
+        if ( $is_mutation ) {
             $receipts = get_option( 'mainwp_wordfence_abilities_v2_receipts', array() );
             if ( ! is_array( $receipts ) ) {
                 return $this->abilities_v2_error( $operation, 'storage_unavailable' );
@@ -856,9 +883,9 @@ class MainWP_Child_Wordfence { //phpcs:ignore -- NOSONAR - multi methods.
         }
 
         try {
-            $result = $this->abilities_v2_provider_operation( $operation, $request['payload'], $request_ref );
+            $result = $this->abilities_v2_provider_operation( $operation, $payload, $request_ref );
         } catch ( \Throwable $throwable ) {
-            return $this->abilities_v2_error( $operation, in_array( $operation, $mutations, true ) ? 'outcome_unknown' : 'provider_unavailable' );
+            return $this->abilities_v2_error( $operation, $is_mutation ? 'outcome_unknown' : 'provider_unavailable' );
         }
         if ( is_wp_error( $result ) ) {
             $code = $result->get_error_code();
@@ -878,7 +905,7 @@ class MainWP_Child_Wordfence { //phpcs:ignore -- NOSONAR - multi methods.
             $request_bound ? array( 'request_ref' => $request_ref ) : array(),
             $result
         );
-        if ( in_array( $operation, $mutations, true ) ) {
+        if ( $is_mutation ) {
             if ( 100 <= count( $receipts ) ) {
                 array_shift( $receipts );
             }
@@ -908,6 +935,45 @@ class MainWP_Child_Wordfence { //phpcs:ignore -- NOSONAR - multi methods.
         $result = $response;
         unset( $result['protocol'], $result['operation'], $result['ok'], $result['request_ref'] );
         return $this->abilities_v2_valid_result( $operation, $result );
+    }
+
+    /**
+     * Return this installation's named Wordfence mutation lock.
+     *
+     * @return string
+     */
+    protected function abilities_v2_lock_name() {
+        return 'mainwp_wordfence_v2_' . substr( hash( 'sha256', home_url( '/' ) ), 0, 32 );
+    }
+
+    /**
+     * Acquire the Child-wide Wordfence mutation lock without waiting.
+     *
+     * @return bool
+     */
+    protected function abilities_v2_begin_mutation_lock() {
+        global $wpdb;
+        if ( ! is_object( $wpdb ) || ! is_callable( array( $wpdb, 'prepare' ) ) || ! is_callable( array( $wpdb, 'get_var' ) ) ) {
+            return false;
+        }
+        $wpdb->last_error = '';
+        $locked           = $wpdb->get_var( $wpdb->prepare( 'SELECT GET_LOCK(%s,0)', $this->abilities_v2_lock_name() ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery -- Named lock is the serialization primitive.
+        return empty( $wpdb->last_error ) && '1' === (string) $locked;
+    }
+
+    /**
+     * Release the Child-wide Wordfence mutation lock.
+     *
+     * @return bool
+     */
+    protected function abilities_v2_end_mutation_lock() {
+        global $wpdb;
+        if ( ! is_object( $wpdb ) || ! is_callable( array( $wpdb, 'prepare' ) ) || ! is_callable( array( $wpdb, 'get_var' ) ) ) {
+            return false;
+        }
+        $wpdb->last_error = '';
+        $released         = $wpdb->get_var( $wpdb->prepare( 'SELECT RELEASE_LOCK(%s)', $this->abilities_v2_lock_name() ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery -- Named lock release must be checked.
+        return empty( $wpdb->last_error ) && '1' === (string) $released;
     }
 
     /**
@@ -1796,12 +1862,16 @@ SQL
                     continue;
                 }
                 if ( 'del' === $op ) {
-                    if ( wp_delete_file( $localFile ) ) {
+                    // wp_delete_file() only gained a return value in WP 6.7 and we support 6.2+, so
+                    // the readback decides; the return would report every delete as failed on 6.2-6.6.
+                    wp_delete_file( $localFile );
+                    clearstatcache( true, $localFile );
+                    if ( ! file_exists( $localFile ) ) {
                         $issues->updateIssue( $id, 'delete' );
                         $filesWorkedOn ++;
                     } else {
                         $err      = error_get_last();
-                        $errors[] = 'Could not delete file ' . htmlentities( $file ) . '. Error was: ' . htmlentities( $err['message'] );
+                        $errors[] = 'Could not delete file ' . htmlentities( $file ) . '. Error was: ' . htmlentities( is_array( $err ) ? $err['message'] : 'unknown' );
                     }
                 } elseif ( 'repair' === $op ) {
                     $dat    = $issue['data'];
@@ -1907,7 +1977,11 @@ SQL
         if ( strpos( $localFile, ABSPATH ) !== 0 ) {
             return array( 'errorMsg' => 'An invalid file was requested for deletion.' );
         }
-        if ( wp_delete_file( $localFile ) ) {
+        // wp_delete_file() only gained a return value in WP 6.7 and we support 6.2+, so the readback
+        // decides; the return would report every delete as failed on 6.2-6.6.
+        wp_delete_file( $localFile );
+        clearstatcache( true, $localFile );
+        if ( ! file_exists( $localFile ) ) {
             $wfIssues->updateIssue( $issueID, 'delete' );
 
             return array(
@@ -1918,7 +1992,7 @@ SQL
         } else {
             $err = error_get_last();
 
-            return array( 'errorMsg' => 'Could not delete file ' . htmlentities( $file ) . '. The error was: ' . htmlentities( $err['message'] ) );
+            return array( 'errorMsg' => 'Could not delete file ' . htmlentities( $file ) . '. The error was: ' . htmlentities( is_array( $err ) ? $err['message'] : 'unknown' ) );
         }
     }
 

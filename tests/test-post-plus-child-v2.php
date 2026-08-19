@@ -172,6 +172,94 @@ class Test_Post_Plus_Child_V2 extends WP_UnitTestCase {
 		$this->assertSame( 'invalid_request', $this->request( 'post_plus_newpost_v2', $page )['code'] );
 	}
 
+	public function test_rolled_back_mutation_is_purged_from_the_post_cache() {
+		$payload                   = $this->delivery_payload( '123e4567-e89b-42d3-a456-426614174622', 'Rollback cache' );
+		$payload['post']['tags']   = array( 'rollback-cache-fixture-tag' );
+		$payload['content_digest'] = hash( 'sha256', wp_json_encode( array( $payload['post'], $payload['randomization'] ) ) );
+		$this->assertEmpty( term_exists( 'rollback-cache-fixture-tag', 'post_tag' ) );
+
+		$captured = 0;
+		$capture  = static function ( $post_id ) use ( &$captured ) {
+			if ( 0 === $captured ) {
+				$captured = (int) $post_id;
+			}
+		};
+		$refuse = static function () {
+			return new \WP_Error( 'fixture_term_refused', 'Term creation refused.' );
+		};
+		add_action( 'wp_insert_post', $capture );
+		add_filter( 'pre_insert_term', $refuse );
+		$result = $this->request( 'post_plus_newpost_v2', $payload );
+		remove_filter( 'pre_insert_term', $refuse );
+		remove_action( 'wp_insert_post', $capture );
+
+		$this->assertSame( 'mutation_failed', $result['code'] );
+		$this->assertGreaterThan( 0, $captured );
+		$this->assertFalse( wp_cache_get( $captured, 'posts' ) );
+		$this->assertNull( get_post( $captured ) );
+		$this->assertSame( '', get_post_meta( $captured, '_mainwp_child_content_operation_v2', true ) );
+	}
+
+	public function test_full_ledger_evicts_only_the_receipts_that_can_no_longer_be_replayed() {
+		update_option( 'mainwp_child_post_plus_operations_v2', $this->aged_ledger( 'applied' ), false );
+		$payload = $this->delivery_payload( '123e4567-e89b-42d3-a456-426614174623', 'Ledger eviction' );
+
+		$result = $this->request( 'post_plus_newpost_v2', $payload );
+
+		$this->assertTrue( $result['ok'] );
+		$records = get_option( 'mainwp_child_post_plus_operations_v2' );
+		$this->assertCount( 500, $records );
+		$this->assertArrayHasKey( $payload['operation_ref'], $records );
+		$this->assertArrayNotHasKey( '123e4567-e89b-42d3-a456-426500000000', $records );
+		$this->assertArrayHasKey( '123e4567-e89b-42d3-a456-426500000001', $records );
+	}
+
+	public function test_full_ledger_of_unconfirmed_receipts_refuses_rather_than_evicting_one() {
+		update_option( 'mainwp_child_post_plus_operations_v2', $this->aged_ledger( 'reserved' ), false );
+		$payload = $this->delivery_payload( '123e4567-e89b-42d3-a456-426614174624', 'Ledger full' );
+
+		$result = $this->request( 'post_plus_newpost_v2', $payload );
+
+		$this->assertSame( 'storage_unavailable', $result['code'] );
+		$records = get_option( 'mainwp_child_post_plus_operations_v2' );
+		$this->assertCount( 500, $records );
+		$this->assertArrayHasKey( '123e4567-e89b-42d3-a456-426500000000', $records );
+	}
+
+	/**
+	 * Build a ledger at the cap whose receipts are older than any replayable request.
+	 */
+	private function aged_ledger( $state ) {
+		$applied  = 'applied' === $state;
+		$accepted = time() - ( 2 * DAY_IN_SECONDS );
+		$records  = array();
+		for ( $index = 0; $index < 500; $index++ ) {
+			$operation_ref             = sprintf( '123e4567-e89b-42d3-a456-4265%08d', $index );
+			$records[ $operation_ref ] = array(
+				'dashboard_ref'     => hash( 'sha256', 'https://dashboard.example.test' ),
+				'operation_ref'     => $operation_ref,
+				'effect_hash'       => hash( 'sha256', 'effect-' . $index ),
+				'content_digest'    => hash( 'sha256', 'digest-' . $index ),
+				'mode'              => 'create',
+				'target_post_id'    => null,
+				'expected_revision' => null,
+				'post_id'           => $applied ? $index + 1 : null,
+				'state'             => $state,
+				'post_revision'     => $applied ? hash( 'sha256', 'revision-' . $index ) : null,
+				'remote_post_ref'   => $applied ? hash( 'sha256', 'remote-' . $index ) : null,
+				'retryable'         => false,
+				'choices'           => array(
+					'author_id'     => $this->actor,
+					'category_id'   => null,
+					'post_date_gmt' => null,
+				),
+				'accepted_at'       => $accepted + $index,
+				'updated_at'        => $accepted + $index,
+			);
+		}
+		return $records;
+	}
+
 	public function test_transport_size_cap_admits_a_maximal_legal_create_envelope() {
 		$envelope = wp_json_encode(
 			array(

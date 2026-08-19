@@ -21,14 +21,43 @@ class Test_MainWP_Child_Patchstack_V2 extends WP_UnitTestCase {
 		$this->subject = $reflection->newInstanceWithoutConstructor();
 	}
 
-	public function test_capabilities_are_closed_and_claim_no_unimplemented_operation() {
-		$result = $this->request( 'capabilities', array() );
+	/**
+	 * Protection execution has no Child-side package or licensing adapter, so capabilities must not
+	 * advertise it and dispatch must refuse it by name before it judges the payload.
+	 */
+	public function test_capabilities_advertise_exactly_the_operations_dispatch_accepts() {
+		$production = ( new ReflectionClass( MainWP_Child_Patchstack::class ) )->newInstanceWithoutConstructor();
+
+		$result = $production->abilities_v2(
+			array(
+				'protocol'  => '2',
+				'operation' => 'capabilities',
+				'payload'   => array(),
+			)
+		);
 
 		$this->assertSame( array( 'protocol', 'operation', 'ok', 'operations', 'mutation_supported' ), array_keys( $result ) );
 		$this->assertSame( '2', $result['protocol'] );
 		$this->assertTrue( $result['ok'] );
-		$this->assertSame( array( 'patchstack_protection_preview_v2', 'patchstack_protection_execute_v2', 'patchstack_protection_status_v2', 'patchstack_visibility_replace_v2' ), $result['operations'] );
+		$this->assertSame( array( 'patchstack_protection_preview_v2', 'patchstack_protection_status_v2', 'patchstack_visibility_replace_v2' ), $result['operations'] );
 		$this->assertTrue( $result['mutation_supported'] );
+
+		$refused = array();
+		foreach ( array( 'patchstack_protection_preview_v2', 'patchstack_protection_execute_v2', 'patchstack_protection_status_v2', 'patchstack_visibility_replace_v2' ) as $operation ) {
+			// An empty payload is invalid for every one of these, so only a by-name refusal can outrank invalid_request.
+			$response = $production->abilities_v2(
+				array(
+					'protocol'  => '2',
+					'operation' => $operation,
+					'payload'   => array(),
+				)
+			);
+			if ( isset( $response['code'] ) && 'unsupported_operation' === $response['code'] ) {
+				$refused[] = $operation;
+			}
+		}
+
+		$this->assertSame( array( 'patchstack_protection_execute_v2' ), $refused );
 	}
 
 	public function test_protection_preview_is_local_bounded_and_generation_bound() {
@@ -114,6 +143,26 @@ class Test_MainWP_Child_Patchstack_V2 extends WP_UnitTestCase {
 		$this->assertSame( 'failed', $result['status'] );
 		$this->assertSame( 'absent', $this->subject->plugin_state );
 		$this->assertSame( 1, $this->subject->protection_rollbacks );
+	}
+
+	/** An installed plugin needs no package, so execution must not be refused for missing package verification. */
+	public function test_protection_execute_runs_when_the_plugin_is_already_installed_and_no_package_is_needed() {
+		$this->subject->plugin_state = 'active';
+		$this->subject->manifest     = null;
+		$common                      = $this->base_payload();
+		$preview                     = $this->request( 'patchstack_protection_preview_v2', $common );
+		$this->assertSame( 'not_needed', $preview['package_state'] );
+
+		$result = $this->request(
+			'patchstack_protection_execute_v2',
+			array_merge( $common, array( 'if_match' => $preview['state_revision'], 'license_token' => 'private-license-token' ) )
+		);
+
+		$this->assertTrue( $result['ok'] );
+		$this->assertSame( 'completed', $result['status'] );
+		$this->assertSame( 'protected', $result['current_state'] );
+		$this->assertNull( $result['code'] );
+		$this->assertSame( 1, $this->subject->protection_writes );
 	}
 
 	public function test_dispatching_protection_receipt_is_unknown_and_status_never_dispatches() {
@@ -256,9 +305,14 @@ class Test_MainWP_Child_Patchstack_V2 extends WP_UnitTestCase {
 		);
 		$this->assertTrue( $result['ok'] );
 
+		// Negotiation is supported, so a payload on it is a malformed request, not an unknown operation.
 		$result = $this->request( 'capabilities', array( 'extra' => true ) );
 		$this->assertFalse( $result['ok'] );
-		$this->assertSame( 'unsupported_operation', $result['code'] );
+		$this->assertSame( 'capabilities', $result['operation'] );
+		$this->assertSame( 'invalid_request', $result['code'] );
+
+		$unknown = $this->request( 'patchstack_unknown_v2', array() );
+		$this->assertSame( 'unsupported_operation', $unknown['code'] );
 	}
 
 	private function request( $operation, $payload ) {
@@ -303,6 +357,11 @@ class Testable_MainWP_Child_Patchstack extends MainWP_Child_Patchstack {
 	public $protection_readback = 'protected';
 	public $protection_receipts = array();
 	public $protection_receipt_writes = array();
+
+	/** This fixture wires the package and licensing seams, so it can advertise and run execution. */
+	protected function abilities_v2_supported_operations() {
+		return array_merge( parent::abilities_v2_supported_operations(), array( 'patchstack_protection_execute_v2' ) );
+	}
 
 	protected function abilities_v2_plugin_state() {
 		return $this->plugin_state;

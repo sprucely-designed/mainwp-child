@@ -152,7 +152,12 @@ class MainWP_Child_Jetpack_Scan {
             return $this->abilities_v2_error( 'unknown', 'invalid_request' );
         }
 
-        if ( 'capabilities' === $operation && array() === $request['payload'] ) {
+        if ( 'capabilities' === $operation ) {
+            // Negotiation is supported; a payload on it is a malformed request, not an unknown operation.
+            if ( array() !== $request['payload'] ) {
+                return $this->abilities_v2_error( $operation, 'invalid_request' );
+            }
+
             return array(
                 'protocol'           => '2',
                 'operation'          => 'capabilities',

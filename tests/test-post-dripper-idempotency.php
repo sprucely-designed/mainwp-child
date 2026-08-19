@@ -35,12 +35,30 @@ class Test_Post_Dripper_Idempotency extends WP_UnitTestCase {
 
 	public function test_capability_callable_advertises_the_closed_delivery_contract() {
 		$this->assertTrue( MainWP_Child_Callable::get_instance()->is_callable_function( 'post_dripper_capabilities_v2' ) );
-		$this->assertSame( 262144, MainWP_Child_Callable::POST_DRIPPER_REQUEST_MAX_BYTES );
 
 		$result = $this->request( 'capabilities', array() );
 		$this->assertSame( array( 'protocol', 'operation', 'ok', 'operations', 'mutation_supported' ), array_keys( $result ) );
 		$this->assertSame( array( 'post_dripper_delivery_v2', 'post_dripper_status_v2' ), $result['operations'] );
 		$this->assertTrue( $result['mutation_supported'] );
+	}
+
+	/**
+	 * Post Dripper shares Post Plus's content normalizer, so it must admit the same maximal post.
+	 * A CJK body at the 200 KB field limit doubles once JSON escapes every character, which the
+	 * old 256 KB transport cap rejected before the handler ever saw it.
+	 */
+	public function test_transport_size_cap_admits_a_maximal_legal_delivery_envelope() {
+		$envelope = wp_json_encode(
+			array(
+				'protocol'  => '2',
+				'operation' => 'post_dripper_delivery_v2',
+				'payload'   => $this->maximal_delivery_payload( '123e4567-e89b-42d3-a456-426614174590' ),
+			)
+		);
+
+		$this->assertGreaterThan( 262144, strlen( $envelope ) );
+		$this->assertLessThanOrEqual( $this->callable_request_cap( 'post_dripper_capabilities_v2' ), strlen( $envelope ) );
+		$this->assertTrue( $this->request( 'post_dripper_delivery_v2', json_decode( $envelope, true )['payload'] )['ok'] );
 	}
 
 	public function test_create_replay_and_status_are_exactly_once() {
@@ -278,6 +296,55 @@ class Test_Post_Dripper_Idempotency extends WP_UnitTestCase {
 				'meta_value'     => $operation_ref,
 				'posts_per_page' => 2,
 			)
+		);
+	}
+
+	/**
+	 * Read the request-size cap the callable transport enforces on the raw envelope.
+	 *
+	 * MainWP_Helper::write() ends the request with die(), so the dispatcher cannot run inside the
+	 * suite; reading its own bound keeps the assertion tied to the shipped guard.
+	 */
+	private function callable_request_cap( $method ) {
+		$reflection = new \ReflectionMethod( MainWP_Child_Callable::class, $method );
+		$lines      = file( $reflection->getFileName() );
+		$source     = implode( '', array_slice( $lines, $reflection->getStartLine() - 1, $reflection->getEndLine() - $reflection->getStartLine() + 1 ) );
+		$this->assertSame( 1, preg_match( '/([A-Za-z0-9_:]+)\s*<\s*strlen\(\s*\$raw\s*\)|strlen\(\s*\$raw\s*\)\s*>\s*([A-Za-z0-9_:]+)/', $source, $bound ) );
+		$token = '' !== $bound[1] ? $bound[1] : $bound[2];
+		if ( 0 === strpos( $token, 'self::' ) ) {
+			return constant( MainWP_Child_Callable::class . '::' . substr( $token, 6 ) );
+		}
+		$this->assertTrue( ctype_digit( $token ), 'The transport size bound must be a literal or a self:: constant.' );
+		return (int) $token;
+	}
+
+	private function maximal_delivery_payload( $operation_ref ) {
+		$slugs = array();
+		for ( $index = 0; $index < 100; $index++ ) {
+			$slugs[] = str_pad( 'bound-' . $index . '-', 200, 'x' );
+		}
+		sort( $slugs, SORT_STRING );
+		$post = array(
+			'post_type'      => 'post',
+			'status'         => 'draft',
+			'title'          => str_repeat( '記', 170 ),
+			'content'        => str_repeat( '記', 66666 ),
+			'excerpt'        => str_repeat( '記', 1666 ),
+			'slug'           => str_pad( 'maximal-', 200, 'x' ),
+			'comment_status' => 'closed',
+			'ping_status'    => 'closed',
+			'categories'     => $slugs,
+			'tags'           => $slugs,
+		);
+		return array(
+			'dashboard_ref'     => hash( 'sha256', 'https://dashboard.example.test' ),
+			'operation_ref'     => $operation_ref,
+			'mode'              => 'create',
+			'target_post_id'    => null,
+			'expected_revision' => null,
+			'content_digest'    => hash( 'sha256', wp_json_encode( $post ) ),
+			'expires_at'        => time() + 300,
+			'post'              => $post,
 		);
 	}
 

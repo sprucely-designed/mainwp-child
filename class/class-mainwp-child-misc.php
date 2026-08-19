@@ -675,29 +675,30 @@ class MainWP_Child_Misc {
             'apply_snippet_v2'  => array( 'protocol_version', 'request_ref', 'slug', 'type', 'code' ),
             'remove_snippet_v2' => array( 'protocol_version', 'request_ref', 'slug', 'type' ),
         );
-        if ( ! isset( $keys[ $action ] ) || $keys[ $action ] !== array_keys( $request ) || 2 !== $request['protocol_version'] || ! $this->snippet_v2_valid_request_ref( $request['request_ref'] ) || ! $this->snippet_v2_valid_slug( $request['slug'] ) ) { // phpcs:ignore WordPress.PHP.YodaConditions.NotYoda -- Exact ordered key comparison has no literal operand.
-            return $this->snippet_v2_error( 'invalid_request' );
+        $ref  = isset( $request['request_ref'] ) && $this->snippet_v2_valid_request_ref( $request['request_ref'] ) ? $request['request_ref'] : null;
+        if ( ! isset( $keys[ $action ] ) || ! $this->snippet_v2_exact_keys( $request, $keys[ $action ] ) || 2 !== $request['protocol_version'] || null === $ref || ! $this->snippet_v2_valid_slug( $request['slug'] ) ) {
+            return $this->snippet_v2_error( 'invalid_request', $ref );
         }
 
         $type = $request['type'];
         if ( ! is_string( $type ) || ! in_array( $type, array( 'R', 'S', 'C' ), true ) ) {
-            return $this->snippet_v2_error( 'invalid_request' );
+            return $this->snippet_v2_error( 'invalid_request', $ref );
         }
 
         if ( 'run_snippet_v2' === $action ) {
             if ( 'R' !== $type || ! $this->snippet_v2_valid_code( $request['code'] ) ) {
-                return $this->snippet_v2_error( 'invalid_request' );
+                return $this->snippet_v2_error( 'invalid_request', $ref );
             }
             return $this->snippet_v2_run( $request );
         }
 
         if ( 'R' === $type || ( 'apply_snippet_v2' === $action && ! $this->snippet_v2_valid_code( $request['code'] ) ) ) {
-            return $this->snippet_v2_error( 'invalid_request' );
+            return $this->snippet_v2_error( 'invalid_request', $ref );
         }
 
         $owner = $this->snippet_v2_acquire_lock( $request['slug'] );
         if ( false === $owner ) {
-            return $this->snippet_v2_error( 'lock_busy' );
+            return $this->snippet_v2_error( 'lock_busy', $ref );
         }
 
         try {
@@ -708,28 +709,71 @@ class MainWP_Child_Misc {
             $released = $this->snippet_v2_release_lock( $request['slug'], $owner );
         }
 
-        if ( ! $released || ! is_array( $result ) ) {
-            return $this->snippet_v2_error( 'storage_failed' );
+        // A release that did not take says nothing about whether the write landed, so it rides along
+        // as an advisory instead of overwriting a committed outcome with a fabricated failure.
+        $warnings = $released ? array() : array( 'lock_release_failed' );
+        if ( ! is_array( $result ) ) {
+            return $this->snippet_v2_error( 'storage_failed', $ref, $warnings );
         }
         if ( isset( $result['error_code'] ) ) {
-            return $this->snippet_v2_error( $result['error_code'] );
+            return $this->snippet_v2_error( $result['error_code'], $ref, $warnings );
         }
 
-        return array_merge( array( 'request_ref' => $request['request_ref'] ), $result );
+        return $this->snippet_v2_envelope( true, $ref, null, $result, $warnings );
+    }
+
+    /**
+     * Build the one response envelope every Code Snippets v2 reply uses.
+     *
+     * `success` reports whether the Child carried the request through to an outcome it can vouch
+     * for, which is what the Dashboard branches on; it is not the snippet's own verdict. A run that
+     * executed and threw is a reported outcome, so it stays `true` and `error_code` classifies it.
+     *
+     * @param bool        $success     Whether an outcome was produced.
+     * @param string|null $request_ref Correlation reference, null when the request carried none.
+     * @param string|null $error_code  Stable failure class, null when there was none.
+     * @param array       $fields      Operation-specific fields.
+     * @param array       $warnings    Advisory codes that do not change the outcome.
+     * @return array<string,mixed>
+     */
+    private function snippet_v2_envelope( $success, $request_ref, $error_code, $fields = array(), $warnings = array() ) {
+        return array_merge(
+            array(
+                'success'       => $success,
+                'request_ref'   => is_string( $request_ref ) ? $request_ref : null,
+                'error_code'    => $error_code,
+                'warning_codes' => array_values( array_unique( $warnings ) ),
+            ),
+            $fields
+        );
     }
 
     /**
      * Build the failure response for a Code Snippets v2 request.
      *
-     * @param string $code Error code, replaced with storage_failed when unrecognised.
+     * @param string      $code        Error code, replaced with storage_failed when unrecognised.
+     * @param string|null $request_ref Correlation reference, echoed so a failure can be matched to its request.
+     * @param array       $warnings    Advisory codes that do not change the outcome.
      * @return array<string,mixed>
      */
-    private function snippet_v2_error( $code ) {
+    private function snippet_v2_error( $code, $request_ref = null, $warnings = array() ) {
         $allowed = array( 'invalid_request', 'lock_busy', 'execution_failed', 'storage_failed' );
-        return array(
-            'success'    => false,
-            'error_code' => in_array( $code, $allowed, true ) ? $code : 'storage_failed',
-        );
+        return $this->snippet_v2_envelope( false, $request_ref, in_array( $code, $allowed, true ) ? $code : 'storage_failed', array(), $warnings );
+    }
+
+    /**
+     * Whether a request carries exactly the expected keys, in any order.
+     *
+     * @param array $value Request to check.
+     * @param array $keys  Expected keys.
+     * @return bool
+     */
+    private function snippet_v2_exact_keys( $value, $keys ) {
+        $actual = array_keys( $value );
+        sort( $actual, SORT_STRING );
+        sort( $keys, SORT_STRING );
+
+        return $actual === $keys;
     }
 
     /**
@@ -745,11 +789,17 @@ class MainWP_Child_Misc {
     /**
      * Whether a value is an accepted snippet slug.
      *
+     * Protocol v1 put whatever the Dashboard sent straight into the option key and the wp-config
+     * marker with no character restriction, so hyphens and underscores are in the field already;
+     * refusing them here would leave those snippets installed with no way to remove them. The set
+     * stops at alphanumerics plus those two: nothing here can read as a path segment, and none of it
+     * can alter the meaning of the `/***snippet_<slug>***\/` marker or of the pattern built from it.
+     *
      * @param mixed $value Value to check.
      * @return bool
      */
     private function snippet_v2_valid_slug( $value ) {
-        return is_string( $value ) && 1 === preg_match( '/^[A-Za-z0-9]{1,32}$/D', $value );
+        return is_string( $value ) && 1 === preg_match( '/^[A-Za-z0-9_-]{1,32}$/D', $value );
     }
 
     /**
@@ -853,14 +903,17 @@ class MainWP_Child_Misc {
     private function snippet_v2_run( $request ) {
         $execution = $this->snippet_v2_execute_code( $request['code'] );
         if ( ! is_array( $execution ) || ! isset( $execution['status'], $execution['output'], $execution['output_truncated'] ) ) {
-            return $this->snippet_v2_error( 'execution_failed' );
+            return $this->snippet_v2_error( 'execution_failed', $request['request_ref'] );
         }
-        return array(
-            'request_ref'      => $request['request_ref'],
-            'status'           => $execution['status'],
-            'output'           => $execution['output'],
-            'output_truncated' => $execution['output_truncated'],
-            'error_code'       => 'succeeded' === $execution['status'] ? null : 'execution_failed',
+        return $this->snippet_v2_envelope(
+            true,
+            $request['request_ref'],
+            'succeeded' === $execution['status'] ? null : 'execution_failed',
+            array(
+                'status'           => $execution['status'],
+                'output'           => $execution['output'],
+                'output_truncated' => $execution['output_truncated'],
+            )
         );
     }
 
@@ -1064,16 +1117,60 @@ class MainWP_Child_Misc {
      * @return bool
      */
     protected function snippet_v2_write_file_atomic( $path, $expected, $next ) {
-        $handle = fopen( $path, 'c+' );
-        if ( false === $handle || ! flock( $handle, LOCK_EX ) ) {
-            false !== $handle && fclose( $handle );
+        // flock() binds to an inode and the rename below hands $path a brand new one, so a lock taken
+        // on the target itself stops excluding anybody at the exact moment it matters: the next
+        // writer opens the orphaned inode, still reads the pre-edit bytes there, and its own
+        // compare-and-swap waves through a write that silently drops this one. The lock therefore
+        // lives in a file beside the target that no rename ever touches, and it is never deleted,
+        // because handing each writer a fresh inode would put the same hole straight back.
+        //
+        // Ordering: the per-slug option lock from snippet_v2_acquire_lock() is always taken first and
+        // this one second, never the other way round. Both are needed - the option lock is per slug
+        // and cannot serialize two different slugs editing this one shared file.
+        $lock = fopen( $this->snippet_v2_config_lock_path( $path ), 'c' );
+        if ( false === $lock || ! flock( $lock, LOCK_EX ) ) {
+            false !== $lock && fclose( $lock );
             return false;
         }
-        $current = stream_get_contents( $handle );
+        $ok = $this->snippet_v2_replace_config( $path, $expected, $next );
+        flock( $lock, LOCK_UN );
+        fclose( $lock );
+        return $ok;
+    }
+
+    /**
+     * Path of the lock file guarding writes to a configuration file.
+     *
+     * The .php suffix keeps an empty, world-readable file in the web root from being served as text.
+     *
+     * @param string $path Configuration file path.
+     * @return string
+     */
+    protected function snippet_v2_config_lock_path( $path ) {
+        return dirname( $path ) . '/.mainwp-snippets-config-lock.php';
+    }
+
+    /**
+     * Swap a configuration file's contents while it still holds the expected bytes.
+     *
+     * The caller holds the configuration lock. The live bytes are re-read here rather than taken on
+     * trust from the read that produced $next, so an edit that landed in between is caught instead
+     * of overwritten.
+     *
+     * @param string $path     File path.
+     * @param string $expected Contents the caller read before editing.
+     * @param string $next     Contents to write.
+     * @return bool
+     */
+    private function snippet_v2_replace_config( $path, $expected, $next ) {
+        // A configuration file that disappeared under us is a failure to report, not a file to
+        // conjure up; the handle this used to open would have created an empty one.
+        if ( ! is_file( $path ) ) {
+            return false;
+        }
+        $current = file_get_contents( $path );
         $mode    = fileperms( $path );
         if ( $expected !== $current || false === $mode ) {
-            flock( $handle, LOCK_UN );
-            fclose( $handle );
             return false;
         }
         $temporary = $this->snippet_v2_stage_file( dirname( $path ), '.mainwp-cs-', $next, $mode & 0777 );
@@ -1091,8 +1188,6 @@ class MainWP_Child_Misc {
                 unlink( $rollback );
             }
         }
-        flock( $handle, LOCK_UN );
-        fclose( $handle );
         return $ok && file_get_contents( $path ) === $next;
     }
 

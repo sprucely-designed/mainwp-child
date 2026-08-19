@@ -33,6 +33,12 @@ class MainWP_Child_Maintenance {
     /** Atomic v2 mutation lock. */
     const ABILITIES_V2_LOCK_OPTION = 'mainwp_child_maintenance_v2_lock';
 
+    /** Revision rows removed per delete statement. */
+    const ABILITIES_V2_REVISION_DELETE_BATCH = 500;
+
+    /** Revision parents examined per sweep page. */
+    const ABILITIES_V2_REVISION_PARENT_PAGE = 200;
+
     /**
      * Current v2 mutation-lock owner.
      *
@@ -132,7 +138,11 @@ class MainWP_Child_Maintenance {
             return $this->abilities_v2_error( 'unknown', 'invalid_request' );
         }
 
-        if ( 'capabilities' === $operation && array() === $request['payload'] ) {
+        if ( 'capabilities' === $operation ) {
+            // Capabilities is supported; a payload on it is a malformed request, not an unknown operation.
+            if ( array() !== $request['payload'] ) {
+                return $this->abilities_v2_error( $operation, 'invalid_request' );
+            }
             return array(
                 'protocol'           => '2',
                 'operation'          => 'capabilities',
@@ -146,12 +156,17 @@ class MainWP_Child_Maintenance {
             return $this->abilities_v2_preview( $request['payload'] );
         }
         if ( 'ability_maintenance_execute_v2' === $operation ) {
+            // The payload is checked before the lock so a request that could never run is answered
+            // with invalid_request instead of the lock_busy of a run it was never eligible to start.
+            if ( false === $this->abilities_v2_execute_actions( $request['payload'] ) ) {
+                return $this->abilities_v2_error( $operation, 'invalid_request' );
+            }
             if ( ! $this->abilities_v2_begin_mutation() ) {
                 return $this->abilities_v2_error( $operation, 'lock_busy' );
             }
             $result   = $this->abilities_v2_execute( $request['payload'] );
             $released = $this->abilities_v2_end_mutation();
-            return $released ? $result : $this->abilities_v2_error( $operation, 'outcome_unknown' );
+            return $this->abilities_v2_with_lock_release( $result, $released );
         }
         if ( 'ability_maintenance_operation_v2' === $operation ) {
             return $this->abilities_v2_operation( $request['payload'] );
@@ -392,15 +407,24 @@ class MainWP_Child_Maintenance {
         }
         // phpcs:enable WordPress.DB.PreparedSQL.NotPrepared
 
+        // Both prefixes are stripped, as the deletion path does: a LIKE '_transient_%' sweep returns
+        // the value row and the timeout row of the same transient, and stripping only one of them
+        // counts that transient twice.
         $keys = array();
         foreach ( $names as $name ) {
             if ( is_string( $name ) ) {
-                $keys[ 'local:' . str_replace( $transient_prefix, '', $name ) ] = true;
+                $key = str_replace( array( '_transient_timeout_', '_transient_' ), '', $name );
+                if ( '' !== $key ) {
+                    $keys[ 'local:' . $key ] = true;
+                }
             }
         }
         foreach ( $site_names as $name ) {
             if ( is_string( $name ) ) {
-                $keys[ 'site:' . str_replace( $site_prefix, '', $name ) ] = true;
+                $key = str_replace( array( '_site_transient_timeout_', '_site_transient_' ), '', $name );
+                if ( '' !== $key ) {
+                    $keys[ 'site:' . $key ] = true;
+                }
             }
         }
         return array(
@@ -417,18 +441,11 @@ class MainWP_Child_Maintenance {
      */
     private function abilities_v2_execute( $payload ) { // phpcs:ignore Generic.Metrics.CyclomaticComplexity -- Explicit durable transition flow.
         $operation = 'ability_maintenance_execute_v2';
-        if ( ! is_array( $payload ) || ! $this->abilities_v2_exact_keys( $payload, array( 'operation_ref', 'actions', 'revision_retention', 'snapshot_revision', 'action_hash' ) ) || ! $this->abilities_v2_valid_uuid( $payload['operation_ref'] ) || ! $this->abilities_v2_hash( $payload['snapshot_revision'] ) || ! $this->abilities_v2_hash( $payload['action_hash'] ) || ! is_int( $payload['revision_retention'] ) || 0 > $payload['revision_retention'] || 1000 < $payload['revision_retention'] ) {
-            return $this->abilities_v2_error( $operation, 'invalid_request' );
-        }
-
-        $actions = $this->abilities_v2_canonical_actions( $payload['actions'] );
+        $actions   = $this->abilities_v2_execute_actions( $payload );
         if ( false === $actions ) {
             return $this->abilities_v2_error( $operation, 'invalid_request' );
         }
         $action_hash = hash( 'sha256', wp_json_encode( array( $actions, $payload['revision_retention'] ) ) );
-        if ( ! hash_equals( $action_hash, $payload['action_hash'] ) ) {
-            return $this->abilities_v2_error( $operation, 'invalid_request' );
-        }
         $effect_hash = hash( 'sha256', wp_json_encode( array( $payload['operation_ref'], $actions, $payload['revision_retention'], $payload['snapshot_revision'], $action_hash ) ) );
         $records     = $this->abilities_v2_read_operations();
         if ( false === $records ) {
@@ -536,6 +553,48 @@ class MainWP_Child_Maintenance {
     }
 
     /**
+     * Validate an execute payload and return its canonical action set.
+     *
+     * Runs before the mutation lock is taken as well as inside the execute path, so the same
+     * malformed payload gets the same invalid_request whether or not another run holds the lock.
+     *
+     * @param mixed $payload Closed execute payload.
+     * @return array<int,string>|false
+     */
+    private function abilities_v2_execute_actions( $payload ) {
+        if ( ! is_array( $payload ) || ! $this->abilities_v2_exact_keys( $payload, array( 'operation_ref', 'actions', 'revision_retention', 'snapshot_revision', 'action_hash' ) ) || ! $this->abilities_v2_valid_uuid( $payload['operation_ref'] ) || ! $this->abilities_v2_hash( $payload['snapshot_revision'] ) || ! $this->abilities_v2_hash( $payload['action_hash'] ) || ! is_int( $payload['revision_retention'] ) || 0 > $payload['revision_retention'] || 1000 < $payload['revision_retention'] ) {
+            return false;
+        }
+        $actions = $this->abilities_v2_canonical_actions( $payload['actions'] );
+        if ( false === $actions ) {
+            return false;
+        }
+        return hash_equals( hash( 'sha256', wp_json_encode( array( $actions, $payload['revision_retention'] ) ) ), $payload['action_hash'] ) ? $actions : false;
+    }
+
+    /**
+     * Report a failed lock release without rewriting the outcome it accompanies.
+     *
+     * The effect and its durable record are both committed by the time the lock is released, so a
+     * failed release cannot make any of that untrue. The lock expires on its own 300s TTL, and the
+     * caller is told about the release through an advisory warning instead of being handed an
+     * outcome_unknown for a run whose outcome is known.
+     *
+     * @param mixed $result   Result produced under the lock.
+     * @param bool  $released Whether the lock release succeeded.
+     * @return mixed
+     */
+    private function abilities_v2_with_lock_release( $result, $released ) {
+        if ( $released || ! is_array( $result ) ) {
+            return $result;
+        }
+        $warnings                = isset( $result['warning_codes'] ) && is_array( $result['warning_codes'] ) ? $result['warning_codes'] : array();
+        $warnings[]              = 'lock_release_failed';
+        $result['warning_codes'] = array_values( array_unique( $warnings ) );
+        return $result;
+    }
+
+    /**
      * Read one durable maintenance operation.
      *
      * @param array $payload Closed status payload.
@@ -625,6 +684,8 @@ class MainWP_Child_Maintenance {
             if ( ! $this->abilities_v2_valid_operation_record( $record ) || ! hash_equals( $operation_ref, $record['operation_ref'] ) ) {
                 return false;
             }
+            $record                    = $this->abilities_v2_settle_stale_operation( $record );
+            $records[ $operation_ref ] = $record;
             if ( null !== $record['finished_at'] && $record['finished_at'] < $cutoff ) {
                 unset( $records[ $operation_ref ] );
             }
@@ -634,6 +695,37 @@ class MainWP_Child_Maintenance {
         }
         update_option( self::ABILITIES_V2_OPERATIONS_OPTION, $records, false );
         return get_option( self::ABILITIES_V2_OPERATIONS_OPTION, null ) === $records;
+    }
+
+    /**
+     * Settle a running record that nothing has advanced for a day.
+     *
+     * A run only writes to its record while it holds the 300s mutation lock and renews that lock
+     * between actions, so a record still marked running a day after its last write has no process
+     * behind it. Leaving it there is both a false claim and a leak: running records carry no
+     * finished_at, the prune above only evicts finished ones, and 100 abandoned records make every
+     * later execute fail on the record cap for good. finished_at is stamped with the last time the
+     * Child actually observed the run rather than with now, because settling is not an observation.
+     *
+     * @param array $record Validated durable record.
+     * @return array
+     */
+    private function abilities_v2_settle_stale_operation( $record ) {
+        if ( 'running' !== $record['status'] || $record['updated_at'] >= time() - DAY_IN_SECONDS ) {
+            return $record;
+        }
+        foreach ( array_slice( $record['actions'], count( $record['outcomes'] ) ) as $action ) {
+            $record['outcomes'][] = array(
+                'action'     => $action,
+                'status'     => 'unknown',
+                'affected'   => null,
+                'error_code' => 'outcome_unknown',
+            );
+        }
+        $record['status']      = 'unknown';
+        $record['finished_at'] = $record['updated_at'];
+        $record['retryable']   = false;
+        return $record;
     }
 
     /**
@@ -770,7 +862,9 @@ class MainWP_Child_Maintenance {
         if ( 'succeeded' === $outcome['status'] ) {
             return is_int( $outcome['affected'] ) && 0 <= $outcome['affected'] && null === $outcome['error_code'];
         }
-        return null === $outcome['affected'] && in_array( $outcome['error_code'], array( 'mutation_failed', 'unsupported', 'outcome_unknown' ), true );
+        // An action that stopped part way through still destroyed rows, so a failed or unknown
+        // outcome may carry the count it did affect; null keeps meaning the count is not known.
+        return ( null === $outcome['affected'] || ( is_int( $outcome['affected'] ) && 0 <= $outcome['affected'] ) ) && in_array( $outcome['error_code'], array( 'mutation_failed', 'unsupported', 'outcome_unknown' ), true );
     }
 
     /**
@@ -814,7 +908,12 @@ class MainWP_Child_Maintenance {
                 }
             )
         );
-        return null !== $record['finished_at'] && count( $record['actions'] ) === count( $record['outcomes'] ) && ( 0 < $successful ) === $record['report_emitted'];
+        if ( null === $record['finished_at'] || count( $record['actions'] ) !== count( $record['outcomes'] ) ) {
+            return false;
+        }
+        // A settled-stale record can hold successful outcomes whose report was never emitted: the
+        // run died before it reached the emit step, and settling it is no reason to emit one now.
+        return 'unknown' === $record['status'] || ( 0 < $successful ) === $record['report_emitted'];
     }
 
     /**
@@ -853,13 +952,14 @@ class MainWP_Child_Maintenance {
     /**
      * Return a stable failed action outcome.
      *
-     * @param string $code Stable error code.
-     * @return array<string,string|null>
+     * @param string   $code     Stable error code.
+     * @param int|null $affected Rows the action destroyed before it stopped, or null when unknown.
+     * @return array<string,int|string|null>
      */
-    private function abilities_v2_failed_outcome( $code = 'mutation_failed' ) {
+    private function abilities_v2_failed_outcome( $code = 'mutation_failed', $affected = null ) {
         return array(
             'status'     => 'failed',
-            'affected'   => null,
+            'affected'   => $affected,
             'error_code' => $code,
         );
     }
@@ -875,36 +975,79 @@ class MainWP_Child_Maintenance {
         if ( 0 === $revision_retention ) {
             return $this->abilities_v2_delete_rows( 'posts', "post_type = 'revision'" );
         }
-        $wpdb->last_error = '';
-        // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Reads exact revision candidates for immediate checked deletion.
-        $rows = $wpdb->get_results( "SELECT ID, post_parent FROM $wpdb->posts WHERE post_type = 'revision' ORDER BY post_parent ASC, post_modified DESC, ID DESC" );
-        if ( '' !== $wpdb->last_error || ! is_array( $rows ) ) {
-            return $this->abilities_v2_failed_outcome();
-        }
-        $seen     = array();
         $affected = 0;
-        foreach ( $rows as $row ) {
-            if ( ! is_object( $row ) || ! isset( $row->ID, $row->post_parent ) || ! is_numeric( $row->ID ) || ! is_numeric( $row->post_parent ) ) {
-                return $this->abilities_v2_failed_outcome();
-            }
-            $parent          = (int) $row->post_parent;
-            $seen[ $parent ] = isset( $seen[ $parent ] ) ? $seen[ $parent ] + 1 : 1;
-            if ( $seen[ $parent ] <= $revision_retention ) {
-                continue;
-            }
+        while ( true ) {
             $wpdb->last_error = '';
-            // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Checked exact revision deletion.
-            $deleted = $wpdb->delete( $wpdb->posts, array( 'ID' => (int) $row->ID ), array( '%d' ) );
-            if ( 1 !== $deleted || '' !== $wpdb->last_error ) {
-                return $this->abilities_v2_failed_outcome();
+            // A parent drops out of this result set once its surplus is gone, so the same first
+            // page is re-read until nothing is over retention; an OFFSET would step over parents.
+            // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Bounded page of parents holding surplus revisions.
+            $parents = $wpdb->get_col( $wpdb->prepare( "SELECT post_parent FROM $wpdb->posts WHERE post_type = 'revision' GROUP BY post_parent HAVING COUNT(*) > %d LIMIT %d", $revision_retention, self::ABILITIES_V2_REVISION_PARENT_PAGE ) );
+            if ( '' !== $wpdb->last_error || ! is_array( $parents ) ) {
+                return $this->abilities_v2_failed_outcome( 'mutation_failed', $affected );
             }
-            ++$affected;
+            if ( empty( $parents ) ) {
+                return array(
+                    'status'     => 'succeeded',
+                    'affected'   => $affected,
+                    'error_code' => null,
+                );
+            }
+            $page_affected = 0;
+            foreach ( $parents as $parent ) {
+                if ( ! is_numeric( $parent ) ) {
+                    return $this->abilities_v2_failed_outcome( 'mutation_failed', $affected );
+                }
+                $removed = $this->abilities_v2_delete_parent_revisions( (int) $parent, $revision_retention );
+                if ( false === $removed ) {
+                    return $this->abilities_v2_failed_outcome( 'mutation_failed', $affected );
+                }
+                $affected      += $removed;
+                $page_affected += $removed;
+            }
+            if ( 0 === $page_affected ) {
+                // Parents still report surplus revisions that no delete removed: stop instead of spinning.
+                return $this->abilities_v2_failed_outcome( 'mutation_failed', $affected );
+            }
         }
-        return array(
-            'status'     => 'succeeded',
-            'affected'   => $affected,
-            'error_code' => null,
-        );
+    }
+
+    /**
+     * Delete one parent's surplus revisions in bounded batches.
+     *
+     * @param int $parent_id          Parent post ID.
+     * @param int $revision_retention Revisions retained for this parent.
+     * @return int|false Deleted rows, or false when a statement failed.
+     */
+    private function abilities_v2_delete_parent_revisions( $parent_id, $revision_retention ) {
+        global $wpdb;
+        $deleted = 0;
+        while ( true ) {
+            $wpdb->last_error = '';
+            // The retained revisions stay at the top of this ordering, so the same OFFSET keeps
+            // returning the next surplus batch as earlier batches are removed.
+            // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Bounded batch of surplus revision IDs.
+            $ids = $wpdb->get_col( $wpdb->prepare( "SELECT ID FROM $wpdb->posts WHERE post_type = 'revision' AND post_parent = %d ORDER BY post_modified DESC, ID DESC LIMIT %d OFFSET %d", $parent_id, self::ABILITIES_V2_REVISION_DELETE_BATCH, $revision_retention ) );
+            if ( '' !== $wpdb->last_error || ! is_array( $ids ) ) {
+                return false;
+            }
+            if ( empty( $ids ) ) {
+                return $deleted;
+            }
+            foreach ( $ids as $id ) {
+                if ( ! is_numeric( $id ) ) {
+                    return false;
+                }
+            }
+            $ids              = array_map( 'intval', $ids );
+            $placeholders     = implode( ',', array_fill( 0, count( $ids ), '%d' ) );
+            $wpdb->last_error = '';
+            // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare -- Placeholder list is built from the row count and prepared with the IDs.
+            $removed = $wpdb->query( $wpdb->prepare( "DELETE FROM $wpdb->posts WHERE post_type = 'revision' AND ID IN ($placeholders)", $ids ) );
+            if ( '' !== $wpdb->last_error || ! is_int( $removed ) || count( $ids ) !== $removed ) {
+                return false;
+            }
+            $deleted += $removed;
+        }
     }
 
     /**
@@ -950,14 +1093,14 @@ class MainWP_Child_Maintenance {
         $affected         = 0;
         foreach ( $terms as $term ) {
             if ( ! is_object( $term ) || ! isset( $term->term_id, $term->count ) ) {
-                return $this->abilities_v2_failed_outcome();
+                return $this->abilities_v2_failed_outcome( 'mutation_failed', $affected );
             }
             if ( 0 !== (int) $term->count || ( 'category' === $taxonomy && $default_category === (int) $term->term_id ) ) {
                 continue;
             }
             $deleted = wp_delete_term( (int) $term->term_id, $taxonomy );
             if ( false === $deleted || is_wp_error( $deleted ) ) {
-                return $this->abilities_v2_failed_outcome();
+                return $this->abilities_v2_failed_outcome( 'mutation_failed', $affected );
             }
             ++$affected;
         }
@@ -980,7 +1123,7 @@ class MainWP_Child_Maintenance {
         $affected = 0;
         foreach ( $tables as $table ) {
             if ( ! is_array( $table ) || ! isset( $table['Name'] ) || ! is_string( $table['Name'] ) ) {
-                return $this->abilities_v2_failed_outcome();
+                return $this->abilities_v2_failed_outcome( 'mutation_failed', $affected );
             }
             if ( 0 !== strpos( $table['Name'], $wpdb->prefix ) ) {
                 continue;
@@ -990,7 +1133,7 @@ class MainWP_Child_Maintenance {
             // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- Identifier comes from SHOW TABLE STATUS and is quoted.
             $optimized = $wpdb->query( "OPTIMIZE TABLE `$identifier`" );
             if ( false === $optimized || '' !== $wpdb->last_error ) {
-                return $this->abilities_v2_failed_outcome();
+                return $this->abilities_v2_failed_outcome( 'mutation_failed', $affected );
             }
             ++$affected;
         }
@@ -1013,17 +1156,26 @@ class MainWP_Child_Maintenance {
             return $this->abilities_v2_failed_outcome();
         }
         $affected = 0;
+        $refused  = 0;
         foreach ( $names['local'] as $name ) {
-            if ( ! delete_transient( $name ) ) {
-                return $this->abilities_v2_failed_outcome();
+            if ( delete_transient( $name ) ) {
+                ++$affected;
+            } else {
+                ++$refused;
             }
-            ++$affected;
         }
         foreach ( $names['site'] as $name ) {
-            if ( ! delete_site_transient( $name ) ) {
-                return $this->abilities_v2_failed_outcome();
+            if ( delete_site_transient( $name ) ) {
+                ++$affected;
+            } else {
+                ++$refused;
             }
-            ++$affected;
+        }
+        // One transient that will not go (an orphaned timeout row has no value option left to
+        // delete) says nothing about the rest, so the run finishes the list and reports both the
+        // deletions it made and the fact that it did not clear everything it listed.
+        if ( 0 < $refused ) {
+            return $this->abilities_v2_failed_outcome( 'mutation_failed', $affected );
         }
         return array(
             'status'     => 'succeeded',

@@ -123,6 +123,32 @@ class MainWP_WordPress_SEO {
             return $this->abilities_v2_error( $operation, 'invalid_request' );
         }
 
+        if ( ! $is_mutation ) {
+            return $this->abilities_v2_execute( $operation, $request, false );
+        }
+
+        // Serialize the receipt check, the generation-drift check and the write against each other.
+        if ( ! $this->abilities_v2_begin_lock() ) {
+            return $this->abilities_v2_error( $operation, 'lock_busy' );
+        }
+        try {
+            return $this->abilities_v2_execute( $operation, $request, true );
+        } finally {
+            $this->abilities_v2_end_lock();
+        }
+    }
+
+    /**
+     * Execute one validated operation, under the mutation lock when it mutates.
+     *
+     * @param string $operation   Protocol operation.
+     * @param array  $request     Validated request.
+     * @param bool   $is_mutation Whether the operation mutates.
+     * @return array
+     */
+    private function abilities_v2_execute( $operation, $request, $is_mutation ) {
+        $is_read = ! $is_mutation;
+
         if ( $is_mutation ) {
             $replay = $this->abilities_v2_receipt( $operation, $request );
             if ( is_array( $replay ) ) {
@@ -140,7 +166,9 @@ class MainWP_WordPress_SEO {
         if ( 'active' !== $runtime['plugin_state'] ) {
             return $this->abilities_v2_error( $operation, 'provider_unavailable' );
         }
-        if ( ! $this->abilities_v2_supported_version( $runtime['version'] ) ) {
+        // The version pin exists to keep writes off untested option layouts; a read that
+        // normalizes cleanly is truthful on any Yoast version.
+        if ( $is_mutation && ! $this->abilities_v2_supported_version( $runtime['version'] ) ) {
             return $this->abilities_v2_error( $operation, 'unsupported_version' );
         }
 
@@ -247,10 +275,49 @@ class MainWP_WordPress_SEO {
             'plugin_state'       => $valid_runtime ? $runtime['plugin_state'] : 'unknown',
             'version'            => $active ? $runtime['version'] : null,
             'compatibility'      => $supported ? 'supported' : ( $active ? 'unsupported' : 'unavailable' ),
-            'schema'             => $supported ? 'yoast-safe-v1' : null,
-            'operations'         => $supported ? array( 'read_safe_v1', 'apply_safe_v1', 'rollback_safe_v1' ) : array(),
+            'schema'             => $active ? 'yoast-safe-v1' : null,
+            'operations'         => $supported ? array( 'read_safe_v1', 'apply_safe_v1', 'rollback_safe_v1' ) : ( $active ? array( 'read_safe_v1' ) : array() ),
             'mutation_supported' => $supported,
         );
+    }
+
+    /**
+     * Return this installation's named mutation lock.
+     *
+     * @return string
+     */
+    protected function abilities_v2_lock_name() {
+        return 'mainwp_yoast_v2_' . substr( hash( 'sha256', home_url( '/' ) ), 0, 32 );
+    }
+
+    /**
+     * Acquire the Child-wide Yoast mutation lock without waiting.
+     *
+     * @return bool
+     */
+    protected function abilities_v2_begin_lock() {
+        global $wpdb;
+        if ( ! is_object( $wpdb ) || ! is_callable( array( $wpdb, 'prepare' ) ) || ! is_callable( array( $wpdb, 'get_var' ) ) ) {
+            return false;
+        }
+        $wpdb->last_error = '';
+        $locked           = $wpdb->get_var( $wpdb->prepare( 'SELECT GET_LOCK(%s,0)', $this->abilities_v2_lock_name() ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery -- Named lock is the serialization primitive.
+        return empty( $wpdb->last_error ) && '1' === (string) $locked;
+    }
+
+    /**
+     * Release the Child-wide Yoast mutation lock.
+     *
+     * @return bool
+     */
+    protected function abilities_v2_end_lock() {
+        global $wpdb;
+        if ( ! is_object( $wpdb ) || ! is_callable( array( $wpdb, 'prepare' ) ) || ! is_callable( array( $wpdb, 'get_var' ) ) ) {
+            return false;
+        }
+        $wpdb->last_error = '';
+        $released         = $wpdb->get_var( $wpdb->prepare( 'SELECT RELEASE_LOCK(%s)', $this->abilities_v2_lock_name() ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery -- Named lock release must be checked.
+        return empty( $wpdb->last_error ) && '1' === (string) $released;
     }
 
     /**
@@ -492,7 +559,9 @@ class MainWP_WordPress_SEO {
      * @return bool
      */
     protected function abilities_v2_write_option( $name, $value ) {
-        return update_option( $name, $value, false ) || get_option( $name, null ) === $value;
+        // Yoast owns these options' autoload flag; the null default leaves it as stored,
+        // so an apply and its rollback cannot silently move them off autoload.
+        return update_option( $name, $value ) || get_option( $name, null ) === $value;
     }
 
     /**

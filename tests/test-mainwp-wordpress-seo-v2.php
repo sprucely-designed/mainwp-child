@@ -35,16 +35,79 @@ class Test_MainWP_WordPress_SEO_V2 extends WP_UnitTestCase {
 		$this->assertStringNotContainsString( 'secret', wp_json_encode( $result ) );
 	}
 
-	public function test_unsupported_versions_and_unsafe_templates_fail_closed() {
-		$unsupported = new Testable_MainWP_WordPress_SEO_V2( '19.9', $this->safe_options() );
-		$this->assertSame( 'unsupported_version', $unsupported->abilities_v2( 'read_safe_v1', $this->read_request() )['code'] );
+	public function test_unsupported_versions_block_mutations_only_and_unsafe_templates_fail_closed() {
 		$unverified = new Testable_MainWP_WordPress_SEO_V2( '26.0', $this->safe_options() );
-		$this->assertSame( 'unsupported_version', $unverified->abilities_v2( 'read_safe_v1', $this->read_request() )['code'] );
+
+		$read = $unverified->abilities_v2( 'read_safe_v1', $this->read_request() );
+		$this->assertTrue( $read['ok'] );
+		$this->assertSame( '26.0', $read['version'] );
+
+		$target = $read['settings'];
+		$target['sitemaps']['enabled'] = false;
+		$apply = $unverified->abilities_v2( 'apply_safe_v1', $this->mutation_request( 'apply_safe_v1', $read['config_generation'], $target ) );
+		$this->assertSame( 'unsupported_version', $apply['code'] );
+		$this->assertSame( 0, $unverified->write_count() );
+
+		$describe = $unverified->abilities_v2( 'describe_v2', array( 'contract_version' => '2' ) );
+		$this->assertSame( 'unsupported', $describe['compatibility'] );
+		$this->assertSame( array( 'read_safe_v1' ), $describe['operations'] );
+		$this->assertFalse( $describe['mutation_supported'] );
 
 		$options                                = $this->safe_options();
 		$options['wpseo_titles']['title-post'] = '%%title%% %%unknown%%';
 		$unsafe                                 = new Testable_MainWP_WordPress_SEO_V2( '25.5', $options );
 		$this->assertSame( 'unsafe_configuration', $unsafe->abilities_v2( 'read_safe_v1', $this->read_request() )['code'] );
+
+		$missing = new Testable_MainWP_WordPress_SEO_V2_Missing();
+		$this->assertSame( 'provider_unavailable', $missing->abilities_v2( 'read_safe_v1', $this->read_request() )['code'] );
+	}
+
+	public function test_apply_holds_the_named_lock_and_releases_it() {
+		$subject = new Testable_MainWP_WordPress_SEO_V2( '25.5', $this->safe_options() );
+		$read    = $subject->abilities_v2( 'read_safe_v1', $this->read_request() );
+		$this->assertNull( $subject->lock_free_during_write );
+
+		$target                        = $read['settings'];
+		$target['sitemaps']['enabled'] = false;
+		$result                        = $subject->abilities_v2( 'apply_safe_v1', $this->mutation_request( 'apply_safe_v1', $read['config_generation'], $target ) );
+
+		$this->assertTrue( $result['ok'] );
+		$this->assertSame( '0', (string) $subject->lock_free_during_write );
+		$this->assertSame( '1', (string) $this->lock_state( $subject->lock_name() ) );
+	}
+
+	public function test_apply_refuses_honestly_while_another_request_holds_the_lock() {
+		$subject = new Testable_MainWP_WordPress_SEO_V2( '25.5', $this->safe_options() );
+		$read    = $subject->abilities_v2( 'read_safe_v1', $this->read_request() );
+		$target  = $read['settings'];
+		$target['sitemaps']['enabled'] = false;
+
+		$holder = $this->hold_lock_elsewhere( $subject->lock_name() );
+		$result = $subject->abilities_v2( 'apply_safe_v1', $this->mutation_request( 'apply_safe_v1', $read['config_generation'], $target ) );
+		$read_while_locked = $subject->abilities_v2( 'read_safe_v1', $this->read_request() );
+		$this->release_lock_elsewhere( $holder, $subject->lock_name() );
+
+		$this->assertFalse( $result['ok'] );
+		$this->assertSame( 'lock_busy', $result['code'] );
+		$this->assertSame( 0, $subject->write_count() );
+		$this->assertTrue( $read_while_locked['ok'] );
+	}
+
+	private function lock_state( $name ) {
+		global $wpdb;
+		return $wpdb->get_var( $wpdb->prepare( 'SELECT IS_FREE_LOCK(%s)', $name ) );
+	}
+
+	private function hold_lock_elsewhere( $name ) {
+		$other = new \wpdb( DB_USER, DB_PASSWORD, DB_NAME, DB_HOST );
+		$other->suppress_errors( true );
+		$this->assertSame( '1', (string) $other->get_var( $other->prepare( 'SELECT GET_LOCK(%s,0)', $name ) ) );
+		return $other;
+	}
+
+	private function release_lock_elsewhere( $other, $name ) {
+		$other->get_var( $other->prepare( 'SELECT RELEASE_LOCK(%s)', $name ) );
+		$other->close();
 	}
 
 	public function test_inputs_are_closed_and_uuid_uses_request_ref() {
@@ -58,9 +121,7 @@ class Test_MainWP_WordPress_SEO_V2 extends WP_UnitTestCase {
 		unset( $request['request_ref'] );
 		$this->assertSame( 'invalid_request', $subject->abilities_v2( 'read_safe_v1', $request )['code'] );
 
-		$source = file_get_contents( dirname( __DIR__ ) . '/class/class-mainwp-wordpress-seo.php' );
-		$this->assertStringContainsString( "'import_settings' === \$mwp_action", $source );
-		$this->assertStringContainsString( "'file_url'", $source );
+		$this->assertSame( 'invalid_request', $subject->abilities_v2( 'unknown_operation', $this->read_request() )['code'] );
 	}
 
 	public function test_apply_preserves_unowned_values_reads_back_and_replays() {
@@ -130,6 +191,33 @@ class Test_MainWP_WordPress_SEO_V2 extends WP_UnitTestCase {
 		$this->assertSame( $before['settings'], $subject->abilities_v2( 'read_safe_v1', $this->read_request() )['settings'] );
 	}
 
+	public function test_apply_preserves_the_stored_autoload_setting() {
+		global $wpdb;
+		$options = $this->safe_options();
+		delete_option( 'wpseo_titles' );
+		delete_option( 'wpseo' );
+		delete_option( 'mainwp_wordpress_seo_v2_receipts' );
+		$this->assertTrue( add_option( 'wpseo_titles', $options['wpseo_titles'], '', 'yes' ) );
+		$this->assertTrue( add_option( 'wpseo', $options['wpseo'], '', 'yes' ) );
+		$autoload_before = $wpdb->get_var( $wpdb->prepare( "SELECT autoload FROM {$wpdb->options} WHERE option_name = %s", 'wpseo_titles' ) );
+
+		$subject = new Testable_MainWP_WordPress_SEO_V2_Durable( '25.5' );
+		$read    = $subject->abilities_v2( 'read_safe_v1', $this->read_request() );
+		$this->assertTrue( $read['ok'] );
+		$target  = $read['settings'];
+		$target['post_types'][0]['index'] = false;
+		$result  = $subject->abilities_v2( 'apply_safe_v1', $this->mutation_request( 'apply_safe_v1', $read['config_generation'], $target ) );
+
+		$this->assertTrue( $result['ok'] );
+		$this->assertSame( 'applied', $result['state'] );
+		$this->assertTrue( get_option( 'wpseo_titles' )['noindex-post'] );
+		$this->assertSame( $autoload_before, $wpdb->get_var( $wpdb->prepare( "SELECT autoload FROM {$wpdb->options} WHERE option_name = %s", 'wpseo_titles' ) ) );
+
+		delete_option( 'wpseo_titles' );
+		delete_option( 'wpseo' );
+		delete_option( 'mainwp_wordpress_seo_v2_receipts' );
+	}
+
 	private function read_request() {
 		return array(
 			'contract_version' => '2',
@@ -191,6 +279,9 @@ class Testable_MainWP_WordPress_SEO_V2 extends MainWP_WordPress_SEO {
 
 	private $test_fail_name = null;
 
+	/** @var string|null IS_FREE_LOCK() observed while the option write ran. */
+	public $lock_free_during_write = null;
+
 	public function __construct( $version, $options ) {
 		$this->test_version = $version;
 		$this->test_options = $options;
@@ -205,13 +296,19 @@ class Testable_MainWP_WordPress_SEO_V2 extends MainWP_WordPress_SEO {
 	}
 
 	protected function abilities_v2_write_option( $name, $value ) {
+		global $wpdb;
 		++$this->test_write_count;
+		$this->lock_free_during_write = $wpdb->get_var( $wpdb->prepare( 'SELECT IS_FREE_LOCK(%s)', $this->abilities_v2_lock_name() ) );
 		if ( $name === $this->test_fail_name ) {
 			$this->test_fail_name = null;
 			return false;
 		}
 		$this->test_options[ $name ] = $value;
 		return true;
+	}
+
+	public function lock_name() {
+		return $this->abilities_v2_lock_name();
 	}
 
 	protected function abilities_v2_receipt( $operation, $request ) {
@@ -241,5 +338,41 @@ class Testable_MainWP_WordPress_SEO_V2 extends MainWP_WordPress_SEO {
 
 	public function fail_next_write( $name ) {
 		$this->test_fail_name = $name;
+	}
+}
+
+/** Reports Yoast as absent so provider guards can be exercised. */
+class Testable_MainWP_WordPress_SEO_V2_Missing extends MainWP_WordPress_SEO {
+
+	public function __construct() {
+	}
+
+	protected function abilities_v2_runtime() {
+		return array(
+			'plugin_state' => 'missing',
+			'version'      => null,
+			'options'      => null,
+		);
+	}
+}
+
+/** Reads and writes the real Yoast options so storage behavior is exercised. */
+class Testable_MainWP_WordPress_SEO_V2_Durable extends MainWP_WordPress_SEO {
+
+	private $test_version;
+
+	public function __construct( $version ) {
+		$this->test_version = $version;
+	}
+
+	protected function abilities_v2_runtime() {
+		return array(
+			'plugin_state' => 'active',
+			'version'      => $this->test_version,
+			'options'      => array(
+				'wpseo_titles' => get_option( 'wpseo_titles', null ),
+				'wpseo'        => get_option( 'wpseo', null ),
+			),
+		);
 	}
 }

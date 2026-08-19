@@ -78,6 +78,61 @@ class Test_MainWP_Child_Early_Access_Release_V2 extends WP_UnitTestCase {
 		$this->assertSame( 0, $subject->applies );
 	}
 
+	public function test_package_invalid_failure_reports_the_unchanged_installed_version() {
+		$subject                = new Testable_MainWP_Child_Early_Access_Release();
+		$subject->package_valid = false;
+		$request                = $this->apply_request();
+		$result                 = $subject->release_v2( $request );
+
+		$this->assertFalse( $result['ok'] );
+		$this->assertSame( 'failed', $result['status'] );
+		$this->assertSame( 'package_invalid', $result['code'] );
+		$this->assertSame( 'not_attempted', $result['persistence'] );
+		$this->assertTrue( $result['retry_safe'] );
+		$this->assertSame( '5.4.1', $result['previous_version'] );
+		$this->assertSame( '5.4.1', $result['installed_version'] );
+		$this->assertTrue( $result['active'] );
+		$this->assertSame( 0, $subject->applies );
+		$this->assertSame( $result, $subject->release_v2( $this->request( 'status', array( 'request_ref' => $request['payload']['request_ref'] ) ) ) );
+
+		$mismatch                = new Testable_MainWP_Child_Early_Access_Release();
+		$mismatch->package_bytes = 2048;
+		$digest                  = $mismatch->release_v2( $this->apply_request() );
+
+		$this->assertSame( 'package_invalid', $digest['code'] );
+		$this->assertSame( '5.4.1', $digest['installed_version'] );
+		$this->assertSame( 0, $mismatch->applies );
+	}
+
+	public function test_stale_state_failure_reports_the_version_actually_found() {
+		$subject                = new Testable_MainWP_Child_Early_Access_Release();
+		$subject->recheck_state = '5.4.2';
+		$result                 = $subject->release_v2( $this->apply_request() );
+
+		$this->assertFalse( $result['ok'] );
+		$this->assertSame( 'failed', $result['status'] );
+		$this->assertSame( 'stale_state', $result['code'] );
+		$this->assertSame( 'not_attempted', $result['persistence'] );
+		$this->assertSame( '5.4.1', $result['previous_version'] );
+		$this->assertSame( '5.4.2', $result['installed_version'] );
+		$this->assertTrue( $result['active'] );
+		$this->assertSame( 0, $subject->applies );
+	}
+
+	public function test_unreadable_recheck_is_unknown_and_claims_no_version() {
+		$subject                = new Testable_MainWP_Child_Early_Access_Release();
+		$subject->recheck_state = false;
+		$result                 = $subject->release_v2( $this->apply_request() );
+
+		$this->assertFalse( $result['ok'] );
+		$this->assertSame( 'unknown', $result['status'] );
+		$this->assertSame( 'read_failed', $result['code'] );
+		$this->assertSame( 'unknown', $result['persistence'] );
+		$this->assertSame( '', $result['installed_version'] );
+		$this->assertFalse( $result['retry_safe'] );
+		$this->assertSame( 0, $subject->applies );
+	}
+
 	public function test_settled_install_failure_reports_verified_restoration() {
 		$subject               = new Testable_MainWP_Child_Early_Access_Release();
 		$subject->apply_status = 'restored';
@@ -170,14 +225,26 @@ class Testable_MainWP_Child_Early_Access_Release extends MainWP_Child_Early_Acce
 	public $version = '5.4.1';
 	public $active = true;
 	public $package_valid = true;
+	public $package_bytes = 1024;
 	public $apply_status = 'applied';
 	public $downloads = 0;
 	public $applies = 0;
 	public $cleanups = 0;
 	public $receipts = array();
 	public $lock_available = true;
+	public $state_reads = 0;
+
+	/** Version reported by the post-download state re-read, or false for a tree that no longer parses. */
+	public $recheck_state = null;
 
 	protected function current_state() {
+		++$this->state_reads;
+		if ( null !== $this->recheck_state && 2 === $this->state_reads ) {
+			if ( false === $this->recheck_state ) {
+				return false;
+			}
+			$this->version = $this->recheck_state;
+		}
 		return array( 'installed' => $this->installed, 'version' => $this->version, 'active' => $this->active );
 	}
 
@@ -188,7 +255,7 @@ class Testable_MainWP_Child_Early_Access_Release extends MainWP_Child_Early_Acce
 	protected function download_package( $url, $token, $expected_bytes ) {
 		unset( $url, $token, $expected_bytes );
 		++$this->downloads;
-		return array( 'path' => '/private/fixture.zip', 'bytes' => 1024, 'sha256' => str_repeat( 'a', 64 ) );
+		return array( 'path' => '/private/fixture.zip', 'bytes' => $this->package_bytes, 'sha256' => str_repeat( 'a', 64 ) );
 	}
 
 	protected function validate_package( $package, $target_version ) {

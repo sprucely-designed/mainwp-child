@@ -167,6 +167,49 @@ class Test_Custom_Post_Type_Import_V2 extends WP_UnitTestCase {
 	}
 
 	/**
+	 * A variation may only carry a registered non-builtin post type.
+	 */
+	public function test_variation_post_type_is_gated_before_any_mutation() {
+		$payload                        = $this->payload();
+		$variation                      = $this->payload();
+		$variation                      = array_intersect_key( $variation, array_flip( array( 'post', 'postmeta', 'extras' ) ) );
+		$variation['post']['post_type'] = 'post';
+		$payload['product_variation']   = array( 77 => $variation );
+
+		$result = $this->import( $payload );
+
+		$this->assertSame( array( 'outcome' => 'rejected', 'reason' => 'unsupported_post_type' ), $result );
+		$this->assertSame( 0, (int) wp_count_posts( 'codex_cpt_v2' )->draft );
+		$this->assertCount(
+			0,
+			get_posts(
+				array(
+					'post_type'   => 'post',
+					'post_status' => 'any',
+					'name'        => 'v2-title',
+					'fields'      => 'ids',
+				)
+			)
+		);
+	}
+
+	/**
+	 * A fatal after the first write may not claim the child was left untouched.
+	 */
+	public function test_fatal_after_the_first_write_is_not_reported_as_rejected() {
+		$outcome = new ReflectionMethod( MainWP_Custom_Post_Type::class, 'v2_fatal_outcome' );
+		$outcome->setAccessible( true );
+
+		$payload               = $this->payload();
+		$payload['categories'] = array( 'not-allowed-in-v2' );
+		$this->assertSame( 'rejected', $this->import( $payload )['outcome'] );
+		$this->assertSame( array( 'outcome' => 'rejected', 'reason' => 'child_failure' ), $outcome->invoke( null ) );
+
+		$this->assertSame( 'complete', $this->import( $this->payload() )['outcome'] );
+		$this->assertSame( array( 'outcome' => 'unknown', 'reason' => 'child_failure' ), $outcome->invoke( null ) );
+	}
+
+	/**
 	 * JSON object member order does not change the closed contract.
 	 */
 	public function test_reordered_meta_members_remain_valid() {

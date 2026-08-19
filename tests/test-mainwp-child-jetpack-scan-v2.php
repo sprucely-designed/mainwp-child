@@ -225,9 +225,14 @@ class Test_MainWP_Child_Jetpack_Scan_V2 extends WP_UnitTestCase {
 		);
 		$this->assertTrue( $result['ok'] );
 
+		// Negotiation is supported, so a payload on it is a malformed request, not an unknown operation.
 		$result = $this->request( 'capabilities', array( 'extra' => true ) );
 		$this->assertFalse( $result['ok'] );
-		$this->assertSame( 'unsupported_operation', $result['code'] );
+		$this->assertSame( 'capabilities', $result['operation'] );
+		$this->assertSame( 'invalid_request', $result['code'] );
+
+		$unknown = $this->request( 'jetpack_scan_future_v2', array() );
+		$this->assertSame( 'unsupported_operation', $unknown['code'] );
 	}
 
 	private function request( $operation, $payload ) {

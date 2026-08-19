@@ -23,8 +23,14 @@ if ( ! defined( 'ABSPATH' ) ) {
  */
 class MainWP_Child_Callable { //phpcs:ignore -- NOSONAR - multi methods.
 
-    /** Maximum serialized Post Dripper v2 request, including 200 KB content. */
-    const POST_DRIPPER_REQUEST_MAX_BYTES = 262144;
+    /**
+     * Maximum serialized Post Dripper v2 request.
+     *
+     * Post Dripper deliveries go through the same content normalizer as Post Plus, so they carry
+     * the same field limits; 256 KB rejected legal non-Latin posts here, because a 200 KB CJK body
+     * doubles to 400 KB once every character is JSON-escaped to \uXXXX.
+     */
+    const POST_DRIPPER_REQUEST_MAX_BYTES = 2097152;
 
     /**
      * Maximum serialized Post Plus v2 request.

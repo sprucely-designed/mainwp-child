@@ -319,22 +319,27 @@ class MainWP_Child_Early_Access_Release {
             $package = $this->download_package( $payload['gateway_url'], $payload['gateway_token'], $payload['expected_bytes'] );
             if ( ! $this->valid_package_descriptor( $package ) || $payload['expected_bytes'] !== $package['bytes'] || ! hash_equals( $payload['expected_sha256'], $package['sha256'] ) ) {
                 $this->cleanup_package( $package );
-                return $this->settle_failure( $dispatching, 'package_invalid' );
+                return $this->settle_failure( $dispatching, 'package_invalid', 'failed', $before );
             }
             if ( ! $this->validate_package( $package, $payload['target_version'] ) ) {
                 $this->cleanup_package( $package );
-                return $this->settle_failure( $dispatching, 'package_invalid' );
+                return $this->settle_failure( $dispatching, 'package_invalid', 'failed', $before );
             }
             $fresh = $this->current_state();
-            if ( ! $this->valid_current_state( $fresh ) || $fresh !== $before ) {
+            if ( ! $this->valid_current_state( $fresh ) ) {
                 $this->cleanup_package( $package );
-                return $this->settle_failure( $dispatching, 'stale_state' );
+                // The installed tree became unreadable while the transition lane was held, so no version can be claimed.
+                return $this->settle_failure( $dispatching, 'read_failed', 'unknown' );
+            }
+            if ( $fresh !== $before ) {
+                $this->cleanup_package( $package );
+                return $this->settle_failure( $dispatching, 'stale_state', 'failed', $fresh );
             }
             $applied = $this->apply_package( $package, $before, $payload['target_version'] );
             $cleaned = $this->cleanup_package( $package );
             $after   = $this->current_state();
             if ( ! $cleaned || ! is_array( $applied ) || ! $this->exact_keys( $applied, array( 'status', 'backup_ref' ) ) || ! in_array( $applied['status'], array( 'applied', 'restored', 'unknown' ), true ) || ( null !== $applied['backup_ref'] && ! $this->safe_ref( $applied['backup_ref'] ) ) || ! $this->valid_current_state( $after ) ) {
-                return $this->settle_failure( $dispatching, 'outcome_unknown', 'unknown', $before );
+                return $this->settle_failure( $dispatching, 'outcome_unknown', 'unknown', $after );
             }
             if ( 'restored' === $applied['status'] ) {
                 return $this->settle_result( $dispatching, $this->result( $payload, 'restored', $before['version'], $after['version'], $after['active'], 'restored', false, 'install_failed_restored' ) );
@@ -428,7 +433,10 @@ class MainWP_Child_Early_Access_Release {
 
     /** Persist one settled failure or ambiguity. */
     private function settle_failure( $dispatching, $code, $status = 'failed', $state = null ) {
-        $current = $this->valid_current_state( $state ) ? $state : array(
+        // Without a snapshot the installed code is unknown, not absent, so the empty reading only ever ships as an ambiguous outcome.
+        $known   = $this->valid_current_state( $state );
+        $status  = $known ? $status : 'unknown';
+        $current = $known ? $state : array(
             'installed' => false,
             'version'   => '',
             'active'    => $dispatching['previous_active'],

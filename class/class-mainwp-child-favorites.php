@@ -129,6 +129,11 @@ class MainWP_Child_Favorites {
         if ( false === $existing ) {
             return $this->error( $operation, 'storage_unavailable' );
         }
+        // Only this mutation path evicts: the read paths must never write.
+        if ( is_array( $existing ) && $this->install_receipt_expired( $existing ) ) {
+            $this->delete_install_receipt( $payload['request_ref'] );
+            $existing = null;
+        }
         $effect_hash = $this->install_effect_hash( $payload );
         if ( is_array( $existing ) ) {
             return $this->replay_install_receipt( $existing, $effect_hash );
@@ -212,7 +217,7 @@ class MainWP_Child_Favorites {
         if ( false === $receipt ) {
             return $this->error( 'status', 'storage_unavailable' );
         }
-        if ( ! is_array( $receipt ) || ! $this->valid_install_receipt( $receipt ) ) {
+        if ( ! is_array( $receipt ) || ! $this->valid_install_receipt( $receipt ) || $this->install_receipt_expired( $receipt ) ) {
             return $this->error( 'status', 'not_found' );
         }
         return 'dispatching' === $receipt['state'] ? $this->unknown_result( $receipt ) : $receipt['result'];
@@ -353,14 +358,17 @@ class MainWP_Child_Favorites {
         if ( $missing === $receipt ) {
             return null;
         }
-        if ( ! $this->valid_install_receipt( $receipt ) ) {
-            return false;
-        }
-        if ( $receipt['expires_at'] <= time() ) {
-            delete_option( $this->receipt_key( $request_ref ) );
-            return null;
-        }
-        return $receipt;
+        return $this->valid_install_receipt( $receipt ) ? $receipt : false;
+    }
+
+    /** Report whether a stored receipt is past its retention window. */
+    private function install_receipt_expired( $receipt ) {
+        return is_array( $receipt ) && isset( $receipt['expires_at'] ) && is_int( $receipt['expires_at'] ) && $receipt['expires_at'] <= time();
+    }
+
+    /** Drop one receipt a mutation has proven past retention. */
+    protected function delete_install_receipt( $request_ref ) {
+        return delete_option( $this->receipt_key( $request_ref ) );
     }
 
     /** Reserve one effect before package acquisition or installation. */
@@ -427,7 +435,7 @@ class MainWP_Child_Favorites {
         $validated = true;
         for ( $index = 0; $index < $zip->numFiles; ++$index ) {
             $stat = $zip->statIndex( $index );
-            if ( ! is_array( $stat ) || ! isset( $stat['name'], $stat['size'] ) || ! is_string( $stat['name'] ) || 512 < strlen( $stat['name'] ) || false !== strpos( $stat['name'], "\0" ) || false !== strpos( $stat['name'], '\\' ) || 0 === strpos( $stat['name'], '/' ) || ( '' !== $root && 0 !== strpos( $stat['name'], $root ) ) ) {
+            if ( ! is_array( $stat ) || ! isset( $stat['name'], $stat['size'] ) || ! is_string( $stat['name'] ) || 512 < strlen( $stat['name'] ) || false !== strpos( $stat['name'], "\0" ) || false !== strpos( $stat['name'], '\\' ) || 0 === strpos( $stat['name'], '/' ) || ! $this->contained_entry( $stat['name'], $root ) ) {
                 $validated = false;
                 break;
             }
@@ -458,6 +466,16 @@ class MainWP_Child_Favorites {
         $name_pattern    = 'plugin' === $type ? '/^[ \t\/*#@]*Plugin Name:\s*(.+)$/mi' : '/^[ \t\/*#@]*Theme Name:\s*(.+)$/mi';
         $version_pattern = '/^[ \t\/*#@]*Version:\s*(.+)$/mi';
         return 1 === preg_match( $name_pattern, $header, $name_match ) && '' !== trim( $name_match[1] ) && 1 === preg_match( $version_pattern, $header, $version_match ) && trim( $version_match[1] ) === $version;
+    }
+
+    /**
+     * Hold containment for one archive entry.
+     *
+     * A single-file plugin slug ("hello.php") has no directory to anchor on, so the
+     * archive is only contained when every entry sits at the archive root.
+     */
+    private function contained_entry( $name, $root ) {
+        return '' === $root ? false === strpos( $name, '/' ) : 0 === strpos( $name, $root );
     }
 
     /** Install the verified local package and optionally activate the exact plugin. */

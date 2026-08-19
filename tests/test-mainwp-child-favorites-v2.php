@@ -113,6 +113,81 @@ class Test_MainWP_Child_Favorites_V2 extends WP_UnitTestCase {
 		$this->assertSame( 0, $subject->download_count );
 	}
 
+	public function test_expired_receipt_is_not_found_and_the_status_read_never_deletes_it() {
+		$subject                   = new Testable_MainWP_Child_Favorites_V2( array(), array(), array() );
+		$subject->durable_receipts = true;
+		$ref                       = '123e4567-e89b-42d3-a456-426614173022';
+		$receipt                   = $this->expired_receipt( $ref );
+		$this->assertTrue( $subject->seed_durable_receipt( $ref, $receipt ) );
+
+		$status = $subject->install_verified_v2(
+			array(
+				'protocol'  => '2',
+				'operation' => 'status',
+				'payload'   => array( 'request_ref' => $ref ),
+			)
+		);
+
+		$this->assertFalse( $status['ok'] );
+		$this->assertSame( 'not_found', $status['code'] );
+		$this->assertSame( $receipt, get_option( 'mainwp_child_favorites_receipt_' . hash( 'sha256', $ref ), false ) );
+
+		delete_option( 'mainwp_child_favorites_receipt_' . hash( 'sha256', $ref ) );
+	}
+
+	public function test_install_evicts_an_expired_receipt_instead_of_replaying_it() {
+		$subject                   = new Testable_MainWP_Child_Favorites_V2( array(), array(), array() );
+		$subject->durable_receipts = true;
+		$request                   = $this->install_request();
+		$ref                       = $request['payload']['request_ref'];
+		$this->assertTrue( $subject->seed_durable_receipt( $ref, $this->expired_receipt( $ref ) ) );
+
+		$result = $subject->install_verified_v2( $request );
+
+		$this->assertTrue( $result['ok'] );
+		$this->assertSame( 'completed', $result['status'] );
+		$this->assertSame( 1, $subject->download_count );
+		$this->assertSame( 1, $subject->install_count );
+		$stored = get_option( 'mainwp_child_favorites_receipt_' . hash( 'sha256', $ref ), false );
+		$this->assertSame( 'settled', $stored['state'] );
+		$this->assertSame( $result, $stored['result'] );
+
+		delete_option( 'mainwp_child_favorites_receipt_' . hash( 'sha256', $ref ) );
+	}
+
+	public function test_single_file_plugin_archive_must_stay_at_the_archive_root() {
+		if ( ! class_exists( '\ZipArchive' ) ) {
+			$this->markTestSkipped( 'ZipArchive is unavailable.' );
+		}
+		$probe = new Production_MainWP_Child_Favorites_Package_Probe();
+
+		$valid = wp_tempnam( 'mainwp-favorites-single.zip' );
+		$zip   = new \ZipArchive();
+		$this->assertTrue( $zip->open( $valid, \ZipArchive::OVERWRITE ) );
+		$zip->addFromString( 'hello.php', "<?php\n/*\nPlugin Name: Hello\nVersion: 1.2.3\n*/\n" );
+		$zip->close();
+		$this->assertTrue( $probe->inspect( $valid, 'plugin', 'hello.php', '1.2.3' ) );
+		unlink( $valid );
+
+		$hostile = wp_tempnam( 'mainwp-favorites-escape.zip' );
+		$zip     = new \ZipArchive();
+		$this->assertTrue( $zip->open( $hostile, \ZipArchive::OVERWRITE ) );
+		$zip->addFromString( 'hello.php', "<?php\n/*\nPlugin Name: Hello\nVersion: 1.2.3\n*/\n" );
+		$zip->addFromString( 'other-plugin/evil.php', '<?php // payload' );
+		$zip->close();
+		$this->assertFalse( $probe->inspect( $hostile, 'plugin', 'hello.php', '1.2.3' ) );
+		unlink( $hostile );
+
+		$nested = wp_tempnam( 'mainwp-favorites-nested.zip' );
+		$zip    = new \ZipArchive();
+		$this->assertTrue( $zip->open( $nested, \ZipArchive::OVERWRITE ) );
+		$zip->addFromString( 'forms/forms.php', "<?php\n/*\nPlugin Name: Forms\nVersion: 2.1.0\n*/\n" );
+		$zip->addFromString( 'forms/readme.txt', 'fixture' );
+		$zip->close();
+		$this->assertTrue( $probe->inspect( $nested, 'plugin', 'forms/forms.php', '2.1.0' ) );
+		unlink( $nested );
+	}
+
 	public function test_uuid_alias_and_callable_map_are_closed() {
 		$subject = new Testable_MainWP_Child_Favorites_V2( array(), array(), array() );
 		$request = $this->state_request( 'plugin', 'forms/forms.php' );
@@ -126,6 +201,36 @@ class Test_MainWP_Child_Favorites_V2 extends WP_UnitTestCase {
 		$callables = $property->getValue( MainWP_Child_Callable::get_instance() );
 		$this->assertSame( 'favorites_package_state_v2', $callables['favorites_package_state_v2'] );
 		$this->assertSame( 'favorites_install_verified_v2', $callables['favorites_install_verified_v2'] );
+	}
+
+	private function expired_receipt( $ref ) {
+		return array(
+			'effect_hash'      => str_repeat( 'c', 64 ),
+			'state'            => 'settled',
+			'request_ref'      => $ref,
+			'type'             => 'plugin',
+			'slug'             => 'forms/forms.php',
+			'expected_version' => '2.1.0',
+			'activate'         => true,
+			'installed'        => false,
+			'previous_version' => null,
+			'previous_active'  => null,
+			'result'           => array(
+				'protocol'    => '2',
+				'operation'   => 'install',
+				'ok'          => false,
+				'request_ref' => $ref,
+				'status'      => 'failed',
+				'installed'   => false,
+				'type'        => 'plugin',
+				'slug'        => 'forms/forms.php',
+				'version'     => null,
+				'active'      => null,
+				'code'        => 'download_failed',
+			),
+			'updated_at'       => time() - 8 * DAY_IN_SECONDS,
+			'expires_at'       => time() - DAY_IN_SECONDS,
+		);
 	}
 
 	private function state_request( $type, $slug ) {
@@ -176,6 +281,8 @@ class Testable_MainWP_Child_Favorites_V2 extends MainWP_Child_Favorites {
 	public $downloaded_package_digest;
 
 	public $receipts = array();
+
+	public $durable_receipts = false;
 
 	public function __construct( $plugins, $active_plugins, $themes ) {
 		$this->test_plugins        = $plugins;
@@ -229,10 +336,16 @@ class Testable_MainWP_Child_Favorites_V2 extends MainWP_Child_Favorites {
 	}
 
 	protected function load_install_receipt( $request_ref ) {
+		if ( $this->durable_receipts ) {
+			return parent::load_install_receipt( $request_ref );
+		}
 		return isset( $this->receipts[ $request_ref ] ) ? $this->receipts[ $request_ref ] : null;
 	}
 
 	protected function create_install_receipt( $request_ref, $receipt ) {
+		if ( $this->durable_receipts ) {
+			return parent::create_install_receipt( $request_ref, $receipt );
+		}
 		if ( isset( $this->receipts[ $request_ref ] ) ) {
 			return false;
 		}
@@ -241,11 +354,26 @@ class Testable_MainWP_Child_Favorites_V2 extends MainWP_Child_Favorites {
 	}
 
 	protected function settle_install_receipt( $request_ref, $expected, $receipt ) {
+		if ( $this->durable_receipts ) {
+			return parent::settle_install_receipt( $request_ref, $expected, $receipt );
+		}
 		if ( ! isset( $this->receipts[ $request_ref ] ) || $expected !== $this->receipts[ $request_ref ] ) {
 			return false;
 		}
 		$this->receipts[ $request_ref ] = $receipt;
 		return true;
+	}
+
+	protected function delete_install_receipt( $request_ref ) {
+		if ( $this->durable_receipts ) {
+			return parent::delete_install_receipt( $request_ref );
+		}
+		unset( $this->receipts[ $request_ref ] );
+		return true;
+	}
+
+	public function seed_durable_receipt( $request_ref, $receipt ) {
+		return parent::create_install_receipt( $request_ref, $receipt );
 	}
 
 	public function seed_dispatching( $request ) {
@@ -268,5 +396,13 @@ class Testable_MainWP_Child_Favorites_V2 extends MainWP_Child_Favorites {
 
 	public function effect_hash_for_test( $payload ) {
 		return $this->install_effect_hash( $payload );
+	}
+}
+
+/** Exposes the production archive validator with no stubbed seams. */
+class Production_MainWP_Child_Favorites_Package_Probe extends MainWP_Child_Favorites {
+
+	public function inspect( $path, $type, $slug, $version ) {
+		return $this->inspect_package( $path, $type, $slug, $version );
 	}
 }

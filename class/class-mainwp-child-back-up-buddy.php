@@ -2294,7 +2294,11 @@ class MainWP_Child_Back_Up_Buddy { //phpcs:ignore -- NOSONAR - multi methods.
             $deleted_files = array();
             foreach ( $item_ids as $item ) {
                 if ( file_exists( \backupbuddy_core::getBackupDirectory() . $item ) ) {
-                    if ( wp_delete_file( \backupbuddy_core::getBackupDirectory() . $item ) === true ) { // NOSONAR .
+                    // wp_delete_file() only gained a return value in WP 6.7 and we support 6.2+, so
+                    // absence on readback is the only truth available here.
+                    wp_delete_file( \backupbuddy_core::getBackupDirectory() . $item ); // NOSONAR .
+                    clearstatcache( true, \backupbuddy_core::getBackupDirectory() . $item );
+                    if ( ! file_exists( \backupbuddy_core::getBackupDirectory() . $item ) ) {
                         $deleted_files[] = $item;
 
                         $backup_files = glob( \backupbuddy_core::getBackupDirectory() . '*.zip' );
@@ -2549,8 +2553,14 @@ class MainWP_Child_Back_Up_Buddy { //phpcs:ignore -- NOSONAR - multi methods.
             $chk_valid = true;
         }
 
-        if ( $chk_valid && false === wp_delete_file( $fileoptions_file ) ) { // NOSONAR - safe.
-            $alerts[] = 'Error #456765545. Unable to wipe cached fileoptions file `' . $fileoptions_file . '`.';
+        if ( $chk_valid ) {
+            // wp_delete_file() only gained a return value in WP 6.7 and we support 6.2+, so the
+            // alert has to rest on the file still being there, not on the call's return.
+            wp_delete_file( $fileoptions_file ); // NOSONAR - safe.
+            clearstatcache( true, $fileoptions_file );
+            if ( file_exists( $fileoptions_file ) ) {
+                $alerts[] = 'Error #456765545. Unable to wipe cached fileoptions file `' . $fileoptions_file . '`.';
+            }
         }
 
         \pb_backupbuddy::status( 'details', 'Fileoptions instance #28.' );
@@ -3587,8 +3597,12 @@ class MainWP_Child_Back_Up_Buddy { //phpcs:ignore -- NOSONAR - multi methods.
         if ( '1' === \pb_backupbuddy::$options['lock_archives_directory'] ) {
 
             if ( file_exists( \backupbuddy_core::getBackupDirectory() . '.htaccess' ) ) {
-                $unlink_status = wp_delete_file( \backupbuddy_core::getBackupDirectory() . '.htaccess' );
-                if ( false === $unlink_status ) {
+                // wp_delete_file() only gained a return value in WP 6.7 and we support 6.2+; a
+                // download served through a still-present .htaccess would fail anyway, so the
+                // readback is what decides.
+                wp_delete_file( \backupbuddy_core::getBackupDirectory() . '.htaccess' );
+                clearstatcache( true, \backupbuddy_core::getBackupDirectory() . '.htaccess' );
+                if ( file_exists( \backupbuddy_core::getBackupDirectory() . '.htaccess' ) ) {
                     die( 'Error #844594. Unable to temporarily remove .htaccess security protection on archives directory to allow downloading. Please verify permissions of the BackupBuddy archives directory or manually download via FTP.' );
                 }
             }

@@ -244,7 +244,7 @@ class MainWP_Child_Branding { //phpcs:ignore -- NOSONAR - multi methods.
      * @param array $request Typed request.
      * @return array Closed protocol result.
      */
-    public function apply_abilities_v2( $request ) { // phpcs:ignore -- NOSONAR - effect reconciliation is intentionally explicit.
+    public function apply_abilities_v2( $request ) {
         $operation_ref = is_array( $request ) && isset( $request['operation_ref'] ) && is_string( $request['operation_ref'] ) ? $request['operation_ref'] : '';
         if ( ! $this->abilities_v2_valid_request( $request ) ) {
             return $this->abilities_v2_error( $operation_ref, 'invalid_request', 'The Branding request is invalid.' );
@@ -255,6 +255,27 @@ class MainWP_Child_Branding { //phpcs:ignore -- NOSONAR - multi methods.
             return $this->abilities_v2_error( $operation_ref, 'invalid_settings', 'The Branding settings are invalid.' );
         }
 
+        // Everything below is a read-modify-write over one settings option plus staged and
+        // deleted files; two concurrent applies would interleave and delete an asset the
+        // other request just recorded as current.
+        if ( ! $this->abilities_v2_begin_lock() ) {
+            return $this->abilities_v2_error( $operation_ref, 'lock_busy', 'Another Branding operation is already running.' );
+        }
+        try {
+            return $this->abilities_v2_apply_locked( $operation_ref, $settings );
+        } finally {
+            $this->abilities_v2_end_lock();
+        }
+    }
+
+    /**
+     * Apply one validated Branding request while holding the mutation lock.
+     *
+     * @param string $operation_ref Operation reference.
+     * @param array  $settings      Normalized desired settings.
+     * @return array Closed protocol result.
+     */
+    private function abilities_v2_apply_locked( $operation_ref, $settings ) { // phpcs:ignore -- NOSONAR - effect reconciliation is intentionally explicit.
         $desired_hash = hash( 'sha256', wp_json_encode( $this->abilities_v2_canonicalize( $settings ) ) );
         $receipts     = $this->abilities_v2_prune_receipts( $this->abilities_v2_read_receipts() );
         if ( isset( $receipts[ $operation_ref ] ) ) {
@@ -362,6 +383,45 @@ class MainWP_Child_Branding { //phpcs:ignore -- NOSONAR - multi methods.
 
         $this->child_branding_options = $target;
         return $this->abilities_v2_success( $operation_ref, $result );
+    }
+
+    /**
+     * Return this installation's named Branding mutation lock.
+     *
+     * @return string
+     */
+    protected function abilities_v2_lock_name() {
+        return 'mainwp_branding_v2_' . substr( hash( 'sha256', home_url( '/' ) ), 0, 32 );
+    }
+
+    /**
+     * Acquire the Child-wide Branding mutation lock without waiting.
+     *
+     * @return bool
+     */
+    protected function abilities_v2_begin_lock() {
+        global $wpdb;
+        if ( ! is_object( $wpdb ) || ! is_callable( array( $wpdb, 'prepare' ) ) || ! is_callable( array( $wpdb, 'get_var' ) ) ) {
+            return false;
+        }
+        $wpdb->last_error = '';
+        $locked           = $wpdb->get_var( $wpdb->prepare( 'SELECT GET_LOCK(%s,0)', $this->abilities_v2_lock_name() ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery -- Named lock is the serialization primitive.
+        return empty( $wpdb->last_error ) && '1' === (string) $locked;
+    }
+
+    /**
+     * Release the Child-wide Branding mutation lock.
+     *
+     * @return bool
+     */
+    protected function abilities_v2_end_lock() {
+        global $wpdb;
+        if ( ! is_object( $wpdb ) || ! is_callable( array( $wpdb, 'prepare' ) ) || ! is_callable( array( $wpdb, 'get_var' ) ) ) {
+            return false;
+        }
+        $wpdb->last_error = '';
+        $released         = $wpdb->get_var( $wpdb->prepare( 'SELECT RELEASE_LOCK(%s)', $this->abilities_v2_lock_name() ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery -- Named lock release must be checked.
+        return empty( $wpdb->last_error ) && '1' === (string) $released;
     }
 
     /**
@@ -639,7 +699,11 @@ class MainWP_Child_Branding { //phpcs:ignore -- NOSONAR - multi methods.
         if ( ! is_string( $path ) || '' === $path || ! file_exists( $path ) ) {
             return true;
         }
-        return (bool) wp_delete_file( $path );
+        // wp_delete_file() only gained a return value in WP 6.7 and we support 6.2+, so casting it
+        // reported every successful delete as a failure on the older half of the range.
+        wp_delete_file( $path );
+        clearstatcache( true, $path );
+        return ! file_exists( $path );
     }
 
     /**

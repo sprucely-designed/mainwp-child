@@ -160,6 +160,31 @@ class Test_MainWP_Child_Virusdie_V1 extends WP_UnitTestCase {
 		$this->assertSame( 'gateway_rejected', $subject->request_v1( $request )['code'] );
 	}
 
+	public function test_expired_receipt_is_never_replayed_and_status_does_not_delete_it() {
+		$subject                   = new Testable_MainWP_Child_Virusdie();
+		$subject->durable_receipts = true;
+		$subject->gateway_bytes    = '<?php // signed fixture';
+		$request                   = $this->install_request( $subject->gateway_bytes );
+		$ref                       = $request['payload']['request_ref'];
+		$key                       = 'mainwp_child_virusdie_v1_' . hash( 'sha256', $ref );
+		$expired                   = $this->expired_receipt( $ref );
+		$this->assertTrue( $subject->seed_durable_receipt( $ref, $expired ) );
+
+		$status = $subject->request_v1( $this->request( 'status', array( 'request_ref' => $ref ) ) );
+		$this->assertFalse( $status['ok'] );
+		$this->assertSame( 'not_found', $status['code'] );
+		$this->assertSame( $expired, get_option( $key, false ) );
+
+		$result = $subject->request_v1( $request );
+		$this->assertTrue( $result['ok'] );
+		$this->assertSame( 'completed', $result['status'] );
+		$this->assertSame( 1, $subject->gateway_reads );
+		$this->assertSame( 1, $subject->installs );
+		$this->assertSame( $result, get_option( $key, false )['result'] );
+
+		delete_option( $key );
+	}
+
 	public function test_callable_dispatch_map_registers_the_narrow_protocol() {
 		$reflection = new ReflectionClass( MainWP_Child_Callable::class );
 		$callable   = $reflection->newInstanceWithoutConstructor();
@@ -183,6 +208,31 @@ class Test_MainWP_Child_Virusdie_V1 extends WP_UnitTestCase {
 				'site_generation' => str_repeat( 'a', 64 ),
 				'expires_at'      => time() + 300,
 			)
+		);
+	}
+
+	private function expired_receipt( $ref ) {
+		return array(
+			'effect_hash'     => str_repeat( 'd', 64 ),
+			'operation'       => 'install',
+			'request_ref'     => $ref,
+			'basename'        => 'virusdie_fixture.php',
+			'expected_sha256' => str_repeat( 'e', 64 ),
+			'site_generation' => str_repeat( 'a', 64 ),
+			'state'           => 'settled',
+			'result'          => array(
+				'protocol'    => '1',
+				'operation'   => 'install',
+				'ok'          => false,
+				'request_ref' => $ref,
+				'status'      => 'failed',
+				'installed'   => false,
+				'bytes'       => null,
+				'sha256'      => null,
+				'code'        => 'digest_mismatch',
+			),
+			'updated_at'      => time() - 172800,
+			'expires_at'      => time() - 86400,
 		);
 	}
 
@@ -292,7 +342,19 @@ class Testable_MainWP_Child_Virusdie extends MainWP_Child_Virusdie {
 		return true;
 	}
 
+	protected function delete_receipt( $request_ref ) {
+		if ( $this->durable_receipts ) {
+			return parent::delete_receipt( $request_ref );
+		}
+		unset( $this->receipts[ $request_ref ] );
+		return true;
+	}
+
 	public function seed_dispatching( $request ) {
 		$this->receipts[ $request['payload']['request_ref'] ] = $this->dispatching_receipt_for_test( $request );
+	}
+
+	public function seed_durable_receipt( $request_ref, $receipt ) {
+		return parent::create_receipt( $request_ref, $receipt );
 	}
 }

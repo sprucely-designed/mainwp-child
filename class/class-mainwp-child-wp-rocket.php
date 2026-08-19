@@ -647,14 +647,20 @@ class MainWP_Child_WP_Rocket {//phpcs:ignore -- NOSONAR - multi methods.
      */
     public function action() { //phpcs:ignore -- NOSONAR -complex.
 
+        // Action to be performed.
+        $mwp_action = MainWP_System::instance()->validate_params( 'mwp_action' );
+
+        $abilities_v2_response = $this->abilities_v2_action_response( $mwp_action );
+        if ( null !== $abilities_v2_response ) {
+            MainWP_Helper::write( $abilities_v2_response );
+            return;
+        }
+
         // Check if the WP Rocket plugin is installed on the child website.
         if ( ! $this->is_plugin_installed ) {
             MainWP_Helper::write( array( 'error' => esc_html__( 'Please install WP Rocket plugin on child website', 'mainwp-child' ) ) );
             return;
         }
-
-        // Action to be performed.
-        $mwp_action = MainWP_System::instance()->validate_params( 'mwp_action' );
 
         // Run specific wprocket method based on the passed action.
         $information = array();
@@ -681,9 +687,6 @@ class MainWP_Child_WP_Rocket {//phpcs:ignore -- NOSONAR - multi methods.
                         break;
                     case 'optimize_database':
                         $information = $this->optimize_database();
-                        break;
-                    case 'abilities_v2':
-                        $information = $this->abilities_v2_action();
                         break;
                     case 'get_optimize_info':
                         $information = $this->get_optimize_info();
@@ -1015,6 +1018,20 @@ class MainWP_Child_WP_Rocket {//phpcs:ignore -- NOSONAR - multi methods.
     }
 
     /**
+     * Answer an abilities_v2 request ahead of the v1 provider gate.
+     *
+     * This has to run before the installed-plugin bail: on a site without WP Rocket
+     * the v2 protocol still owes the Dashboard its own closed envelope, and the v1
+     * bail would answer a protocol request with localized display text instead.
+     *
+     * @param string $mwp_action Validated action name.
+     * @return array|null Closed protocol response, or null for a v1 request.
+     */
+    protected function abilities_v2_action_response( $mwp_action ) {
+        return 'abilities_v2' === $mwp_action ? $this->abilities_v2_action() : null;
+    }
+
+    /**
      * Decode the additive WP Rocket abilities-v2 transport request.
      *
      * @return array Closed protocol result.
@@ -1079,6 +1096,11 @@ class MainWP_Child_WP_Rocket {//phpcs:ignore -- NOSONAR - multi methods.
                 return $this->abilities_v2_error( $operation );
             }
             $provider_categories[] = $map[ $category ];
+        }
+
+        // The request is well formed, so a missing WP Rocket is refused for what it is rather than blamed on the payload.
+        if ( ! $this->is_plugin_installed ) {
+            return $this->abilities_v2_error( $operation, 'provider_unavailable' );
         }
 
         try {

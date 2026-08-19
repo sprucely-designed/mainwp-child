@@ -104,6 +104,9 @@ class MainWP_Child_File_Deployment {
             if ( is_array( $existing ) ) {
                 return $this->replay_receipt( $existing, $effect_hash, 'deploy' );
             }
+            // Only a genuinely new effect sweeps the store, so a pruned file can never be one
+            // this request still has to answer for.
+            $this->prune_expired_storage();
 
             $before = $this->target_snapshot( $payload['destination_class'], $destination );
             if ( ! $this->valid_target_snapshot( $before ) || ! hash_equals( $this->state_revision( $payload['destination_class'], $destination, $before ), $payload['state_revision'] ) ) {
@@ -158,6 +161,9 @@ class MainWP_Child_File_Deployment {
         if ( ! is_array( $receipt ) ) {
             return $this->error( 'status', 'not_found' );
         }
+        if ( $this->receipt_expired( $receipt ) ) {
+            return $this->error( 'status', 'receipt_expired' );
+        }
         return 'dispatching' === $receipt['state'] ? $this->unknown_result( $receipt ) : $receipt['result'];
     }
 
@@ -168,8 +174,14 @@ class MainWP_Child_File_Deployment {
         }
         $payload    = $request['payload'];
         $deployment = $this->load_receipt( $payload['deployment_ref'] );
+        if ( false === $deployment ) {
+            return $this->error( 'rollback', 'storage_unavailable' );
+        }
         if ( ! is_array( $deployment ) || ! $this->valid_receipt( $deployment ) || 'deploy' !== $deployment['kind'] || 'settled' !== $deployment['state'] || true !== $deployment['result']['ok'] ) {
             return $this->error( 'rollback', 'not_found' );
+        }
+        if ( $this->receipt_expired( $deployment ) ) {
+            return $this->error( 'rollback', 'receipt_expired' );
         }
         $lock = $this->acquire_destination_lock( $deployment['destination_class'], $deployment['relative_destination'] );
         if ( false === $lock ) {
@@ -231,13 +243,15 @@ class MainWP_Child_File_Deployment {
                 }
                 $ancestor = dirname( $ancestor );
             }
+            $writable = is_dir( $ancestor ) && ! is_link( $ancestor ) && is_writable( $ancestor );
             return array(
                 'exists'             => false,
                 'bytes'              => null,
                 'sha256'             => null,
                 'mode'               => null,
-                'writable'           => is_dir( $ancestor ) && ! is_link( $ancestor ) && is_writable( $ancestor ),
-                'rollback_available' => true,
+                'writable'           => $writable,
+                // Undoing a create is an unlink in that same directory, so it needs nothing else.
+                'rollback_available' => $writable,
             );
         }
         $stat = lstat( $path );
@@ -256,7 +270,9 @@ class MainWP_Child_File_Deployment {
             'sha256'             => $digest,
             'mode'               => $mode & 0777,
             'writable'           => is_writable( $path ) && is_writable( dirname( $path ) ),
-            'rollback_available' => true,
+            // Restoring a replaced file needs a retained private copy and a directory to
+            // rename it back into; without both there is nothing to promise the Dashboard.
+            'rollback_available' => is_writable( dirname( $path ) ) && $this->backup_storage_available(),
         );
     }
 
@@ -312,9 +328,13 @@ class MainWP_Child_File_Deployment {
         }
         $backup_ref = null;
         if ( $before['exists'] ) {
+            $root = $this->storage_root( true );
+            if ( false === $root ) {
+                return false;
+            }
             $backup_ref = 'backup-' . wp_generate_password( 32, false, false );
-            $backup     = $this->storage_root( true ) . '/' . $backup_ref;
-            if ( false === $backup || ! copy( $path, $backup ) || ! chmod( $backup, 0600 ) || ! hash_equals( $before['sha256'], hash_file( 'sha256', $backup ) ) ) {
+            $backup     = $root . '/' . $backup_ref;
+            if ( ! copy( $path, $backup ) || ! chmod( $backup, 0600 ) || ! hash_equals( $before['sha256'], hash_file( 'sha256', $backup ) ) ) {
                 return false;
             }
         }
@@ -342,10 +362,11 @@ class MainWP_Child_File_Deployment {
         if ( ! $receipt['prior_exists'] ) {
             return is_file( $path ) && ! is_link( $path ) && unlink( $path ) && ! file_exists( $path );
         }
-        if ( ! $this->safe_private_ref( $receipt['backup_ref'] ) ) {
+        $root = $this->storage_root( false );
+        if ( false === $root || ! $this->safe_private_ref( $receipt['backup_ref'] ) ) {
             return false;
         }
-        $backup = $this->storage_root( false ) . '/' . $receipt['backup_ref'];
+        $backup = $root . '/' . $receipt['backup_ref'];
         if ( ! is_file( $backup ) || is_link( $backup ) || ! hash_equals( $receipt['prior_sha256'], hash_file( 'sha256', $backup ) ) ) {
             return false;
         }
@@ -357,7 +378,9 @@ class MainWP_Child_File_Deployment {
     protected function load_receipt( $request_ref ) {
         $root = $this->storage_root( false );
         if ( false === $root ) {
-            return null;
+            // A store that was never created genuinely holds no receipts. One that exists but
+            // cannot be used is a read failure, and calling that not_found erases a settled deploy.
+            return $this->storage_root_absent() ? null : false;
         }
         $path = $root . '/receipt-' . hash( 'sha256', $request_ref ) . '.json';
         if ( ! file_exists( $path ) ) {
@@ -369,6 +392,45 @@ class MainWP_Child_File_Deployment {
         $raw     = file_get_contents( $path );
         $receipt = is_string( $raw ) ? json_decode( $raw, true ) : null;
         return $this->valid_receipt( $receipt ) ? $receipt : false;
+    }
+
+    /** Drop receipts past retention and the backups no live receipt still binds. */
+    protected function prune_expired_storage() {
+        $root = $this->storage_root( false );
+        if ( false === $root ) {
+            return;
+        }
+        $now    = time();
+        $bound  = array();
+        $stored = glob( $root . '/receipt-*.json' );
+        foreach ( is_array( $stored ) ? $stored : array() as $path ) {
+            if ( ! is_file( $path ) || is_link( $path ) ) {
+                continue;
+            }
+            $raw     = file_get_contents( $path );
+            $receipt = is_string( $raw ) ? json_decode( $raw, true ) : null;
+            if ( ! is_array( $receipt ) || ! isset( $receipt['state'], $receipt['expires_at'] ) || ! is_int( $receipt['expires_at'] ) ) {
+                continue;
+            }
+            // An unresolved dispatch marker is kept whatever its age: dropping it is exactly what
+            // would let a resent request run the same write a second time.
+            if ( 'settled' === $receipt['state'] && $receipt['expires_at'] <= $now ) {
+                wp_delete_file( $path );
+                continue;
+            }
+            if ( isset( $receipt['backup_ref'] ) && is_string( $receipt['backup_ref'] ) ) {
+                $bound[ $receipt['backup_ref'] ] = true;
+            }
+        }
+        $backups = glob( $root . '/backup-*' );
+        foreach ( is_array( $backups ) ? $backups : array() as $path ) {
+            $mtime = is_file( $path ) && ! is_link( $path ) ? filemtime( $path ) : false;
+            // The receipt is always created before its backup, so a file younger than the
+            // retention window may still belong to an effect that is mid-flight right now.
+            if ( false !== $mtime && ! isset( $bound[ basename( $path ) ] ) && $mtime + self::RECEIPT_TTL <= $now ) {
+                wp_delete_file( $path );
+            }
+        }
     }
 
     /** Exclusively reserve one effect. */
@@ -399,6 +461,9 @@ class MainWP_Child_File_Deployment {
             return false;
         }
         $root = $this->storage_root( false );
+        if ( false === $root ) {
+            return false;
+        }
         $path = $root . '/receipt-' . hash( 'sha256', $request_ref ) . '.json';
         $temp = $path . '.tmp-' . wp_generate_password( 16, false, false );
         $raw  = wp_json_encode( $receipt, JSON_UNESCAPED_SLASHES );
@@ -613,6 +678,9 @@ class MainWP_Child_File_Deployment {
         if ( ! $this->valid_receipt( $receipt ) ) {
             return $this->error( $operation, 'storage_unavailable' );
         }
+        if ( $this->receipt_expired( $receipt ) ) {
+            return $this->error( $operation, 'receipt_expired' );
+        }
         if ( ! hash_equals( $receipt['effect_hash'], $effect_hash ) ) {
             return $this->error( $operation, 'request_conflict' );
         }
@@ -658,6 +726,13 @@ class MainWP_Child_File_Deployment {
         return $this->result( $receipt['kind'], $receipt['request_ref'], 'unknown', $receipt['deployed_bytes'], $receipt['deployed_sha256'], 'deploy' === $receipt['kind'], 'outcome_unknown' );
     }
 
+    /** Report whether one stored result has passed its retention deadline. */
+    private function receipt_expired( $receipt ) {
+        // A dispatch marker never expires into silence: its effect is still unresolved, so the
+        // only truthful answer stays outcome_unknown no matter how old the marker is.
+        return is_array( $receipt ) && isset( $receipt['state'], $receipt['expires_at'] ) && 'settled' === $receipt['state'] && is_int( $receipt['expires_at'] ) && $receipt['expires_at'] <= time();
+    }
+
     /** Validate a stored private receipt. */
     private function valid_receipt( $receipt ) { // phpcs:ignore Generic.Metrics.CyclomaticComplexity -- Closed relational storage validation.
         $keys = array( 'effect_hash', 'kind', 'request_ref', 'deployment_ref', 'destination_class', 'relative_destination', 'prior_exists', 'prior_bytes', 'prior_sha256', 'prior_mode', 'backup_ref', 'deployed_bytes', 'deployed_sha256', 'state', 'result', 'updated_at', 'expires_at' );
@@ -689,8 +764,8 @@ class MainWP_Child_File_Deployment {
         return is_int( $snapshot['bytes'] ) && 0 <= $snapshot['bytes'] && self::MAX_BYTES >= $snapshot['bytes'] && $this->hash_ref( $snapshot['sha256'] ) && is_int( $snapshot['mode'] ) && 0 <= $snapshot['mode'] && 0777 >= $snapshot['mode'];
     }
 
-    /** Return/create the protected storage root. */
-    private function storage_root( $create ) {
+    /** Return the protected storage root path without touching the filesystem. */
+    private function storage_root_path() {
         if ( ! defined( 'ABSPATH' ) ) {
             return false;
         }
@@ -700,7 +775,37 @@ class MainWP_Child_File_Deployment {
         if ( is_string( $document_root ) && 0 === strpos( wp_normalize_path( $private_base ) . '/', rtrim( wp_normalize_path( $document_root ), '/' ) . '/' ) ) {
             return false;
         }
-        $root = $private_base . '/file-deployments-' . substr( hash( 'sha256', $wordpress_root ), 0, 16 );
+        return $private_base . '/file-deployments-' . substr( hash( 'sha256', $wordpress_root ), 0, 16 );
+    }
+
+    /** Report whether the protected storage root has never been created. */
+    protected function storage_root_absent() {
+        $root = $this->storage_root_path();
+        return false !== $root && ! file_exists( $root ) && ! is_link( $root );
+    }
+
+    /** Report whether a pre-deployment copy of the target could actually be retained. */
+    protected function backup_storage_available() {
+        $root = $this->storage_root_path();
+        if ( false === $root ) {
+            return false;
+        }
+        if ( file_exists( $root ) || is_link( $root ) ) {
+            return is_dir( $root ) && ! is_link( $root ) && is_writable( $root );
+        }
+        $ancestor = dirname( $root );
+        while ( ! file_exists( $ancestor ) && dirname( $ancestor ) !== $ancestor ) {
+            $ancestor = dirname( $ancestor );
+        }
+        return is_dir( $ancestor ) && ! is_link( $ancestor ) && is_writable( $ancestor );
+    }
+
+    /** Return/create the protected storage root. */
+    protected function storage_root( $create ) {
+        $root = $this->storage_root_path();
+        if ( false === $root ) {
+            return false;
+        }
         if ( ! is_dir( $root ) && ( ! $create || ! wp_mkdir_p( $root ) ) ) {
             return false;
         }

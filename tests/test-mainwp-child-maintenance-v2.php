@@ -105,11 +105,7 @@ class Test_MainWP_Child_Maintenance_V2 extends WP_UnitTestCase {
 		$this->assertSame( 'lock_busy', $this->request( 'ability_maintenance_execute_v2', $payload )['code'] );
 		$this->assertSame( array(), $this->subject->execution_log );
 		$this->subject->begin_mutation_succeeds = true;
-		$this->subject->action_results['spam']     = array( 'status' => 'succeeded', 'affected' => 1, 'error_code' => null );
-		$this->subject->end_mutation_succeeds      = false;
-		$this->assertSame( 'outcome_unknown', $this->request( 'ability_maintenance_execute_v2', $payload )['code'] );
-		$this->assertSame( array( 'spam' ), $this->subject->execution_log );
-		$this->subject->end_mutation_succeeds = true;
+		$this->subject->action_results['spam']  = array( 'status' => 'succeeded', 'affected' => 1, 'error_code' => null );
 		$this->assertTrue( $this->request( 'ability_maintenance_execute_v2', $payload )['ok'] );
 		$this->assertSame( array( 'spam' ), $this->subject->execution_log );
 
@@ -320,7 +316,7 @@ class Test_MainWP_Child_Maintenance_V2 extends WP_UnitTestCase {
 		$this->assertSame( 'invalid_request', $alias['code'] );
 	}
 
-	public function test_reordered_envelope_is_accepted_but_nonempty_payload_is_not() {
+	public function test_reordered_envelope_is_accepted_and_capabilities_with_a_payload_is_invalid() {
 		$result = $this->subject->abilities_v2(
 			array(
 				'payload'   => array(),
@@ -332,7 +328,289 @@ class Test_MainWP_Child_Maintenance_V2 extends WP_UnitTestCase {
 
 		$result = $this->request( 'capabilities', array( 'extra' => true ) );
 		$this->assertFalse( $result['ok'] );
-		$this->assertSame( 'unsupported_operation', $result['code'] );
+		$this->assertSame( 'invalid_request', $result['code'] );
+		$this->assertSame( 'capabilities', $result['operation'] );
+	}
+
+	public function test_invalid_execute_payload_is_rejected_before_the_lock_is_taken() {
+		update_option(
+			MainWP_Child_Maintenance::ABILITIES_V2_LOCK_OPTION,
+			array(
+				'owner'      => '123e4567-e89b-42d3-a456-426614174777',
+				'expires_at' => time() + 300,
+			),
+			false
+		);
+		$subject = $this->real_subject();
+
+		$result = $this->real_request( $subject, 'ability_maintenance_execute_v2', array( 'operation_ref' => 'not-a-uuid' ) );
+
+		$this->assertFalse( $result['ok'] );
+		$this->assertSame( 'invalid_request', $result['code'] );
+
+		$held = array(
+			'operation_ref'      => '123e4567-e89b-42d3-a456-426614174511',
+			'actions'            => array( 'autodraft' ),
+			'revision_retention' => 5,
+			'snapshot_revision'  => str_repeat( 'a', 64 ),
+			'action_hash'        => hash( 'sha256', wp_json_encode( array( array( 'autodraft' ), 5 ) ) ),
+		);
+		$this->assertSame( 'lock_busy', $this->real_request( $subject, 'ability_maintenance_execute_v2', $held )['code'] );
+		$this->assertSame( '123e4567-e89b-42d3-a456-426614174777', get_option( MainWP_Child_Maintenance::ABILITIES_V2_LOCK_OPTION )['owner'] );
+	}
+
+	public function test_committed_execute_survives_a_failed_lock_release() {
+		$this->subject->preview_impacts       = array( 'spam' => array( 'would_affect' => 1, 'capability' => true ) );
+		$this->subject->action_results        = array( 'spam' => array( 'status' => 'succeeded', 'affected' => 1, 'error_code' => null ) );
+		$this->subject->end_mutation_succeeds = false;
+		$preview                              = $this->request( 'ability_maintenance_preview_v2', array( 'actions' => array( 'spam' ), 'revision_retention' => 5 ) );
+		$payload                              = array(
+			'operation_ref'      => '123e4567-e89b-42d3-a456-426614174512',
+			'actions'            => array( 'spam' ),
+			'revision_retention' => 5,
+			'snapshot_revision'  => $preview['snapshot_revision'],
+			'action_hash'        => hash( 'sha256', wp_json_encode( array( array( 'spam' ), 5 ) ) ),
+		);
+
+		$result = $this->request( 'ability_maintenance_execute_v2', $payload );
+
+		$this->assertTrue( $result['ok'] );
+		$this->assertSame( 'succeeded', $result['status'] );
+		$this->assertSame( array( 'succeeded' ), array_column( $result['outcomes'], 'status' ) );
+		$this->assertSame( array( 'lock_release_failed' ), $result['warning_codes'] );
+
+		$this->subject->end_mutation_succeeds = true;
+		$replay                               = $this->request( 'ability_maintenance_execute_v2', $payload );
+		$this->assertTrue( $replay['ok'] );
+		$this->assertArrayNotHasKey( 'warning_codes', $replay );
+		$this->assertSame( array( 'spam' ), $this->subject->execution_log );
+	}
+
+	public function test_failed_action_outcome_reports_the_rows_it_destroyed() {
+		$this->subject->preview_impacts = array( 'tags' => array( 'would_affect' => 9, 'capability' => true ) );
+		$this->subject->action_results  = array( 'tags' => array( 'status' => 'failed', 'affected' => 4, 'error_code' => 'mutation_failed' ) );
+		$preview                        = $this->request( 'ability_maintenance_preview_v2', array( 'actions' => array( 'tags' ), 'revision_retention' => 5 ) );
+
+		$result = $this->request(
+			'ability_maintenance_execute_v2',
+			array(
+				'operation_ref'      => '123e4567-e89b-42d3-a456-426614174513',
+				'actions'            => array( 'tags' ),
+				'revision_retention' => 5,
+				'snapshot_revision'  => $preview['snapshot_revision'],
+				'action_hash'        => hash( 'sha256', wp_json_encode( array( array( 'tags' ), 5 ) ) ),
+			)
+		);
+
+		$this->assertSame( 'failed', $result['status'] );
+		$this->assertSame(
+			array(
+				'action'     => 'tags',
+				'status'     => 'failed',
+				'affected'   => 4,
+				'error_code' => 'mutation_failed',
+			),
+			$result['outcomes'][0]
+		);
+		$this->assertTrue( $result['retryable'] );
+	}
+
+	public function test_stale_running_records_settle_instead_of_bricking_the_operation_store() {
+		$records = array();
+		for ( $index = 1; $index <= 99; $index++ ) {
+			$abandoned                             = $this->running_record( $index, 8 * DAY_IN_SECONDS );
+			$records[ $abandoned['operation_ref'] ] = $abandoned;
+		}
+		$recent                              = $this->running_record( 900, 2 * DAY_IN_SECONDS );
+		$records[ $recent['operation_ref'] ] = $recent;
+		update_option( MainWP_Child_Maintenance::ABILITIES_V2_OPERATIONS_OPTION, $records, false );
+
+		list( , $result ) = $this->real_execute( $this->real_subject(), array( 'autodraft' ), 5, '123e4567-e89b-42d3-a456-426614174514' );
+
+		$this->assertTrue( $result['ok'] );
+		$this->assertSame( 'succeeded', $result['status'] );
+		$stored = get_option( MainWP_Child_Maintenance::ABILITIES_V2_OPERATIONS_OPTION, array() );
+		$this->assertCount( 2, $stored );
+		$this->assertSame( 'unknown', $stored[ $recent['operation_ref'] ]['status'] );
+		$this->assertSame( $recent['updated_at'], $stored[ $recent['operation_ref'] ]['finished_at'] );
+		$this->assertSame(
+			array(
+				array(
+					'action'     => 'autodraft',
+					'status'     => 'unknown',
+					'affected'   => null,
+					'error_code' => 'outcome_unknown',
+				),
+			),
+			$stored[ $recent['operation_ref'] ]['outcomes']
+		);
+	}
+
+	public function test_orphaned_transient_does_not_discard_completed_deletions() {
+		if ( wp_using_ext_object_cache() ) {
+			$this->markTestSkipped( 'Transient maintenance reports unsupported behind an external object cache.' );
+		}
+		$this->clear_transients();
+		set_transient( 'mwp_maint_a', 'a', -100 );
+		set_transient( 'mwp_maint_b', 'b', -100 );
+		add_option( '_transient_timeout_mwp_maint_ghost', time() - 100, '', false );
+
+		list( $preview, $result ) = $this->real_execute( $this->real_subject(), array( 'transients_expired' ), 5, '123e4567-e89b-42d3-a456-426614174515' );
+
+		$this->assertSame( 3, $preview['impacts'][0]['would_affect'] );
+		$this->assertTrue( $result['ok'] );
+		$this->assertSame(
+			array(
+				'action'     => 'transients_expired',
+				'status'     => 'failed',
+				'affected'   => 2,
+				'error_code' => 'mutation_failed',
+			),
+			$result['outcomes'][0]
+		);
+		$this->assertFalse( get_option( '_transient_mwp_maint_a' ) );
+		$this->assertFalse( get_option( '_transient_mwp_maint_b' ) );
+	}
+
+	public function test_transient_preview_counts_each_transient_once() {
+		if ( wp_using_ext_object_cache() ) {
+			$this->markTestSkipped( 'Transient maintenance reports unsupported behind an external object cache.' );
+		}
+		$this->clear_transients();
+		set_transient( 'mwp_preview_a', 'a', HOUR_IN_SECONDS );
+		set_transient( 'mwp_preview_b', 'b', HOUR_IN_SECONDS );
+		set_transient( 'mwp_preview_c', 'c', HOUR_IN_SECONDS );
+		set_transient( 'mwp_preview_d', 'd' );
+
+		list( $preview, $result ) = $this->real_execute( $this->real_subject(), array( 'transients_all' ), 5, '123e4567-e89b-42d3-a456-426614174516' );
+
+		$this->assertSame( 4, $preview['impacts'][0]['would_affect'] );
+		$this->assertSame( 'succeeded', $result['status'] );
+		$this->assertSame( $preview['impacts'][0]['would_affect'], $result['outcomes'][0]['affected'] );
+	}
+
+	public function test_revision_sweep_batches_its_deletes_and_keeps_the_newest() {
+		global $wpdb;
+		$parent_id = self::factory()->post->create();
+		$revisions = array();
+		for ( $index = 0; $index < 20; $index++ ) {
+			$when        = gmdate( 'Y-m-d H:i:s', time() - ( 3600 * ( 20 - $index ) ) );
+			$revisions[] = wp_insert_post(
+				array(
+					'post_type'         => 'revision',
+					'post_parent'       => $parent_id,
+					'post_status'       => 'inherit',
+					'post_title'        => 'revision-' . $index,
+					'post_name'         => $parent_id . '-revision-' . $index,
+					'post_date'         => $when,
+					'post_date_gmt'     => $when,
+					'post_modified'     => $when,
+					'post_modified_gmt' => $when,
+				)
+			);
+		}
+		$deletes = array();
+		$spy     = static function ( $query ) use ( &$deletes ) {
+			if ( 1 === preg_match( '/^\s*DELETE\s+FROM\s+\S*posts\b/i', $query ) ) {
+				$deletes[] = $query;
+			}
+			return $query;
+		};
+
+		add_filter( 'query', $spy );
+		list( $preview, $result ) = $this->real_execute( $this->real_subject(), array( 'revisions' ), 2, '123e4567-e89b-42d3-a456-426614174517' );
+		remove_filter( 'query', $spy );
+
+		$this->assertSame( 18, $preview['impacts'][0]['would_affect'] );
+		$this->assertSame( 'succeeded', $result['status'] );
+		$this->assertSame( 18, $result['outcomes'][0]['affected'] );
+		$this->assertLessThanOrEqual( 2, count( $deletes ) );
+		$remaining = $wpdb->get_col( $wpdb->prepare( "SELECT ID FROM $wpdb->posts WHERE post_type = 'revision' AND post_parent = %d ORDER BY post_modified DESC, ID DESC", $parent_id ) );
+		$this->assertSame( array( $revisions[19], $revisions[18] ), array_map( 'intval', $remaining ) );
+	}
+
+	private function real_subject() {
+		$reflection = new ReflectionClass( MainWP_Child_Maintenance::class );
+		return $reflection->newInstanceWithoutConstructor();
+	}
+
+	private function real_request( $subject, $operation, $payload ) {
+		return $subject->abilities_v2(
+			array(
+				'protocol'  => '2',
+				'operation' => $operation,
+				'payload'   => $payload,
+			)
+		);
+	}
+
+	/**
+	 * Preview then execute one action set through the real class, as the Dashboard does.
+	 *
+	 * @return array Preview response and execute response.
+	 */
+	private function real_execute( $subject, $actions, $retention, $operation_ref ) {
+		$catalog   = array( 'revisions', 'autodraft', 'trashpost', 'spam', 'pending', 'trashcomment', 'tags', 'categories', 'optimize', 'transients_expired', 'transients_all' );
+		$canonical = array_values(
+			array_filter(
+				$catalog,
+				static function ( $action ) use ( $actions ) {
+					return in_array( $action, $actions, true );
+				}
+			)
+		);
+		$preview   = $this->real_request(
+			$subject,
+			'ability_maintenance_preview_v2',
+			array(
+				'actions'            => $actions,
+				'revision_retention' => $retention,
+			)
+		);
+		$this->assertTrue( $preview['ok'] );
+		$result = $this->real_request(
+			$subject,
+			'ability_maintenance_execute_v2',
+			array(
+				'operation_ref'      => $operation_ref,
+				'actions'            => $actions,
+				'revision_retention' => $retention,
+				'snapshot_revision'  => $preview['snapshot_revision'],
+				'action_hash'        => hash( 'sha256', wp_json_encode( array( $canonical, $retention ) ) ),
+			)
+		);
+		return array( $preview, $result );
+	}
+
+	/** Build one durable record left in 'running' by a run that never came back. */
+	private function running_record( $index, $age ) {
+		$operation_ref = sprintf( '123e4567-e89b-42d3-a456-%012d', $index );
+		$actions       = array( 'autodraft' );
+		$retention     = 5;
+		$snapshot      = str_repeat( 'b', 64 );
+		$action_hash   = hash( 'sha256', wp_json_encode( array( $actions, $retention ) ) );
+		$at            = time() - $age;
+		return array(
+			'operation_ref'      => $operation_ref,
+			'effect_hash'        => hash( 'sha256', wp_json_encode( array( $operation_ref, $actions, $retention, $snapshot, $action_hash ) ) ),
+			'action_hash'        => $action_hash,
+			'snapshot_revision'  => $snapshot,
+			'actions'            => $actions,
+			'revision_retention' => $retention,
+			'status'             => 'running',
+			'outcomes'           => array(),
+			'accepted_at'        => $at,
+			'finished_at'        => null,
+			'retryable'          => false,
+			'report_emitted'     => false,
+			'updated_at'         => $at,
+		);
+	}
+
+	private function clear_transients() {
+		global $wpdb;
+		$wpdb->query( $wpdb->prepare( "DELETE FROM $wpdb->options WHERE option_name LIKE %s OR option_name LIKE %s", $wpdb->esc_like( '_transient_' ) . '%', $wpdb->esc_like( '_site_transient_' ) . '%' ) );
+		wp_cache_flush();
 	}
 
 	private function request( $operation, $payload ) {

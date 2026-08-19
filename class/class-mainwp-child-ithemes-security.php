@@ -293,7 +293,9 @@ class MainWP_Child_IThemes_Security { //phpcs:ignore -- NOSONAR - multi methods.
         // phpcs:disable WordPress.Security.NonceVerification
         $raw_request = isset( $_POST['request'] ) && is_string( $_POST['request'] ) ? wp_unslash( $_POST['request'] ) : '';
         // phpcs:enable
-        $request = 4096 >= strlen( $raw_request ) ? json_decode( $raw_request, true ) : null;
+        // release_lockouts accepts 100 lockout refs, and 100 sha256 hexes plus the envelope is about
+        // 6.9 KB, so the old 4 KB bound rejected a payload the validator calls legal.
+        $request = 16384 >= strlen( $raw_request ) ? json_decode( $raw_request, true ) : null;
         return $this->abilities_v2( $request );
     }
 
@@ -312,7 +314,12 @@ class MainWP_Child_IThemes_Security { //phpcs:ignore -- NOSONAR - multi methods.
             return $this->abilities_v2_error( 'unknown', 'invalid_request' );
         }
 
-        if ( 'capabilities' === $operation && array() === $request['payload'] ) {
+        if ( 'capabilities' === $operation ) {
+            // Negotiation is supported; a payload on it is a malformed request, not an unknown operation.
+            if ( array() !== $request['payload'] ) {
+                return $this->abilities_v2_error( $operation, 'invalid_request' );
+            }
+
             return array(
                 'protocol'           => '2',
                 'operation'          => 'capabilities',

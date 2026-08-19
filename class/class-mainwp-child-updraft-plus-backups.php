@@ -1846,8 +1846,14 @@ class MainWP_Child_Updraft_Plus_Backups { //phpcs:ignore -- NOSONAR - multi meth
                 $files = array( $files );
             }
             foreach ( $files as $file ) {
-                if ( is_file( $updraft_dir . '/' . $file ) && wp_delete_file( $updraft_dir . '/' . $file ) ) {
-                    $local_deleted ++;
+                // wp_delete_file() only gained a return value in WP 6.7 and we support 6.2+, so the
+                // count has to come from the file being gone, not from the call's return.
+                if ( is_file( $updraft_dir . '/' . $file ) ) {
+                    wp_delete_file( $updraft_dir . '/' . $file );
+                    clearstatcache( true, $updraft_dir . '/' . $file );
+                    if ( ! is_file( $updraft_dir . '/' . $file ) ) {
+                        $local_deleted ++;
+                    }
                 }
             }
             if ( 'log' !== $key && ! empty( $delete_from_service ) ) {

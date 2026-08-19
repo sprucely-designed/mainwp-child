@@ -128,6 +128,41 @@ class Test_MainWP_Child_IThemes_Security_V2 extends WP_UnitTestCase {
 		$this->assertSame( 'plugin_unavailable', $summary['code'] );
 	}
 
+	/**
+	 * release_lockouts accepts 100 refs, so the biggest envelope the validator calls legal is about
+	 * 6.9 KB. The transport bound has to admit it, or the Child refuses a request it advertises.
+	 */
+	public function test_transport_bound_admits_a_maximal_legal_release_lockouts_envelope() {
+		$refs = array();
+		for ( $index = 0; $index < 100; $index++ ) {
+			$refs[] = hash( 'sha256', 'lockout-' . $index );
+		}
+		$envelope = wp_json_encode(
+			array(
+				'protocol'    => '2',
+				'operation'   => 'ability_solid_release_lockouts_v2',
+				'request_ref' => '123e4567-e89b-42d3-a456-426614174900',
+				'payload'     => array(
+					'lockout_refs' => $refs,
+					'if_match'     => hash( 'sha256', 'generation' ),
+				),
+			)
+		);
+		$respond = $this->action_response_method();
+
+		try {
+			$_POST['request'] = $envelope;
+			$result           = $respond->invoke( $this->subject, 'abilities_v2' );
+		} finally {
+			unset( $_POST['request'] );
+		}
+
+		$this->assertGreaterThan( 4096, strlen( $envelope ) );
+		// Solid is absent here, so the honest answer is plugin_unavailable. invalid_request would
+		// mean the transport dropped the envelope and handed the protocol a null request.
+		$this->assertSame( 'plugin_unavailable', $result['code'] );
+	}
+
 	public function test_v1_actions_are_not_diverted_into_the_v2_protocol() {
 		$respond = $this->action_response_method();
 
@@ -555,9 +590,14 @@ class Test_MainWP_Child_IThemes_Security_V2 extends WP_UnitTestCase {
 		);
 		$this->assertTrue( $result['ok'] );
 
+		// Negotiation is supported, so a payload on it is a malformed request, not an unknown operation.
 		$result = $this->request( 'capabilities', array( 'extra' => true ) );
 		$this->assertFalse( $result['ok'] );
-		$this->assertSame( 'unsupported_operation', $result['code'] );
+		$this->assertSame( 'capabilities', $result['operation'] );
+		$this->assertSame( 'invalid_request', $result['code'] );
+
+		$unknown = $this->request( 'ability_solid_missing_v2', array() );
+		$this->assertSame( 'unsupported_operation', $unknown['code'] );
 	}
 
 	private function action_response_method() {

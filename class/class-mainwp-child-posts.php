@@ -600,7 +600,10 @@ class MainWP_Child_Posts { //phpcs:ignore -- NOSONAR - multi methods.
             } elseif ( $normalized['expires_at'] < time() - 60 ) {
                 return $this->content_v2_error( $protocol, $operation, 'expired_request' );
             } elseif ( self::CONTENT_V2_MAX_RECORDS <= count( $records ) ) {
-                return $this->content_v2_error( $protocol, $operation, 'storage_unavailable' );
+                $records = $this->content_v2_evict_records( $protocol, $records );
+                if ( false === $records ) {
+                    return $this->content_v2_error( $protocol, $operation, 'storage_unavailable' );
+                }
             }
 
             $target = null;
@@ -1018,35 +1021,35 @@ class MainWP_Child_Posts { //phpcs:ignore -- NOSONAR - multi methods.
 
         $post_id = wp_insert_post( wp_slash( $postarr ), true );
         if ( is_wp_error( $post_id ) || ! is_int( $post_id ) || 1 > $post_id ) {
-            $wpdb->query( 'ROLLBACK' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+            $this->content_v2_rollback( null, $normalized );
             return $this->content_v2_error( $protocol, $operation, 'mutation_failed' );
         }
         if ( ! empty( $normalized['post']['categories'] ) ) {
             $category_ids = $this->content_v2_category_ids( $normalized['post']['categories'] );
             $terms        = false === $category_ids ? false : wp_set_post_categories( $post_id, $category_ids, false );
             if ( false === $terms || is_wp_error( $terms ) ) {
-                $wpdb->query( 'ROLLBACK' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+                $this->content_v2_rollback( $post_id, $normalized );
                 return $this->content_v2_error( $protocol, $operation, 'mutation_failed' );
             }
         }
         if ( null !== $choices['category_id'] ) {
             $terms = wp_set_post_categories( $post_id, array( $choices['category_id'] ), true );
             if ( is_wp_error( $terms ) ) {
-                $wpdb->query( 'ROLLBACK' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+                $this->content_v2_rollback( $post_id, $normalized );
                 return $this->content_v2_error( $protocol, $operation, 'mutation_failed' );
             }
         }
         if ( ! empty( $normalized['post']['tags'] ) ) {
             $terms = wp_set_post_terms( $post_id, $normalized['post']['tags'], 'post_tag', false );
             if ( is_wp_error( $terms ) ) {
-                $wpdb->query( 'ROLLBACK' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+                $this->content_v2_rollback( $post_id, $normalized );
                 return $this->content_v2_error( $protocol, $operation, 'mutation_failed' );
             }
         }
 
         $revision = $this->content_v2_post_revision( $post_id );
         if ( false === $revision ) {
-            $wpdb->query( 'ROLLBACK' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+            $this->content_v2_rollback( $post_id, $normalized );
             return $this->content_v2_error( $protocol, $operation, 'outcome_unknown' );
         }
         $record['post_id']                   = $post_id;
@@ -1056,7 +1059,7 @@ class MainWP_Child_Posts { //phpcs:ignore -- NOSONAR - multi methods.
         $record['updated_at']                = time();
         $records[ $record['operation_ref'] ] = $record;
         if ( ! $this->content_v2_write_records( $protocol, $records ) || false === $wpdb->query( 'COMMIT' ) ) { // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
-            $wpdb->query( 'ROLLBACK' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+            $this->content_v2_rollback( $post_id, $normalized );
             wp_cache_delete( $this->content_v2_option( $protocol ), 'options' );
             return $this->content_v2_error( $protocol, $operation, 'outcome_unknown' );
         }
@@ -1082,6 +1085,29 @@ class MainWP_Child_Posts { //phpcs:ignore -- NOSONAR - multi methods.
             )
         );
         return $this->content_v2_project( $protocol, $operation, $record );
+    }
+
+    /**
+     * Roll the mutation transaction back and forget every post it warmed.
+     *
+     * The post writers prime the object cache before the transaction is decided, so a
+     * persistent cache keeps serving the mutated row and meta after the database has
+     * discarded them - while the Dashboard is told the mutation failed.
+     *
+     * @param int|null $post_id    Post touched inside the transaction, when one exists.
+     * @param array    $normalized Valid normalized mutation.
+     * @return void
+     */
+    private function content_v2_rollback( $post_id, $normalized ) {
+        global $wpdb;
+
+        $wpdb->query( 'ROLLBACK' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+        $touched = array( $post_id, 'update' === $normalized['mode'] ? $normalized['target_post_id'] : null );
+        foreach ( array_unique( array_filter( $touched, 'is_int' ) ) as $id ) {
+            if ( 0 < $id ) {
+                clean_post_cache( $id );
+            }
+        }
     }
 
     /**
@@ -1196,6 +1222,42 @@ class MainWP_Child_Posts { //phpcs:ignore -- NOSONAR - multi methods.
             }
         }
         return ( ! $changed || $this->content_v2_write_records( $protocol, $records ) ) ? $records : false;
+    }
+
+    /**
+     * Free one ledger slot by dropping only receipts that can no longer be replayed.
+     *
+     * The cap is reached long before the retention window expires, so pruning by age
+     * alone leaves a full ledger rejecting every new mutation for the rest of the
+     * ninety days. A request is accepted for at most a day (see the expires_at bound in
+     * the payload validator), so a settled receipt older than that can only ever be
+     * answered expired_request - dropping it cannot turn a replay into a second post.
+     * Reserved receipts are never dropped: their effect is still unconfirmed, and losing
+     * one is exactly what would let a retry duplicate content.
+     *
+     * @param string $protocol Closed protocol name.
+     * @param array  $records  Valid durable ledger.
+     * @return array|false Ledger below the cap, or false when no slot may be freed.
+     */
+    private function content_v2_evict_records( $protocol, $records ) {
+        $horizon    = time() - ( DAY_IN_SECONDS + 60 );
+        $candidates = array();
+        foreach ( $records as $operation_ref => $record ) {
+            if ( 'reserved' !== $record['state'] && $record['accepted_at'] < $horizon ) {
+                $candidates[ $operation_ref ] = $record['accepted_at'];
+            }
+        }
+        asort( $candidates, SORT_NUMERIC );
+        foreach ( array_keys( $candidates ) as $operation_ref ) {
+            if ( count( $records ) < self::CONTENT_V2_MAX_RECORDS ) {
+                break;
+            }
+            unset( $records[ $operation_ref ] );
+        }
+        if ( self::CONTENT_V2_MAX_RECORDS <= count( $records ) ) {
+            return false;
+        }
+        return $this->content_v2_write_records( $protocol, $records ) ? $records : false;
     }
 
     /**

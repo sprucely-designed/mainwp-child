@@ -658,7 +658,7 @@ class MainWP_Child_Back_WP_Up { //phpcs:ignore -- NOSONAR - multi methods.
         if ( is_wp_error( $result ) ) {
             return $this->abilities_v2_from_provider_error( $operation, $result );
         }
-        if ( ! $this->abilities_v2_valid_progress_result( $result, $payload['log_position'] ) ) {
+        if ( ! $this->abilities_v2_valid_progress_result( $result ) ) {
             return $this->abilities_v2_error( $operation, 'operation_failed', __( 'The backup progress result is invalid.', 'mainwp-child' ) );
         }
 
@@ -1076,12 +1076,14 @@ class MainWP_Child_Back_WP_Up { //phpcs:ignore -- NOSONAR - multi methods.
     /**
      * Validate a structured progress result.
      *
-     * @param mixed $result   Provider result.
-     * @param int   $position Requested position.
+     * The position is the observed one and is deliberately not bound to the requested position:
+     * a log can be absent (null) or shorter than the caller expects.
+     *
+     * @param mixed $result Provider result.
      * @return bool
      */
-    private function abilities_v2_valid_progress_result( $result, $position ) {
-        if ( ! is_array( $result ) || ! $this->abilities_v2_has_keys( $result, array( 'state', 'progress_percent', 'log_position', 'last_backup_at', 'message' ) ) || ! in_array( $result['state'], array( 'running', 'completed', 'failed', 'unknown' ), true ) || ! is_int( $result['log_position'] ) || $position > $result['log_position'] || ! is_int( $result['last_backup_at'] ) || 0 > $result['last_backup_at'] || ! $this->abilities_v2_valid_message( $result['message'] ) ) {
+    private function abilities_v2_valid_progress_result( $result ) {
+        if ( ! is_array( $result ) || ! $this->abilities_v2_has_keys( $result, array( 'state', 'progress_percent', 'log_position', 'last_backup_at', 'message' ) ) || ! in_array( $result['state'], array( 'running', 'completed', 'failed', 'unknown' ), true ) || ! ( null === $result['log_position'] || ( is_int( $result['log_position'] ) && 0 <= $result['log_position'] ) ) || ! is_int( $result['last_backup_at'] ) || 0 > $result['last_backup_at'] || ! $this->abilities_v2_valid_message( $result['message'] ) ) {
             return false;
         }
         return null === $result['progress_percent'] || $this->abilities_v2_is_bounded_int( $result['progress_percent'], 0, 100 );
@@ -1225,18 +1227,20 @@ class MainWP_Child_Back_WP_Up { //phpcs:ignore -- NOSONAR - multi methods.
      * @param int   $position Requested position.
      * @return array|WP_Error
      */
-    protected function abilities_v2_provider_backup_progress( $target, $position ) {
+    protected function abilities_v2_provider_backup_progress( $target, $position ) { // phpcs:ignore Generic.CodeAnalysis.UnusedFunctionParameter -- The requested position stays in the adapter contract, but the reported position is the observed one.
         if ( ! $this->abilities_v2_has_keys( $target, array( 'job_id', 'logfile' ) ) || ! is_int( $target['job_id'] ) || ! is_string( $target['logfile'] ) || basename( $target['logfile'] ) !== $target['logfile'] ) {
             return new \WP_Error( 'not_found' );
         }
-        $job = class_exists( '\\BackWPup_Job' ) ? \BackWPup_Job::get_working_data() : false;
+        $log_file = $this->abilities_v2_resolve_log_file( $target['logfile'] );
+        $observed = $this->abilities_v2_observed_log_position( $log_file );
+        $job      = $this->abilities_v2_working_job();
         if ( is_object( $job ) ) {
             $job_file = isset( $job->logfile ) ? basename( (string) $job->logfile ) : '';
             if ( $job_file !== $target['logfile'] ) {
                 return array(
                     'state'            => 'unknown',
                     'progress_percent' => null,
-                    'log_position'     => $position,
+                    'log_position'     => $observed,
                     'last_backup_at'   => max( 0, (int) MainWP_Utility::get_lasttime_backup( 'backwpup' ) ),
                     'message'          => __( 'The current backup identity changed.', 'mainwp-child' ),
                 );
@@ -1245,31 +1249,109 @@ class MainWP_Child_Back_WP_Up { //phpcs:ignore -- NOSONAR - multi methods.
             return array(
                 'state'            => 'running',
                 'progress_percent' => $percent,
-                'log_position'     => $position,
+                'log_position'     => $observed,
                 'last_backup_at'   => max( 0, (int) MainWP_Utility::get_lasttime_backup( 'backwpup' ) ),
                 'message'          => __( 'The backup is running.', 'mainwp-child' ),
             );
         }
 
-        $log_file = $this->abilities_v2_resolve_log_file( $target['logfile'] );
         if ( ! is_string( $log_file ) ) {
             return array(
                 'state'            => 'unknown',
                 'progress_percent' => null,
-                'log_position'     => $position,
+                'log_position'     => $observed,
                 'last_backup_at'   => max( 0, (int) MainWP_Utility::get_lasttime_backup( 'backwpup' ) ),
                 'message'          => __( 'The backup state is unavailable.', 'mainwp-child' ),
             );
         }
-        $header = method_exists( '\\BackWPup_Job', 'read_logheader' ) ? \BackWPup_Job::read_logheader( $log_file ) : array();
-        $failed = is_array( $header ) && ! empty( $header['errors'] );
+        // A missing job object only means this request cannot see one. The outcome is reported
+        // solely from what the log records: BackWPup closes the document and stamps the error
+        // count when the job ends, so an unterminated log is an unknown outcome, not a success.
+        $errors = $this->abilities_v2_log_error_count( $log_file );
+        if ( null === $errors || ! $this->abilities_v2_log_records_completion( $log_file ) ) {
+            return array(
+                'state'            => 'unknown',
+                'progress_percent' => null,
+                'log_position'     => $observed,
+                'last_backup_at'   => max( 0, (int) MainWP_Utility::get_lasttime_backup( 'backwpup' ) ),
+                'message'          => __( 'The backup log does not record a finished run.', 'mainwp-child' ),
+            );
+        }
+        $failed = 0 < $errors;
         return array(
             'state'            => $failed ? 'failed' : 'completed',
             'progress_percent' => 100,
-            'log_position'     => max( $position, (int) filesize( $log_file ) ),
+            'log_position'     => $observed,
             'last_backup_at'   => max( 0, (int) MainWP_Utility::get_lasttime_backup( 'backwpup' ) ),
             'message'          => $failed ? __( 'The backup completed with errors.', 'mainwp-child' ) : __( 'The backup completed.', 'mainwp-child' ),
         );
+    }
+
+    /**
+     * Return the provider's current working job object.
+     *
+     * @return object|false
+     */
+    protected function abilities_v2_working_job() {
+        return class_exists( '\\BackWPup_Job' ) ? \BackWPup_Job::get_working_data() : false;
+    }
+
+    /**
+     * Report the observed byte position of one resolved log file.
+     *
+     * @param string|null $log_file Resolved log file.
+     * @return int|null
+     */
+    private function abilities_v2_observed_log_position( $log_file ) {
+        if ( ! is_string( $log_file ) ) {
+            return null;
+        }
+        $size = filesize( $log_file );
+        return is_int( $size ) && 0 <= $size ? $size : null;
+    }
+
+    /**
+     * Read the error count BackWPup stamps into the log header.
+     *
+     * @param string $log_file Resolved log file.
+     * @return int|null Null when the log carries no readable error count.
+     */
+    private function abilities_v2_log_error_count( $log_file ) {
+        $chunk = $this->abilities_v2_read_log_chunk( $log_file, 0, 65536 );
+        if ( ! is_array( $chunk ) || 1 !== preg_match( '/<meta\s+name=["\']backwpup_errors["\']\s+content=["\']([0-9]{1,12})["\']/i', $chunk['content'], $matches ) ) {
+            return null;
+        }
+        return (int) $matches[1];
+    }
+
+    /**
+     * Detect the closing marker BackWPup appends only when a job ends.
+     *
+     * @param string $log_file Resolved log file.
+     * @return bool
+     */
+    private function abilities_v2_log_records_completion( $log_file ) {
+        if ( '.gz' !== substr( $log_file, -3 ) && '.bz2' !== substr( $log_file, -4 ) ) {
+            $size  = (int) filesize( $log_file );
+            $chunk = $this->abilities_v2_read_log_chunk( $log_file, max( 0, $size - 256 ), 256 );
+            return is_array( $chunk ) && false !== stripos( $chunk['content'], '</html>' );
+        }
+        // A compressed log has no cheap end offset, so stream it in bounded windows and keep
+        // only the trailing bytes.
+        $offset = 0;
+        $tail   = '';
+        for ( $window = 0; $window < 256; $window++ ) {
+            $chunk = $this->abilities_v2_read_log_chunk( $log_file, $offset, 65536 );
+            if ( ! is_array( $chunk ) || $chunk['next_offset'] === $offset ) {
+                return false;
+            }
+            $tail   = substr( $tail . $chunk['content'], -256 );
+            $offset = $chunk['next_offset'];
+            if ( ! $chunk['truncated'] ) {
+                return false !== stripos( $tail, '</html>' );
+            }
+        }
+        return false;
     }
 
     /**
@@ -1753,10 +1835,14 @@ class MainWP_Child_Back_WP_Up { //phpcs:ignore -- NOSONAR - multi methods.
      * @return string|null
      */
     private function abilities_v2_resolve_log_file( $basename ) {
-        if ( basename( $basename ) !== $basename || strlen( $basename ) > 255 || 1 !== preg_match( '/^[A-Za-z0-9_.-]+$/D', $basename ) || ! class_exists( '\\BackWPup_File' ) ) {
+        if ( basename( $basename ) !== $basename || strlen( $basename ) > 255 || 1 !== preg_match( '/^[A-Za-z0-9_.-]+$/D', $basename ) ) {
             return null;
         }
-        $directory = trailingslashit( \BackWPup_File::get_absolute_path( get_site_option( 'backwpup_cfg_logfolder' ) ) );
+        $configured = $this->abilities_v2_log_directory();
+        if ( ! is_string( $configured ) || '' === $configured ) {
+            return null;
+        }
+        $directory = trailingslashit( $configured );
         $root      = realpath( $directory );
         if ( false === $root ) {
             return null;
@@ -2178,14 +2264,14 @@ class MainWP_Child_Back_WP_Up { //phpcs:ignore -- NOSONAR - multi methods.
      * @return array
      */
     private function abilities_v2_error( $operation, $code, $message ) {
+        // The Dashboard reads the reserved top-level `error` key as a scalar string, so the
+        // protocol code stays a top-level scalar here like every other v2 bridge.
         return array(
             'protocol'  => '2',
             'operation' => is_string( $operation ) ? substr( sanitize_key( $operation ), 0, 64 ) : '',
             'ok'        => false,
-            'error'     => array(
-                'code'    => substr( sanitize_key( $code ), 0, 64 ),
-                'message' => substr( sanitize_text_field( $message ), 0, 1000 ),
-            ),
+            'code'      => substr( sanitize_key( $code ), 0, 64 ),
+            'message'   => substr( sanitize_text_field( $message ), 0, 1000 ),
         );
     }
 

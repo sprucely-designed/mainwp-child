@@ -30,9 +30,6 @@ class WooCommerce_Status_V2_Fixture extends MainWP_Child_WooCommerce_Status {
 	/** @var string|null */
 	public $lease = null;
 
-	/** @var array|null */
-	public $observation = null;
-
 	/** @var string|false */
 	public $source_generation;
 
@@ -84,14 +81,152 @@ class WooCommerce_Status_V2_Fixture extends MainWP_Child_WooCommerce_Status {
 		);
 		return true;
 	}
+}
 
-	protected function abilities_v2_record_observation( $generation, $observed_at ) {
-		$this->observation = array( 'generation' => $generation, 'observed_at' => 101 );
-		return true;
+/** Fixture that keeps the real option storage so read paths can be watched. */
+class WooCommerce_Status_V2_Storage_Fixture extends MainWP_Child_WooCommerce_Status {
+
+	/** @var mixed */
+	public $runtime;
+
+	/** @var mixed */
+	public $page;
+
+	/** @var mixed */
+	public $readiness;
+
+	/** @var string|false */
+	public $source_generation;
+
+	protected function abilities_v2_runtime() {
+		return $this->runtime;
 	}
 
-	protected function abilities_v2_observation() {
-		return $this->observation;
+	protected function abilities_v2_order_page( $payload, $runtime ) {
+		return $this->page;
+	}
+
+	protected function abilities_v2_source_generation( $payload ) {
+		return $this->source_generation;
+	}
+
+	protected function abilities_v2_db_readiness( $runtime ) {
+		return $this->readiness;
+	}
+}
+
+/** Fixture that keeps the real aggregation and generation code. */
+class WooCommerce_Status_V2_Order_Fixture extends MainWP_Child_WooCommerce_Status {
+
+	/** @var mixed */
+	public $runtime;
+
+	/** @var array */
+	public $inventory = array(
+		'processing_orders'     => 2,
+		'on_hold_orders'        => 1,
+		'low_stock'             => 3,
+		'out_of_stock'          => 0,
+		'inventory_observed_at' => '2026-08-10T12:00:00Z',
+	);
+
+	/** @var array */
+	public $orders = array();
+
+	protected function abilities_v2_runtime() {
+		return $this->runtime;
+	}
+
+	protected function abilities_v2_inventory_counts() {
+		return $this->inventory;
+	}
+
+	protected function abilities_v2_query_orders( $args ) {
+		$result = new \stdClass();
+		if ( 1 === $args['limit'] && isset( $args['orderby'] ) && 'modified' === $args['orderby'] ) {
+			$result->orders = array_slice( $this->orders, 0, 1 );
+			$result->total  = count( $this->orders );
+			return $result;
+		}
+		$result->orders = array_slice( $this->orders, isset( $args['offset'] ) ? $args['offset'] : 0, $args['limit'] );
+		$result->total  = count( $this->orders );
+		return $result;
+	}
+}
+
+/** Minimal WooCommerce order line item. */
+class WooCommerce_Status_V2_Item {
+
+	/** @var int */
+	private $product_id;
+
+	/** @var string */
+	private $name;
+
+	/** @var int */
+	private $quantity;
+
+	public function __construct( $product_id, $name, $quantity ) {
+		$this->product_id = $product_id;
+		$this->name       = $name;
+		$this->quantity   = $quantity;
+	}
+
+	public function get_product_id() {
+		return $this->product_id;
+	}
+
+	public function get_name() {
+		return $this->name;
+	}
+
+	public function get_quantity() {
+		return $this->quantity;
+	}
+}
+
+/** Minimal WooCommerce order. */
+class WooCommerce_Status_V2_Order {
+
+	/** @var int */
+	private $id;
+
+	/** @var array */
+	private $items;
+
+	public function __construct( $id, $items ) {
+		$this->id    = $id;
+		$this->items = $items;
+	}
+
+	public function get_id() {
+		return $this->id;
+	}
+
+	public function get_date_modified() {
+		return new \DateTimeImmutable( '@1770000000' );
+	}
+
+	public function get_currency() {
+		return 'usd';
+	}
+
+	public function get_total() {
+		return '10.00';
+	}
+
+	public function get_total_refunded() {
+		return '0';
+	}
+
+	public function get_items( $type = 'line_item' ) {
+		unset( $type );
+		return $this->items;
+	}
+
+	public function get_qty_refunded_for_item( $item_key ) {
+		unset( $item_key );
+		return 0;
 	}
 }
 
@@ -135,7 +270,6 @@ class Test_MainWP_Child_WooCommerce_Status_V2 extends WP_UnitTestCase {
 			'conflict_hashes' => array(),
 			'state'           => 'ready',
 		);
-		$this->subject->observation = array( 'generation' => str_repeat( 'd', 64 ), 'observed_at' => 101 );
 		$this->subject->source_generation = str_repeat( 'e', 64 );
 	}
 
@@ -257,7 +391,154 @@ class Test_MainWP_Child_WooCommerce_Status_V2 extends WP_UnitTestCase {
 		$status = $this->request( 'db_update_v2_status', $identity );
 		$this->assertSame( 'completed', $status['state'] );
 		$this->assertSame( 0, $status['pending_callback_count'] );
-		$this->assertNull( $this->subject->lease );
+		$this->assertSame( $identity['request_ref'], $this->subject->lease );
+	}
+
+	public function test_status_page_read_writes_no_observation_option() {
+		delete_option( 'mainwp_wc_status_v2_last_observation' );
+		$subject = $this->storage_subject();
+		$prepare = $subject->abilities_v2( $this->envelope( 'status_v2_prepare', $this->payload() ) );
+		$payload = array_merge( $this->payload(), array( 'preparation_generation' => $prepare['preparation_generation'], 'cursor' => null, 'page_size' => 100 ) );
+
+		$page = $subject->abilities_v2( $this->envelope( 'status_v2_page', $payload ) );
+
+		$this->assertTrue( $page['ok'] );
+		$this->assertTrue( $page['complete'] );
+		$this->assertNull( get_option( 'mainwp_wc_status_v2_last_observation', null ) );
+	}
+
+	public function test_db_status_read_keeps_the_lease_it_did_not_take() {
+		$identity = array( 'request_ref' => '123e4567-e89b-42d3-a456-426614174004', 'site_fingerprint' => str_repeat( 'a', 64 ) );
+		$lease    = array( 'request_ref' => $identity['request_ref'], 'expires_at' => time() + 3600 );
+		update_option(
+			'mainwp_wc_status_db_update_v2_receipts',
+			array(
+				$identity['request_ref'] => array(
+					'request_hash' => str_repeat( 'a', 64 ),
+					'response'     => array(
+						'protocol'         => '2',
+						'operation'        => 'db_update_v2_start',
+						'ok'               => true,
+						'request_ref'      => $identity['request_ref'],
+						'site_fingerprint' => $identity['site_fingerprint'],
+						'current_version'  => '10.8.0',
+						'target_version'   => '10.9.4',
+						'queued_callbacks' => 2,
+						'state'            => 'requested',
+					),
+					'requested_at' => 100,
+				),
+			),
+			false
+		);
+		update_option( 'mainwp_wc_status_db_update_v2_lease', $lease, false );
+		// A stale observation is exactly what the old read path used to justify deleting the lease.
+		update_option( 'mainwp_wc_status_v2_last_observation', array( 'generation' => str_repeat( 'd', 64 ), 'observed_at' => 200 ), false );
+
+		$subject                                  = $this->storage_subject();
+		$subject->runtime['current_db_version']   = '10.9.4';
+		$subject->runtime['database_update_needed'] = false;
+		$subject->readiness                       = array( 'callback_hashes' => array(), 'conflict_hashes' => array(), 'state' => 'current' );
+
+		$status = $subject->abilities_v2( $this->envelope( 'db_update_v2_status', $identity ) );
+
+		$this->assertSame( 'completed', $status['state'] );
+		$this->assertSame( $lease, get_option( 'mainwp_wc_status_db_update_v2_lease', null ) );
+	}
+
+	public function test_status_page_truncates_top_sellers_to_the_requested_limit() {
+		$subject = $this->order_subject();
+		$payload = array_merge( $this->payload(), array( 'top_limit' => 2 ) );
+		$prepare = $subject->abilities_v2( $this->envelope( 'status_v2_prepare', $payload ) );
+		$this->assertTrue( $prepare['ok'] );
+
+		$page = $subject->abilities_v2(
+			$this->envelope(
+				'status_v2_page',
+				array_merge( $payload, array( 'preparation_generation' => $prepare['preparation_generation'], 'cursor' => null, 'page_size' => 100 ) )
+			)
+		);
+
+		$this->assertTrue( $page['ok'], wp_json_encode( $page ) );
+		$this->assertCount( 2, $page['top_sellers'] );
+		$this->assertSame( array( 43, 42 ), array_column( $page['top_sellers'], 'product_id' ) );
+		$this->assertSame( array( '7', '5' ), array_column( $page['top_sellers'], 'net_quantity' ) );
+	}
+
+	public function test_inventory_change_between_prepare_and_page_is_reported_as_drift() {
+		$prepare_subject = $this->order_subject();
+		$prepare         = $prepare_subject->abilities_v2( $this->envelope( 'status_v2_prepare', $this->payload() ) );
+		$this->assertTrue( $prepare['ok'] );
+
+		$page_subject                          = $this->order_subject();
+		$page_subject->inventory['low_stock']  = 4;
+		$page                                  = $page_subject->abilities_v2(
+			$this->envelope(
+				'status_v2_page',
+				array_merge( $this->payload(), array( 'preparation_generation' => $prepare['preparation_generation'], 'cursor' => null, 'page_size' => 100 ) )
+			)
+		);
+
+		$this->assertFalse( $page['ok'] );
+		$this->assertSame( 'preparation_drift', $page['code'] );
+	}
+
+	public function test_low_stock_counts_managed_products_at_or_below_the_store_threshold() {
+		update_option( 'woocommerce_notify_low_stock_amount', 5 );
+		update_option( 'woocommerce_notify_no_stock_amount', 0 );
+		$this->product( 'product', '2', 'yes' );
+		$this->product( 'product', '0', 'yes' );
+		$this->product( 'product', '9', 'yes' );
+		$this->product( 'product', '2', 'no' );
+		$this->product( 'product_variation', '1', null );
+
+		$reflection = new ReflectionClass( MainWP_Child_WooCommerce_Status::class );
+		$method     = $reflection->getMethod( 'abilities_v2_low_stock_count' );
+		$method->setAccessible( true );
+
+		$this->assertSame( 2, $method->invoke( $reflection->newInstanceWithoutConstructor() ) );
+	}
+
+	private function product( $post_type, $stock, $managed ) {
+		$post_id = self::factory()->post->create( array( 'post_type' => $post_type, 'post_status' => 'publish' ) );
+		update_post_meta( $post_id, '_stock', $stock );
+		if ( null !== $managed ) {
+			update_post_meta( $post_id, '_manage_stock', $managed );
+		}
+		return $post_id;
+	}
+
+	private function storage_subject() {
+		$subject                  = ( new ReflectionClass( WooCommerce_Status_V2_Storage_Fixture::class ) )->newInstanceWithoutConstructor();
+		$subject->runtime         = $this->subject->runtime;
+		$subject->page            = $this->subject->page;
+		$subject->readiness       = $this->subject->readiness;
+		$subject->source_generation = str_repeat( 'e', 64 );
+		return $subject;
+	}
+
+	private function order_subject() {
+		$subject          = ( new ReflectionClass( WooCommerce_Status_V2_Order_Fixture::class ) )->newInstanceWithoutConstructor();
+		$subject->runtime = $this->subject->runtime;
+		$subject->orders  = array(
+			new WooCommerce_Status_V2_Order(
+				7001,
+				array(
+					'line_1' => new WooCommerce_Status_V2_Item( 41, 'Small', 3 ),
+					'line_2' => new WooCommerce_Status_V2_Item( 42, 'Medium', 5 ),
+					'line_3' => new WooCommerce_Status_V2_Item( 43, 'Large', 7 ),
+				)
+			),
+		);
+		return $subject;
+	}
+
+	private function envelope( $operation, $payload ) {
+		return array(
+			'protocol'  => '2',
+			'operation' => $operation,
+			'payload'   => $payload,
+		);
 	}
 
 	public function test_database_start_rejects_uuid_id_alias_and_readiness_drift() {

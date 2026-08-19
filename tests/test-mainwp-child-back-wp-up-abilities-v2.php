@@ -222,13 +222,38 @@ class Test_MainWP_Child_Back_WP_Up_Abilities_V2 extends WP_UnitTestCase {
 			)
 		);
 
-		$this->assertSame( array( 'protocol', 'operation', 'ok', 'error' ), array_keys( $result ) );
+		$this->assertSame( array( 'protocol', 'operation', 'ok', 'code', 'message' ), array_keys( $result ) );
 		$this->assertSame( '2', $result['protocol'] );
 		$this->assertSame( 'not_supported', $result['operation'] );
 		$this->assertFalse( $result['ok'] );
-		$this->assertSame( array( 'code', 'message' ), array_keys( $result['error'] ) );
-		$this->assertSame( 'unsupported_operation', $result['error']['code'] );
-		$this->assertLessThanOrEqual( 1000, strlen( $result['error']['message'] ) );
+		$this->assertSame( 'unsupported_operation', $result['code'] );
+		$this->assertLessThanOrEqual( 1000, strlen( $result['message'] ) );
+	}
+
+	/**
+	 * The Dashboard reads the reserved top-level error key as a scalar, so the protocol
+	 * code must be a scalar top-level field and nothing may be nested under 'error'.
+	 */
+	public function test_protocol_errors_carry_a_scalar_code_and_no_error_array() {
+		$errors = array(
+			$this->invoke_v2( array( 'operation' => 'not_supported', 'payload' => array() ) ),
+			$this->invoke_v2( array( 'operation' => 'diagnostics', 'payload' => array(), 'extra' => true ) ),
+			$this->invoke_v2( array( 'operation' => 'set_visibility', 'payload' => array( 'hidden' => 'true' ) ) ),
+			$this->invoke_v2(
+				array( 'operation' => 'backup_progress', 'payload' => array( 'run_token' => str_repeat( 'x', 43 ), 'log_position' => 0 ) ),
+				new Test_MainWP_Child_Back_WP_Up_V2_Fixture()
+			),
+		);
+
+		foreach ( $errors as $index => $error ) {
+			$this->assertFalse( $error['ok'], (string) $index );
+			$this->assertArrayNotHasKey( 'error', $error, (string) $index );
+			$this->assertArrayHasKey( 'code', $error, (string) $index );
+			$this->assertIsString( $error['code'], (string) $index );
+			$this->assertIsString( $error['message'], (string) $index );
+			$this->assertSame( array( 'protocol', 'operation', 'ok', 'code', 'message' ), array_keys( $error ), (string) $index );
+		}
+		$this->assertSame( 'target_not_found', $errors[3]['code'] );
 	}
 
 	/**
@@ -261,17 +286,17 @@ class Test_MainWP_Child_Back_WP_Up_Abilities_V2 extends WP_UnitTestCase {
 
 		$malformed_wire = $this->invoke_v2( array( 'operation' => 'diagnostics', 'payload_json' => '[]' ) );
 		$this->assertFalse( $malformed_wire['ok'] );
-		$this->assertSame( 'invalid_request', $malformed_wire['error']['code'] );
+		$this->assertSame( 'invalid_request', $malformed_wire['code'] );
 
 		$extra = $this->invoke_v2( array( 'operation' => 'diagnostics', 'payload' => array(), 'extra' => true ) );
 		$this->assertFalse( $extra['ok'] );
-		$this->assertSame( 'invalid_request', $extra['error']['code'] );
+		$this->assertSame( 'invalid_request', $extra['code'] );
 
 		$fixture = new Test_MainWP_Child_Back_WP_Up_V2_Fixture( array(), array( 'list_backups' => array() ) );
 		foreach ( array( 0, 1001 ) as $page ) {
 			$result = $this->invoke_v2( array( 'operation' => 'list_backups', 'payload' => array( 'page' => $page, 'per_page' => 25, 'scope' => 'all' ) ), $fixture );
 			$this->assertFalse( $result['ok'] );
-			$this->assertSame( 'invalid_input', $result['error']['code'] );
+			$this->assertSame( 'invalid_input', $result['code'] );
 		}
 		$this->assertSame( array(), $fixture->provider_calls );
 	}
@@ -312,7 +337,7 @@ class Test_MainWP_Child_Back_WP_Up_Abilities_V2 extends WP_UnitTestCase {
 			)
 		);
 		$this->assertFalse( $invalid['ok'] );
-		$this->assertSame( 'invalid_input', $invalid['error']['code'] );
+		$this->assertSame( 'invalid_input', $invalid['code'] );
 		$this->assertSame( 'hide', get_site_option( 'mainwp_backwpup_hide_plugin' ) );
 	}
 
@@ -438,7 +463,7 @@ class Test_MainWP_Child_Back_WP_Up_Abilities_V2 extends WP_UnitTestCase {
 		);
 
 		$this->assertFalse( $result['ok'] );
-		$this->assertSame( 'invalid_input', $result['error']['code'] );
+		$this->assertSame( 'invalid_input', $result['code'] );
 		$this->assertSame( $before, $fixture->fixture_options );
 	}
 
@@ -535,6 +560,225 @@ class Test_MainWP_Child_Back_WP_Up_Abilities_V2 extends WP_UnitTestCase {
 	}
 
 	/**
+	 * Create one disposable log directory.
+	 *
+	 * @return string
+	 */
+	private function make_log_directory() {
+		$directory = wp_tempnam( 'mainwp-backwpup-v2-progress' );
+		$this->assertIsString( $directory );
+		wp_delete_file( $directory );
+		$this->assertTrue( wp_mkdir_p( $directory ) );
+		return $directory;
+	}
+
+	/**
+	 * Write one BackWPup-shaped log file.
+	 *
+	 * @param string $directory Log directory.
+	 * @param string $basename  Log basename.
+	 * @param int    $errors    Error count BackWPup stamps into the header.
+	 * @param bool   $finished  Append the end-of-job marker BackWPup writes when a job ends.
+	 * @return string
+	 */
+	private function write_log_fixture( $directory, $basename, $errors, $finished ) {
+		$content = '<html><head>' . PHP_EOL .
+			'<meta name="backwpup_errors" content="' . $errors . '" />' . PHP_EOL .
+			'<meta name="backwpup_warnings" content="0" />' . PHP_EOL .
+			'<meta name="backwpup_jobid" content="7" />' . PHP_EOL .
+			'<meta name="backwpup_jobname" content="Nightly" />' . PHP_EOL .
+			'<meta name="backwpup_jobtype" content="DBDUMP" />' . PHP_EOL .
+			'<meta name="backwpup_jobruntime" content="0" />' . PHP_EOL .
+			'</head>' . PHP_EOL . '<body>' . str_repeat( 'log line ', 40 ) . PHP_EOL;
+		if ( $finished ) {
+			$content .= '</body>' . PHP_EOL . '</html>';
+		}
+		$file = trailingslashit( $directory ) . $basename;
+		file_put_contents( $file, $content ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_file_put_contents -- Disposable fixture.
+		return $file;
+	}
+
+	/**
+	 * Bind the real progress adapter to one disposable log directory.
+	 *
+	 * @param string $directory Log directory.
+	 * @return MainWP_Child_Back_WP_Up
+	 */
+	private function progress_fixture( $directory ) {
+		return new class( $directory ) extends MainWP_Child_Back_WP_Up {
+			/** @var string */
+			private $directory;
+
+			/** @param string $directory Directory. */
+			public function __construct( $directory ) {
+				$this->directory = $directory;
+			}
+
+			/** @return string */
+			protected function abilities_v2_log_directory() {
+				return $this->directory;
+			}
+		};
+	}
+
+	/**
+	 * Bind the real progress adapter to a disposable log directory and one working job.
+	 *
+	 * @param string $directory Log directory.
+	 * @param object $job       Working job object.
+	 * @return MainWP_Child_Back_WP_Up
+	 */
+	private function running_progress_fixture( $directory, $job ) {
+		return new class( $directory, $job ) extends MainWP_Child_Back_WP_Up {
+			/** @var string */
+			private $directory;
+
+			/** @var object */
+			private $job;
+
+			/**
+			 * @param string $directory Directory.
+			 * @param object $job       Working job.
+			 */
+			public function __construct( $directory, $job ) {
+				$this->directory = $directory;
+				$this->job       = $job;
+			}
+
+			/** @return string */
+			protected function abilities_v2_log_directory() {
+				return $this->directory;
+			}
+
+			/** @return object */
+			protected function abilities_v2_working_job() {
+				return $this->job;
+			}
+		};
+	}
+
+	/**
+	 * A running job reports the observed log position, not the requested one.
+	 */
+	public function test_backup_progress_reports_the_observed_position_while_running() {
+		$directory = $this->make_log_directory();
+		$running   = $this->write_log_fixture( $directory, 'backwpup_log_current.html', 0, false );
+		$other     = $this->write_log_fixture( $directory, 'backwpup_log_previous.html', 0, true );
+		$job               = new stdClass();
+		$job->logfile      = $running;
+		$job->step_percent = 40;
+		$subject           = $this->running_progress_fixture( $directory, $job );
+
+		$live = $this->invoke_provider( $subject, 'abilities_v2_provider_backup_progress', array( array( 'job_id' => 7, 'logfile' => 'backwpup_log_current.html' ), 999999 ) );
+		$this->assertSame( 'running', $live['state'] );
+		$this->assertSame( 40, $live['progress_percent'] );
+		$this->assertSame( (int) filesize( $running ), $live['log_position'] );
+
+		$changed = $this->invoke_provider( $subject, 'abilities_v2_provider_backup_progress', array( array( 'job_id' => 7, 'logfile' => 'backwpup_log_previous.html' ), 999999 ) );
+		$this->assertSame( 'unknown', $changed['state'] );
+		$this->assertSame( (int) filesize( $other ), $changed['log_position'] );
+
+		wp_delete_file( $running );
+		wp_delete_file( $other );
+		$this->assertTrue( rmdir( $directory ) );
+	}
+
+	/**
+	 * A log that records no finished run is an unknown outcome, never a fabricated completion.
+	 */
+	public function test_backup_progress_reports_unknown_without_recorded_completion() {
+		$directory = $this->make_log_directory();
+		$unfinished = $this->write_log_fixture( $directory, 'backwpup_log_running.html', 0, false );
+		$headerless = trailingslashit( $directory ) . 'backwpup_log_headerless.html';
+		file_put_contents( $headerless, '<html><head></head><body>truncated</body>' . PHP_EOL . '</html>' ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_file_put_contents -- Disposable fixture.
+		$subject = $this->progress_fixture( $directory );
+
+		$running = $this->invoke_provider( $subject, 'abilities_v2_provider_backup_progress', array( array( 'job_id' => 7, 'logfile' => 'backwpup_log_running.html' ), 0 ) );
+		$this->assertSame( 'unknown', $running['state'] );
+		$this->assertNull( $running['progress_percent'] );
+		$this->assertSame( (int) filesize( $unfinished ), $running['log_position'] );
+
+		$no_header = $this->invoke_provider( $subject, 'abilities_v2_provider_backup_progress', array( array( 'job_id' => 7, 'logfile' => 'backwpup_log_headerless.html' ), 0 ) );
+		$this->assertSame( 'unknown', $no_header['state'] );
+		$this->assertNull( $no_header['progress_percent'] );
+
+		wp_delete_file( $unfinished );
+		wp_delete_file( $headerless );
+		$this->assertTrue( rmdir( $directory ) );
+	}
+
+	/**
+	 * A log that records a finished run reports that recorded outcome and error count.
+	 */
+	public function test_backup_progress_reports_the_recorded_outcome() {
+		$directory = $this->make_log_directory();
+		$clean     = $this->write_log_fixture( $directory, 'backwpup_log_clean.html', 0, true );
+		$errored   = $this->write_log_fixture( $directory, 'backwpup_log_errored.html', 3, true );
+		$subject   = $this->progress_fixture( $directory );
+
+		$completed = $this->invoke_provider( $subject, 'abilities_v2_provider_backup_progress', array( array( 'job_id' => 7, 'logfile' => 'backwpup_log_clean.html' ), 0 ) );
+		$this->assertSame( 'completed', $completed['state'] );
+		$this->assertSame( 100, $completed['progress_percent'] );
+
+		$failed = $this->invoke_provider( $subject, 'abilities_v2_provider_backup_progress', array( array( 'job_id' => 7, 'logfile' => 'backwpup_log_errored.html' ), 0 ) );
+		$this->assertSame( 'failed', $failed['state'] );
+
+		wp_delete_file( $clean );
+		wp_delete_file( $errored );
+		$this->assertTrue( rmdir( $directory ) );
+	}
+
+	/**
+	 * The reported position is the observed one, so the caller can see forward progress
+	 * instead of the position it asked for.
+	 */
+	public function test_backup_progress_reports_the_observed_log_position() {
+		$directory = $this->make_log_directory();
+		$log       = $this->write_log_fixture( $directory, 'backwpup_log_observed.html', 0, true );
+		$size      = (int) filesize( $log );
+		$subject   = $this->progress_fixture( $directory );
+
+		$ahead = $this->invoke_provider( $subject, 'abilities_v2_provider_backup_progress', array( array( 'job_id' => 7, 'logfile' => 'backwpup_log_observed.html' ), $size + 100000 ) );
+		$this->assertSame( $size, $ahead['log_position'] );
+
+		$missing = $this->invoke_provider( $subject, 'abilities_v2_provider_backup_progress', array( array( 'job_id' => 7, 'logfile' => 'backwpup_log_absent.html' ), 4242 ) );
+		$this->assertSame( 'unknown', $missing['state'] );
+		$this->assertNull( $missing['log_position'] );
+
+		wp_delete_file( $log );
+		$this->assertTrue( rmdir( $directory ) );
+	}
+
+	/**
+	 * An unknown position survives the protocol validator instead of collapsing into
+	 * operation_failed.
+	 */
+	public function test_backup_progress_envelope_carries_an_unknown_position() {
+		$directory = $this->make_log_directory();
+		$subject   = $this->progress_fixture( $directory );
+		$token     = $this->invoke_provider(
+			$subject,
+			'abilities_v2_issue_target_token',
+			array( 'backup_progress', array( 'job_id' => 7, 'logfile' => 'backwpup_log_absent.html' ) )
+		);
+		$this->assertIsString( $token );
+
+		$result = $this->invoke_v2(
+			array(
+				'operation' => 'backup_progress',
+				'payload'   => array( 'run_token' => $token, 'log_position' => 77 ),
+			),
+			$subject
+		);
+
+		$this->assertTrue( $result['ok'] );
+		$this->assertSame( 'unknown', $result['data']['state'] );
+		$this->assertNull( $result['data']['log_position'] );
+
+		$this->assertTrue( rmdir( $directory ) );
+	}
+
+	/**
 	 * Abort reports the provider's exact current-work state.
 	 */
 	public function test_abort_backup_returns_closed_state() {
@@ -589,7 +833,7 @@ class Test_MainWP_Child_Back_WP_Up_Abilities_V2 extends WP_UnitTestCase {
 
 		$wrong_action = $this->invoke_v2( array( 'operation' => 'delete_backup', 'payload' => array( 'delete_token' => $row['download_token'] ) ), $fixture );
 		$this->assertFalse( $wrong_action['ok'] );
-		$this->assertSame( 'target_not_found', $wrong_action['error']['code'] );
+		$this->assertSame( 'target_not_found', $wrong_action['code'] );
 	}
 
 	/**
@@ -619,7 +863,7 @@ class Test_MainWP_Child_Back_WP_Up_Abilities_V2 extends WP_UnitTestCase {
 
 		$wrong_action = $this->invoke_v2( array( 'operation' => 'redeem_backup_download', 'payload' => array( 'download_token' => str_repeat( 'x', 43 ) ) ), $fixture );
 		$this->assertFalse( $wrong_action['ok'] );
-		$this->assertSame( 'target_not_found', $wrong_action['error']['code'] );
+		$this->assertSame( 'target_not_found', $wrong_action['code'] );
 
 		foreach (
 			array(
@@ -631,7 +875,7 @@ class Test_MainWP_Child_Back_WP_Up_Abilities_V2 extends WP_UnitTestCase {
 			$fixture->provider_results['redeem_backup_download'] = $invalid;
 			$malformed = $this->invoke_v2( array( 'operation' => 'redeem_backup_download', 'payload' => array( 'download_token' => $token ) ), $fixture );
 			$this->assertFalse( $malformed['ok'], (string) $index );
-			$this->assertSame( 'operation_failed', $malformed['error']['code'], (string) $index );
+			$this->assertSame( 'operation_failed', $malformed['code'], (string) $index );
 		}
 	}
 
@@ -692,7 +936,7 @@ class Test_MainWP_Child_Back_WP_Up_Abilities_V2 extends WP_UnitTestCase {
 		$fixture->provider_results['diagnostics']['path'] = '/private/secret';
 		$invalid = $this->invoke_v2( array( 'operation' => 'diagnostics', 'payload' => array() ), $fixture );
 		$this->assertFalse( $invalid['ok'] );
-		$this->assertSame( 'operation_failed', $invalid['error']['code'] );
+		$this->assertSame( 'operation_failed', $invalid['code'] );
 	}
 
 	/**

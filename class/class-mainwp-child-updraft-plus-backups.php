@@ -293,7 +293,6 @@ class MainWP_Child_Updraft_Plus_Backups { //phpcs:ignore -- NOSONAR - multi meth
     /** @param mixed $request Decoded request. @return array Closed protocol response. */
     public function abilities_v2( $request ) {
         $operation = is_array( $request ) && isset( $request['operation'] ) && is_string( $request['operation'] ) ? $request['operation'] : 'unknown';
-        $reads     = array( 'site', 'policy', 'list_backups', 'backup_manifest', 'operation_status', 'preview_restore' );
         $mutations = array( 'replace_policy', 'start_backup', 'cancel_operation', 'prepare_download', 'delete_backup', 'restore_backup' );
         $keys      = in_array( $operation, $mutations, true ) ? array( 'protocol', 'operation', 'request_ref', 'payload' ) : array( 'protocol', 'operation', 'payload' );
         if ( ! is_array( $request ) || ! $this->abilities_v2_exact_keys( $request, $keys ) || '2' !== $request['protocol'] || ! is_array( $request['payload'] ) ) {
@@ -304,15 +303,17 @@ class MainWP_Child_Updraft_Plus_Backups { //phpcs:ignore -- NOSONAR - multi meth
             if ( array() !== $request['payload'] ) {
                 return $this->abilities_v2_error( $operation );
             }
+            $supported = $this->abilities_v2_supported_operations();
             return array(
                 'protocol'           => '2',
                 'operation'          => 'capabilities',
                 'ok'                 => true,
-                'operations'         => array_merge( $reads, $mutations ),
-                'mutation_supported' => $this->abilities_v2_provider_supports_mutation(),
+                'operations'         => $supported,
+                'mutation_supported' => array() !== array_intersect( $mutations, $supported ) && $this->abilities_v2_provider_supports_mutation(),
             );
         }
-        if ( ! in_array( $operation, array_merge( $reads, $mutations ), true ) ) {
+        // Anything this Child cannot execute is refused by name, whether the protocol knows it or not.
+        if ( ! in_array( $operation, $this->abilities_v2_supported_operations(), true ) ) {
             return $this->abilities_v2_error( $operation, 'unsupported_operation' );
         }
         if ( ! $this->abilities_v2_valid_payload( $operation, $request['payload'] ) || ( in_array( $operation, $mutations, true ) && ! $this->abilities_v2_valid_request_ref( $request['request_ref'] ) ) ) {
@@ -320,14 +321,16 @@ class MainWP_Child_Updraft_Plus_Backups { //phpcs:ignore -- NOSONAR - multi meth
         }
 
         $receipts    = array();
+        // The reference is validated case-insensitively, so it has to be folded before it keys a receipt.
+        $request_ref = in_array( $operation, $mutations, true ) ? strtolower( $request['request_ref'] ) : null;
         $effect_hash = hash( 'sha256', wp_json_encode( array( $operation, $request['payload'] ) ) );
         if ( in_array( $operation, $mutations, true ) ) {
             $receipts = get_option( 'mainwp_updraftplus_abilities_v2_receipts', array() );
             if ( ! is_array( $receipts ) ) {
                 return $this->abilities_v2_error( $operation, 'storage_unavailable' );
             }
-            if ( isset( $receipts[ $request['request_ref'] ] ) ) {
-                $receipt = $receipts[ $request['request_ref'] ];
+            if ( isset( $receipts[ $request_ref ] ) ) {
+                $receipt = $receipts[ $request_ref ];
                 if ( ! is_array( $receipt ) || ! $this->abilities_v2_exact_keys( $receipt, array( 'effect_hash', 'response' ) ) || ! is_string( $receipt['effect_hash'] ) || ! is_array( $receipt['response'] ) ) {
                     return $this->abilities_v2_error( $operation, 'storage_unavailable' );
                 }
@@ -350,17 +353,31 @@ class MainWP_Child_Updraft_Plus_Backups { //phpcs:ignore -- NOSONAR - multi meth
         if ( ! $this->abilities_v2_valid_result( $operation, $result ) ) {
             return $this->abilities_v2_error( $operation, 'provider_schema_invalid' );
         }
-        $response = array_merge( array( 'protocol' => '2', 'operation' => $operation, 'ok' => true ), in_array( $operation, $mutations, true ) ? array( 'request_ref' => $request['request_ref'] ) : array(), $result );
+        $response = array_merge( array( 'protocol' => '2', 'operation' => $operation, 'ok' => true ), in_array( $operation, $mutations, true ) ? array( 'request_ref' => $request_ref ) : array(), $result );
         if ( in_array( $operation, $mutations, true ) ) {
             if ( 100 <= count( $receipts ) ) {
                 array_shift( $receipts );
             }
-            $receipts[ $request['request_ref'] ] = array( 'effect_hash' => $effect_hash, 'response' => $response );
+            $receipts[ $request_ref ] = array( 'effect_hash' => $effect_hash, 'response' => $response );
             if ( ! update_option( 'mainwp_updraftplus_abilities_v2_receipts', $receipts, false ) && $receipts !== get_option( 'mainwp_updraftplus_abilities_v2_receipts', array() ) ) {
                 return $this->abilities_v2_error( $operation, 'outcome_unknown' );
             }
         }
         return $response;
+    }
+
+    /**
+     * List the operations this Child can actually execute.
+     *
+     * No UpdraftPlus adapter is wired here: the protocol is defined but nothing on the
+     * Child can answer a single operation, so none are advertised and each one is
+     * refused by name instead of blaming an absent provider. A build that wires the
+     * adapter extends this list.
+     *
+     * @return array Executable operation names.
+     */
+    protected function abilities_v2_supported_operations() {
+        return array();
     }
 
     /** @return bool Whether the installed provider exposes typed mutation support. */

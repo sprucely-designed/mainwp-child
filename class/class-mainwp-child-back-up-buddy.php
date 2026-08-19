@@ -52,6 +52,15 @@ class MainWP_Child_Back_Up_Buddy { //phpcs:ignore -- NOSONAR - multi methods.
       public $backupbuddy_core_class = '\backupbuddy_core';
 
     /**
+     * Operation the current v2 request is being answered for. Errors are built deep inside the
+     * helper chain, so the dispatcher records the operation here instead of threading it through
+     * every call.
+     *
+     * @var string
+     */
+    private $abilities_v2_operation = 'unknown';
+
+    /**
      * Create a public static instance of MainWP_Child_Back_Up_Buddy.
      *
      * @return MainWP_Child_Back_Up_Buddy|null
@@ -389,7 +398,7 @@ class MainWP_Child_Back_Up_Buddy { //phpcs:ignore -- NOSONAR - multi methods.
             MainWP_Helper::write( array( 'error' => esc_html__( 'Please install the BackupBuddy plugin on the child site.', $this->plugin_translate ) ) );
         }
         if ( ! class_exists( $this->backupbuddy_core_class ) ) {
-            require_once \pb_backupbuddy::plugin_path() . $$this->path_core_file; // NOSONAR - WP compatible.
+            require_once \pb_backupbuddy::plugin_path() . $this->path_core_file; // NOSONAR - WP compatible.
         }
 
         if ( ! isset( \pb_backupbuddy::$options ) ) {
@@ -550,12 +559,7 @@ class MainWP_Child_Back_Up_Buddy { //phpcs:ignore -- NOSONAR - multi methods.
      * @return array
      */
     public function abilities_v2( $request ) { // phpcs:ignore -- Closed dispatcher is intentionally explicit.
-        if ( ! is_array( $request ) || ! isset( $request['operation'] ) || ! is_string( $request['operation'] ) ) {
-            return $this->abilities_v2_error( 'invalid_request' );
-        }
-
-        $operation = $request['operation'];
-        $allowed   = array(
+        $allowed = array(
             'capabilities'      => array( 'operation' ),
             'list_profiles'     => array( 'operation', 'page', 'per_page' ),
             'list_schedules'    => array( 'operation', 'page', 'per_page' ),
@@ -569,9 +573,13 @@ class MainWP_Child_Back_Up_Buddy { //phpcs:ignore -- NOSONAR - multi methods.
             'delete_archive'    => array( 'operation', 'archive_ref', 'expected_size_bytes', 'expected_modified_at', 'request_ref' ),
             'start_transfer'    => array( 'operation', 'archive_ref', 'destination_ref', 'request_ref', 'delete_local_after' ),
         );
-        if ( ! isset( $allowed[ $operation ] ) ) {
+        // An unrecognised operation is never echoed back, so a malformed request cannot reflect its own input.
+        $this->abilities_v2_operation = is_array( $request ) && isset( $request['operation'] ) && is_string( $request['operation'] ) && isset( $allowed[ $request['operation'] ] ) ? $request['operation'] : 'unknown';
+        if ( 'unknown' === $this->abilities_v2_operation ) {
             return $this->abilities_v2_error( 'invalid_request' );
         }
+
+        $operation    = $this->abilities_v2_operation;
         $request_keys = array_keys( $request );
         $allowed_keys = $allowed[ $operation ];
         if ( array() !== array_values( array_diff( $request_keys, $allowed_keys ) ) ) {
@@ -584,18 +592,19 @@ class MainWP_Child_Back_Up_Buddy { //phpcs:ignore -- NOSONAR - multi methods.
                 'operations' => array_keys( $allowed ),
             );
         }
+
+        // The payload is judged on its own terms before the provider gate, so a malformed request is
+        // invalid_request everywhere instead of backupbuddy_unavailable on sites without the plugin.
+        if ( ! $this->abilities_v2_valid_payload( $operation, $request ) ) {
+            return $this->abilities_v2_error( 'invalid_request' );
+        }
         if ( ! $this->is_backupbuddy_installed ) {
             return $this->abilities_v2_error( 'backupbuddy_unavailable' );
         }
         $this->abilities_v2_load_provider();
 
-        if ( 0 === strpos( $operation, 'list_' ) ) {
-            $page     = isset( $request['page'] ) ? $request['page'] : 1;
-            $per_page = isset( $request['per_page'] ) ? $request['per_page'] : 25;
-            if ( ! is_int( $page ) || $page < 1 || ! is_int( $per_page ) || $per_page < 1 || $per_page > 100 ) {
-                return $this->abilities_v2_error( 'invalid_request' );
-            }
-        }
+        $page     = isset( $request['page'] ) ? $request['page'] : 1;
+        $per_page = isset( $request['per_page'] ) ? $request['per_page'] : 25;
 
         switch ( $operation ) {
             case 'list_profiles':
@@ -605,29 +614,58 @@ class MainWP_Child_Back_Up_Buddy { //phpcs:ignore -- NOSONAR - multi methods.
             case 'list_destinations':
                 return $this->abilities_v2_list_destinations( $page, $per_page );
             case 'list_archives':
-                $type = isset( $request['type'] ) ? $request['type'] : 'all';
-                if ( ! in_array( $type, array( 'all', 'full', 'database', 'files' ), true ) ) {
-                    return $this->abilities_v2_error( 'invalid_request' );
-                }
-                return $this->abilities_v2_list_archives( $page, $per_page, $type );
+                return $this->abilities_v2_list_archives( $page, $per_page, isset( $request['type'] ) ? $request['type'] : 'all' );
             case 'preview_run':
-                if ( ! isset( $request['target_kind'], $request['target_ref'] ) || ! in_array( $request['target_kind'], array( 'profile', 'schedule' ), true ) || ! $this->abilities_v2_valid_ref( $request['target_ref'] ) ) {
-                    return $this->abilities_v2_error( 'invalid_request' );
-                }
                 return $this->abilities_v2_preview( $request['target_kind'], $request['target_ref'], $this->abilities_v2_now() );
             case 'start_backup':
             case 'run_schedule':
                 return $this->abilities_v2_start_operation( $operation, $request );
             case 'get_operation':
-                return $this->abilities_v2_get_operation( isset( $request['operation_ref'] ) ? $request['operation_ref'] : '' );
+                return $this->abilities_v2_get_operation( $request['operation_ref'] );
             case 'cancel_operation':
-                return $this->abilities_v2_cancel_operation( isset( $request['operation_ref'] ) ? $request['operation_ref'] : '' );
+                return $this->abilities_v2_cancel_operation( $request['operation_ref'] );
             case 'delete_archive':
                 return $this->abilities_v2_delete_archive( $request );
             case 'start_transfer':
                 return $this->abilities_v2_start_transfer( $request );
         }
         return $this->abilities_v2_error( 'invalid_request' );
+    }
+
+    /**
+     * Validate one operation's typed payload in full.
+     *
+     * @param string $operation Operation.
+     * @param array  $request   Typed request.
+     * @return bool
+     */
+    private function abilities_v2_valid_payload( $operation, $request ) { // phpcs:ignore -- Closed per-operation payload table is intentionally explicit.
+        if ( 0 === strpos( $operation, 'list_' ) ) {
+            $page     = isset( $request['page'] ) ? $request['page'] : 1;
+            $per_page = isset( $request['per_page'] ) ? $request['per_page'] : 25;
+            if ( ! is_int( $page ) || $page < 1 || ! is_int( $per_page ) || $per_page < 1 || $per_page > 100 ) {
+                return false;
+            }
+        }
+
+        switch ( $operation ) {
+            case 'list_archives':
+                return in_array( isset( $request['type'] ) ? $request['type'] : 'all', array( 'all', 'full', 'database', 'files' ), true );
+            case 'preview_run':
+                return isset( $request['target_kind'], $request['target_ref'] ) && in_array( $request['target_kind'], array( 'profile', 'schedule' ), true ) && $this->abilities_v2_valid_ref( $request['target_ref'] );
+            case 'start_backup':
+            case 'run_schedule':
+                $target_key = 'start_backup' === $operation ? 'profile_ref' : 'schedule_ref';
+                return isset( $request[ $target_key ], $request['preview_token'], $request['request_ref'] ) && $this->abilities_v2_valid_ref( $request[ $target_key ] ) && $this->abilities_v2_valid_ref( $request['preview_token'] ) && $this->abilities_v2_valid_request_ref( $request['request_ref'] );
+            case 'get_operation':
+            case 'cancel_operation':
+                return isset( $request['operation_ref'] ) && $this->abilities_v2_valid_ref( $request['operation_ref'] );
+            case 'delete_archive':
+                return isset( $request['archive_ref'], $request['expected_size_bytes'], $request['expected_modified_at'], $request['request_ref'] ) && $this->abilities_v2_valid_ref( $request['archive_ref'] ) && is_int( $request['expected_size_bytes'] ) && $request['expected_size_bytes'] >= 0 && is_int( $request['expected_modified_at'] ) && $request['expected_modified_at'] >= 0 && $this->abilities_v2_valid_request_ref( $request['request_ref'] );
+            case 'start_transfer':
+                return isset( $request['archive_ref'], $request['destination_ref'], $request['request_ref'], $request['delete_local_after'] ) && false === $request['delete_local_after'] && $this->abilities_v2_valid_ref( $request['archive_ref'] ) && $this->abilities_v2_valid_ref( $request['destination_ref'] ) && $this->abilities_v2_valid_request_ref( $request['request_ref'] );
+        }
+        return true;
     }
 
     /**
@@ -686,25 +724,58 @@ class MainWP_Child_Back_Up_Buddy { //phpcs:ignore -- NOSONAR - multi methods.
      * @return array
      */
     private function abilities_v2_error( $code ) {
-        $messages = array(
-            'invalid_request'         => 'The request is invalid.',
-            'not_found'               => 'The requested resource was not found.',
-            'request_conflict'        => 'The request reference conflicts with an existing effect.',
-            'preview_stale'           => 'The preview is stale or invalid.',
-            'operation_limit_reached' => 'The operation ledger is full.',
-            'effect_failed'           => 'The requested effect could not be started.',
-            'storage_failed'          => 'The operation state could not be stored.',
-            'lock_busy'               => 'Another BackupBuddy effect is active.',
-            'too_large'               => 'The requested source snapshot is too large.',
-            'outcome_unknown'         => 'The effect outcome could not be confirmed.',
-            'backupbuddy_unavailable' => 'BackupBuddy is unavailable.',
+        $codes = array(
+            'invalid_request',
+            'not_found',
+            'request_conflict',
+            'preview_stale',
+            'operation_limit_reached',
+            'effect_failed',
+            'storage_failed',
+            'lock_busy',
+            'too_large',
+            'outcome_unknown',
+            'backupbuddy_unavailable',
         );
         return array(
-            'error' => array(
-                'code'    => isset( $messages[ $code ] ) ? $code : 'effect_failed',
-                'message' => isset( $messages[ $code ] ) ? $messages[ $code ] : $messages['effect_failed'],
-            ),
+            'protocol'  => '2',
+            'operation' => $this->abilities_v2_operation,
+            'ok'        => false,
+            'code'      => in_array( $code, $codes, true ) ? $code : 'effect_failed',
         );
+    }
+
+    /**
+     * Recognise a v2 error envelope. Helpers return either their result or this envelope, and the
+     * reserved top-level 'error' key is not part of the v2 shape any more.
+     *
+     * @param mixed $value Helper result.
+     * @return bool
+     */
+    private function abilities_v2_is_error( $value ) {
+        return is_array( $value ) && isset( $value['ok'] ) && false === $value['ok'];
+    }
+
+    /**
+     * Report a failed lock release without rewriting the outcome it accompanies.
+     *
+     * The effect is already committed and the record already written by the time the lock is
+     * released, so a failed release cannot make any of that untrue. The lock expires on its own
+     * 120s TTL; the caller is told about the failure through an advisory warning instead of being
+     * handed a storage_failed that did not happen.
+     *
+     * @param array $result   Result produced under the lock.
+     * @param bool  $released Whether the lock release succeeded.
+     * @return array
+     */
+    private function abilities_v2_with_lock_release( $result, $released ) {
+        if ( $released || ! is_array( $result ) ) {
+            return $result;
+        }
+        $warnings                  = isset( $result['warning_codes'] ) && is_array( $result['warning_codes'] ) ? $result['warning_codes'] : array();
+        $warnings[]                = 'lock_release_failed';
+        $result['warning_codes']   = array_values( array_unique( $warnings ) );
+        return $result;
     }
 
     /**
@@ -983,7 +1054,7 @@ class MainWP_Child_Back_Up_Buddy { //phpcs:ignore -- NOSONAR - multi methods.
      */
     private function abilities_v2_list_archives( $page, $per_page, $type ) {
         $archives = $this->abilities_v2_archives();
-        if ( isset( $archives['error'] ) ) {
+        if ( $this->abilities_v2_is_error( $archives ) ) {
             return $archives;
         }
         $items    = array();
@@ -1049,7 +1120,7 @@ class MainWP_Child_Back_Up_Buddy { //phpcs:ignore -- NOSONAR - multi methods.
         }
         $profile = 'profile' === $kind ? $target : $target['profile'];
         $victims = $this->abilities_v2_retention_victims( $profile['type'] );
-        if ( isset( $victims['error'] ) ) {
+        if ( $this->abilities_v2_is_error( $victims ) ) {
             return $victims;
         }
         $remote  = 'schedule' === $kind ? $target['remote_ids'] : array();
@@ -1140,7 +1211,7 @@ class MainWP_Child_Back_Up_Buddy { //phpcs:ignore -- NOSONAR - multi methods.
         unset( $type );
         $options   = $this->abilities_v2_read_options();
         $archives  = $this->abilities_v2_archives();
-        if ( isset( $archives['error'] ) ) {
+        if ( $this->abilities_v2_is_error( $archives ) ) {
             return $archives;
         }
         $remaining = array();
@@ -1208,16 +1279,13 @@ class MainWP_Child_Back_Up_Buddy { //phpcs:ignore -- NOSONAR - multi methods.
 
     /**
      * @param string $operation Operation.
-     * @param array  $request Request.
+     * @param array  $request Request, already validated by abilities_v2_valid_payload().
      * @return array
      */
     private function abilities_v2_start_operation( $operation, $request ) {
         $target_key = 'start_backup' === $operation ? 'profile_ref' : 'schedule_ref';
         $kind       = 'start_backup' === $operation ? 'profile' : 'schedule';
-        if ( ! isset( $request[ $target_key ], $request['preview_token'], $request['request_ref'] ) || ! $this->abilities_v2_valid_ref( $request[ $target_key ] ) || ! $this->abilities_v2_valid_ref( $request['preview_token'] ) || ! $this->abilities_v2_valid_request_ref( $request['request_ref'] ) ) {
-            return $this->abilities_v2_error( 'invalid_request' );
-        }
-        $owner = $this->abilities_v2_acquire_effect_lock();
+        $owner      = $this->abilities_v2_acquire_effect_lock();
         if ( false === $owner ) {
             return $this->abilities_v2_error( 'lock_busy' );
         }
@@ -1228,7 +1296,7 @@ class MainWP_Child_Back_Up_Buddy { //phpcs:ignore -- NOSONAR - multi methods.
                 $result = $replay;
             } else {
                 $preview = $this->abilities_v2_verify_preview( $kind, $request[ $target_key ], $request['preview_token'] );
-                if ( ! is_array( $preview ) || isset( $preview['error'] ) ) {
+                if ( ! is_array( $preview ) || $this->abilities_v2_is_error( $preview ) ) {
                     $result = $this->abilities_v2_error( 'preview_stale' );
                 } else {
                     $target  = $this->abilities_v2_resolve_target( $kind, $request[ $target_key ] );
@@ -1236,7 +1304,7 @@ class MainWP_Child_Back_Up_Buddy { //phpcs:ignore -- NOSONAR - multi methods.
                     $steps   = 'schedule' === $kind ? array( 'remote_destinations' => $target['remote_ids'], 'delete_after' => false ) : array();
                     $record  = $this->abilities_v2_new_operation( $request['request_ref'], $this->abilities_v2_request_hash( $request ), 'profile' === $kind ? 'backup' : 'scheduled_backup', null, null );
                     $records = $this->abilities_v2_prepare_records();
-                    if ( isset( $records['error'] ) ) {
+                    if ( $this->abilities_v2_is_error( $records ) ) {
                         $result = $records;
                     } else {
                         $records['operations'][ $record['operation_ref'] ] = $record;
@@ -1256,7 +1324,7 @@ class MainWP_Child_Back_Up_Buddy { //phpcs:ignore -- NOSONAR - multi methods.
         } finally {
             $released = $this->abilities_v2_release_effect_lock( $owner );
         }
-        return $released ? $result : $this->abilities_v2_error( 'storage_failed' );
+        return $this->abilities_v2_with_lock_release( $result, $released );
     }
 
     /**
@@ -1274,7 +1342,7 @@ class MainWP_Child_Back_Up_Buddy { //phpcs:ignore -- NOSONAR - multi methods.
             return null;
         }
         $preview = $this->abilities_v2_preview( $kind, $ref, $issued );
-        return ! isset( $preview['error'] ) && hash_equals( $preview['preview_token'], $token ) ? $preview : null;
+        return ! $this->abilities_v2_is_error( $preview ) && hash_equals( $preview['preview_token'], $token ) ? $preview : null;
     }
 
     /**
@@ -1293,7 +1361,7 @@ class MainWP_Child_Back_Up_Buddy { //phpcs:ignore -- NOSONAR - multi methods.
      */
     private function abilities_v2_replay( $request_ref, $request ) {
         $records = $this->abilities_v2_normalize_records( $this->abilities_v2_read_records() );
-        if ( isset( $records['error'] ) ) {
+        if ( $this->abilities_v2_is_error( $records ) ) {
             return $records;
         }
         $hash    = $this->abilities_v2_request_hash( $request );
@@ -1316,12 +1384,14 @@ class MainWP_Child_Back_Up_Buddy { //phpcs:ignore -- NOSONAR - multi methods.
     /** @return array */
     private function abilities_v2_prepare_records() {
         $records = $this->abilities_v2_normalize_records( $this->abilities_v2_read_records() );
-        if ( isset( $records['error'] ) ) {
+        if ( $this->abilities_v2_is_error( $records ) ) {
             return $records;
         }
         $cutoff  = $this->abilities_v2_now() - 604800;
         foreach ( $records['operations'] as $key => $record ) {
-            if ( in_array( isset( $record['state'] ) ? $record['state'] : '', array( 'succeeded', 'failed', 'cancelled' ), true ) && isset( $record['updated_at'] ) && $record['updated_at'] < $cutoff ) {
+            $record = $this->abilities_v2_settle_stale_operation( $record );
+            $records['operations'][ $key ] = $record;
+            if ( in_array( isset( $record['state'] ) ? $record['state'] : '', array( 'succeeded', 'failed', 'cancelled', 'unknown' ), true ) && isset( $record['updated_at'] ) && $record['updated_at'] < $cutoff ) {
                 unset( $records['operations'][ $key ] );
             }
         }
@@ -1334,6 +1404,33 @@ class MainWP_Child_Back_Up_Buddy { //phpcs:ignore -- NOSONAR - multi methods.
             return $this->abilities_v2_error( 'operation_limit_reached' );
         }
         return $records;
+    }
+
+    /**
+     * Settle an operation nothing has reported on for a full day.
+     *
+     * The Child only ever learns about an effect through abilities_v2_probe_operation(), so a
+     * record still sitting in queued/running/cancel_requested a day after its last observation has
+     * no evidence behind it: the effect lock it started under expired after 120s and BackupBuddy's
+     * own step cron gives up long before a day is out. Such a record settles to 'unknown' instead
+     * of claiming to still be in flight, and then ages out on the same 7-day prune as any other
+     * settled record. Without that, a crashed run holds its ledger slot forever and 100 of them
+     * make every new operation fail with operation_limit_reached.
+     *
+     * updated_at is left alone on purpose: it records the last time the Child actually observed
+     * the operation, and settling it is not an observation.
+     *
+     * @param mixed $record Stored operation record.
+     * @return mixed
+     */
+    private function abilities_v2_settle_stale_operation( $record ) {
+        if ( ! is_array( $record ) || ! isset( $record['state'], $record['updated_at'] ) || ! is_int( $record['updated_at'] ) ) {
+            return $record;
+        }
+        if ( in_array( $record['state'], array( 'queued', 'running', 'cancel_requested' ), true ) && $record['updated_at'] < $this->abilities_v2_now() - DAY_IN_SECONDS ) {
+            $record['state'] = 'unknown';
+        }
+        return $record;
     }
 
     /**
@@ -1446,21 +1543,19 @@ class MainWP_Child_Back_Up_Buddy { //phpcs:ignore -- NOSONAR - multi methods.
     }
 
     /**
-     * @param string $operation_ref Operation reference.
+     * @param string $operation_ref Operation reference, already validated by abilities_v2_valid_payload().
      * @return array
      */
     private function abilities_v2_get_operation( $operation_ref ) {
-        if ( ! $this->abilities_v2_valid_ref( $operation_ref ) ) {
-            return $this->abilities_v2_error( 'invalid_request' );
-        }
         $records = $this->abilities_v2_normalize_records( $this->abilities_v2_read_records() );
-        if ( isset( $records['error'] ) ) {
+        if ( $this->abilities_v2_is_error( $records ) ) {
             return $records;
         }
         if ( ! isset( $records['operations'][ $operation_ref ] ) || ! is_array( $records['operations'][ $operation_ref ] ) ) {
             return $this->abilities_v2_error( 'not_found' );
         }
-        $record = $this->abilities_v2_probe_operation( $records['operations'][ $operation_ref ] );
+        // Settled here for the response only; this read never writes the ledger back.
+        $record = $this->abilities_v2_settle_stale_operation( $this->abilities_v2_probe_operation( $records['operations'][ $operation_ref ] ) );
         if ( ! $this->abilities_v2_valid_operation_record( $record ) ) {
             return $this->abilities_v2_error( 'storage_failed' );
         }
@@ -1468,13 +1563,10 @@ class MainWP_Child_Back_Up_Buddy { //phpcs:ignore -- NOSONAR - multi methods.
     }
 
     /**
-     * @param string $operation_ref Operation reference.
+     * @param string $operation_ref Operation reference, already validated by abilities_v2_valid_payload().
      * @return array
      */
     private function abilities_v2_cancel_operation( $operation_ref ) {
-        if ( ! $this->abilities_v2_valid_ref( $operation_ref ) ) {
-            return $this->abilities_v2_error( 'invalid_request' );
-        }
         $owner = $this->abilities_v2_acquire_effect_lock();
         if ( false === $owner ) {
             return $this->abilities_v2_error( 'lock_busy' );
@@ -1482,15 +1574,15 @@ class MainWP_Child_Back_Up_Buddy { //phpcs:ignore -- NOSONAR - multi methods.
         $result = null;
         try {
             $records = $this->abilities_v2_normalize_records( $this->abilities_v2_read_records() );
-            if ( isset( $records['error'] ) ) {
+            if ( $this->abilities_v2_is_error( $records ) ) {
                 $result = $records;
             } elseif ( ! isset( $records['operations'][ $operation_ref ] ) ) {
                 $result = $this->abilities_v2_error( 'not_found' );
             } else {
-                $record = $this->abilities_v2_probe_operation( $records['operations'][ $operation_ref ] );
+                $record = $this->abilities_v2_settle_stale_operation( $this->abilities_v2_probe_operation( $records['operations'][ $operation_ref ] ) );
                 if ( ! $this->abilities_v2_valid_operation_record( $record ) ) {
                     $result = $this->abilities_v2_error( 'storage_failed' );
-                } elseif ( in_array( $record['state'], array( 'succeeded', 'failed', 'cancelled', 'cancel_requested' ), true ) ) {
+                } elseif ( in_array( $record['state'], array( 'succeeded', 'failed', 'cancelled', 'cancel_requested', 'unknown' ), true ) ) {
                     $result = array( 'operation' => $this->abilities_v2_public_operation( $record ) );
                 } elseif ( ! $this->abilities_v2_set_stop_signal( $record['serial'] ) ) {
                     $result = $this->abilities_v2_error( 'effect_failed' );
@@ -1505,17 +1597,14 @@ class MainWP_Child_Back_Up_Buddy { //phpcs:ignore -- NOSONAR - multi methods.
         } finally {
             $released = $this->abilities_v2_release_effect_lock( $owner );
         }
-        return $released ? $result : $this->abilities_v2_error( 'storage_failed' );
+        return $this->abilities_v2_with_lock_release( $result, $released );
     }
 
     /**
-     * @param array $request Request.
+     * @param array $request Request, already validated by abilities_v2_valid_payload().
      * @return array
      */
     private function abilities_v2_delete_archive( $request ) {
-        if ( ! isset( $request['archive_ref'], $request['expected_size_bytes'], $request['expected_modified_at'], $request['request_ref'] ) || ! $this->abilities_v2_valid_ref( $request['archive_ref'] ) || ! is_int( $request['expected_size_bytes'] ) || $request['expected_size_bytes'] < 0 || ! is_int( $request['expected_modified_at'] ) || $request['expected_modified_at'] < 0 || ! $this->abilities_v2_valid_request_ref( $request['request_ref'] ) ) {
-            return $this->abilities_v2_error( 'invalid_request' );
-        }
         $owner = $this->abilities_v2_acquire_effect_lock();
         if ( false === $owner ) {
             return $this->abilities_v2_error( 'lock_busy' );
@@ -1527,7 +1616,7 @@ class MainWP_Child_Back_Up_Buddy { //phpcs:ignore -- NOSONAR - multi methods.
                 $result = $replay;
             } else {
                 $archive = $this->abilities_v2_resolve_archive( $request['archive_ref'] );
-                if ( is_array( $archive ) && isset( $archive['error'] ) ) {
+                if ( $this->abilities_v2_is_error( $archive ) ) {
                     $result = $archive;
                 } elseif ( ! is_array( $archive ) ) {
                     $result = $this->abilities_v2_error( 'not_found' );
@@ -1535,7 +1624,7 @@ class MainWP_Child_Back_Up_Buddy { //phpcs:ignore -- NOSONAR - multi methods.
                     $result = $this->abilities_v2_error( 'request_conflict' );
                 } else {
                     $records = $this->abilities_v2_prepare_records();
-                    if ( isset( $records['error'] ) ) {
+                    if ( $this->abilities_v2_is_error( $records ) ) {
                         $result = $records;
                     } else {
                         $receipt = array(
@@ -1571,17 +1660,14 @@ class MainWP_Child_Back_Up_Buddy { //phpcs:ignore -- NOSONAR - multi methods.
         } finally {
             $released = $this->abilities_v2_release_effect_lock( $owner );
         }
-        return $released ? $result : $this->abilities_v2_error( 'storage_failed' );
+        return $this->abilities_v2_with_lock_release( $result, $released );
     }
 
     /**
-     * @param array $request Request.
+     * @param array $request Request, already validated by abilities_v2_valid_payload().
      * @return array
      */
     private function abilities_v2_start_transfer( $request ) {
-        if ( ! isset( $request['archive_ref'], $request['destination_ref'], $request['request_ref'], $request['delete_local_after'] ) || false !== $request['delete_local_after'] || ! $this->abilities_v2_valid_ref( $request['archive_ref'] ) || ! $this->abilities_v2_valid_ref( $request['destination_ref'] ) || ! $this->abilities_v2_valid_request_ref( $request['request_ref'] ) ) {
-            return $this->abilities_v2_error( 'invalid_request' );
-        }
         $owner = $this->abilities_v2_acquire_effect_lock();
         if ( false === $owner ) {
             return $this->abilities_v2_error( 'lock_busy' );
@@ -1594,14 +1680,14 @@ class MainWP_Child_Back_Up_Buddy { //phpcs:ignore -- NOSONAR - multi methods.
             } else {
                 $archive     = $this->abilities_v2_resolve_archive( $request['archive_ref'] );
                 $destination = $this->abilities_v2_resolve_destination( $request['destination_ref'] );
-                if ( is_array( $archive ) && isset( $archive['error'] ) ) {
+                if ( $this->abilities_v2_is_error( $archive ) ) {
                     $result = $archive;
                 } elseif ( ! is_array( $archive ) || null === $destination ) {
                     $result = $this->abilities_v2_error( 'not_found' );
                 } else {
                     $record  = $this->abilities_v2_new_operation( $request['request_ref'], $this->abilities_v2_request_hash( $request ), 'transfer', $request['archive_ref'], $request['destination_ref'] );
                     $records = $this->abilities_v2_prepare_records();
-                    if ( isset( $records['error'] ) ) {
+                    if ( $this->abilities_v2_is_error( $records ) ) {
                         $result = $records;
                     } else {
                         $records['operations'][ $record['operation_ref'] ] = $record;
@@ -1621,7 +1707,7 @@ class MainWP_Child_Back_Up_Buddy { //phpcs:ignore -- NOSONAR - multi methods.
         } finally {
             $released = $this->abilities_v2_release_effect_lock( $owner );
         }
-        return $released ? $result : $this->abilities_v2_error( 'storage_failed' );
+        return $this->abilities_v2_with_lock_release( $result, $released );
     }
 
     /**
@@ -1630,7 +1716,7 @@ class MainWP_Child_Back_Up_Buddy { //phpcs:ignore -- NOSONAR - multi methods.
      */
     private function abilities_v2_resolve_archive( $ref ) {
         $archives = $this->abilities_v2_archives();
-        if ( isset( $archives['error'] ) ) {
+        if ( $this->abilities_v2_is_error( $archives ) ) {
             return $archives;
         }
         foreach ( $archives as $archive ) {

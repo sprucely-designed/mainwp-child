@@ -423,12 +423,14 @@ class MainWP_Child_Staging { //phpcs:ignore -- NOSONAR - multi methods.
     // phpcs:disable Generic.Commenting.DocComment.MissingShort,Squiz.Commenting.FunctionComment,Generic.Formatting.MultipleStatementAlignment,WordPress.Arrays.ArrayDeclarationSpacing.AssociativeArrayFound,WordPress.Arrays.MultipleStatementAlignment,WordPress.PHP.YodaConditions.NotYoda -- Closed protocol block follows the legacy file's compact style.
     public function abilities_v2( $request ) {
         $operation = is_array( $request ) && isset( $request['operation'] ) && is_string( $request['operation'] ) ? $request['operation'] : 'unknown';
-        if ( ! is_array( $request ) || ! isset( $request['protocol'] ) || '2' !== $request['protocol'] ) {
+        $mutations = array( 'replace_settings', 'create_clone', 'update_clone', 'delete_clone', 'cancel_operation', 'reconcile_operation' );
+        $root_keys = in_array( $operation, $mutations, true ) ? array( 'protocol', 'operation', 'request_ref', 'payload' ) : array( 'protocol', 'operation', 'payload' );
+        if ( ! is_array( $request ) || ! $this->abilities_v2_exact_keys( $request, $root_keys ) || '2' !== $request['protocol'] || ! is_array( $request['payload'] ) ) {
             return $this->abilities_v2_error( $operation );
         }
 
         if ( 'capabilities' === $operation ) {
-            if ( ! $this->abilities_v2_exact_keys( $request, array( 'protocol', 'operation', 'payload' ) ) || array() !== $request['payload'] ) {
+            if ( array() !== $request['payload'] ) {
                 return $this->abilities_v2_error( $operation );
             }
 
@@ -448,10 +450,6 @@ class MainWP_Child_Staging { //phpcs:ignore -- NOSONAR - multi methods.
 
         if ( in_array( $operation, array( 'create_clone', 'update_clone', 'delete_clone', 'cancel_operation', 'reconcile_operation' ), true ) ) {
             return $this->abilities_v2_mutation( $operation, $request );
-        }
-
-        if ( ! $this->abilities_v2_exact_keys( $request, array( 'protocol', 'operation', 'payload' ) ) || ! is_array( $request['payload'] ) ) {
-            return $this->abilities_v2_error( $operation );
         }
 
         if ( 'inventory' === $operation ) {
@@ -519,7 +517,7 @@ class MainWP_Child_Staging { //phpcs:ignore -- NOSONAR - multi methods.
      * @return array
      */
     private function abilities_v2_mutation( $operation, $request ) {
-        if ( ! $this->abilities_v2_exact_keys( $request, array( 'protocol', 'operation', 'request_ref', 'payload' ) ) || ! $this->abilities_v2_valid_request_ref( $request['request_ref'] ) || ! $this->abilities_v2_valid_mutation_payload( $operation, $request['payload'] ) ) {
+        if ( ! $this->abilities_v2_valid_request_ref( $request['request_ref'] ) || ! $this->abilities_v2_valid_mutation_payload( $operation, $request['payload'] ) ) {
             return $this->abilities_v2_error( $operation );
         }
         $effect_hash = hash( 'sha256', wp_json_encode( array( $operation, $request['payload'] ) ) );
@@ -632,7 +630,9 @@ class MainWP_Child_Staging { //phpcs:ignore -- NOSONAR - multi methods.
             'protocol'           => '2',
             'operation'          => 'inventory',
             'ok'                 => true,
-            'complete'           => true,
+            // A list recovered from the pre-registry option is not one WP Staging still
+            // maintains, so it cannot be reported as the complete clone set.
+            'complete'           => 'provider' === $this->abilities_v2_clone_source(),
             'observed_at'        => gmdate( 'c' ),
             'wp_staging_version' => $this->abilities_v2_plugin_version(),
             'inventory_revision' => $this->abilities_v2_inventory_revision( $rows ),
@@ -666,7 +666,7 @@ class MainWP_Child_Staging { //phpcs:ignore -- NOSONAR - multi methods.
             }
             $rows[ $clone_ref ] = array(
                 'clone_ref'                   => $clone_ref,
-                'state'                       => 'ready',
+                'state'                       => $identity['state'],
                 'isolated'                    => $identity['isolated'],
                 'search_index_blocked'        => $identity['search_index_blocked'],
                 'outbound_side_effects_blocked' => $identity['outbound_side_effects_blocked'],
@@ -692,6 +692,18 @@ class MainWP_Child_Staging { //phpcs:ignore -- NOSONAR - multi methods.
             return get_option( \WPStaging\Framework\Staging\Sites::STAGING_SITES_OPTION, array() );
         }
         return get_option( 'wpstg_existing_clones_beta', array() );
+    }
+
+    /**
+     * Name where the clone list came from.
+     *
+     * Without either registry constant there is no WP Staging to answer for the list;
+     * the reader falls back to the pre-registry option, which nothing keeps current.
+     *
+     * @return string Either 'provider' or 'legacy_option'.
+     */
+    protected function abilities_v2_clone_source() {
+        return defined( '\\WPStaging\\Staging\\Sites::STAGING_SITES_OPTION' ) || defined( '\\WPStaging\\Framework\\Staging\\Sites::STAGING_SITES_OPTION' ) ? 'provider' : 'legacy_option';
     }
 
     /**
@@ -736,12 +748,32 @@ class MainWP_Child_Staging { //phpcs:ignore -- NOSONAR - multi methods.
 
         return array(
             'binding'                      => $binding,
-            'isolated'                     => ! empty( $clone_data['isolated'] ),
-            'search_index_blocked'         => ! empty( $clone_data['searchIndexBlocked'] ),
-            'outbound_side_effects_blocked' => ! empty( $clone_data['outboundSideEffectsBlocked'] ),
+            'state'                        => $this->abilities_v2_clone_state( $clone_data ),
+            // WP Staging records none of these three today. An absent key means the Child
+            // never observed the guard, which is not the same claim as observing it off.
+            'isolated'                     => $this->abilities_v2_optional_flag( $clone_data, 'isolated' ),
+            'search_index_blocked'         => $this->abilities_v2_optional_flag( $clone_data, 'searchIndexBlocked' ),
+            'outbound_side_effects_blocked' => $this->abilities_v2_optional_flag( $clone_data, 'outboundSideEffectsBlocked' ),
             'created_at'                   => $created_at,
             'updated_at'                   => $updated_at,
         );
+    }
+
+    /** @param array $clone_data Provider clone metadata. @return string */
+    private function abilities_v2_clone_state( $clone_data ) {
+        $status = isset( $clone_data['status'] ) && is_string( $clone_data['status'] ) ? $clone_data['status'] : '';
+        if ( 'finished' === $status ) {
+            return 'ready';
+        }
+        // WP Staging leaves an interrupted clone marked 'unfinished'. Any other value,
+        // including a registry entry carrying no status at all, is not evidence of a
+        // usable clone, so it reports as unknown instead of ready.
+        return 'unfinished' === $status ? 'incomplete' : 'unknown';
+    }
+
+    /** @param array $clone_data Provider clone metadata. @param string $key Provider key. @return bool|null */
+    private function abilities_v2_optional_flag( $clone_data, $key ) {
+        return array_key_exists( $key, $clone_data ) ? ! empty( $clone_data[ $key ] ) : null;
     }
 
     /**
@@ -791,7 +823,7 @@ class MainWP_Child_Staging { //phpcs:ignore -- NOSONAR - multi methods.
      * @return array Closed protocol response.
      */
     private function abilities_v2_replace_settings( $request ) {
-        if ( ! $this->abilities_v2_exact_keys( $request, array( 'protocol', 'operation', 'request_ref', 'payload' ) ) || ! $this->abilities_v2_valid_request_ref( $request['request_ref'] ) || ! is_array( $request['payload'] ) || ! $this->abilities_v2_exact_keys( $request['payload'], array( 'if_match', 'settings' ) ) || ! $this->abilities_v2_valid_hash( $request['payload']['if_match'] ) ) {
+        if ( ! $this->abilities_v2_valid_request_ref( $request['request_ref'] ) || ! $this->abilities_v2_exact_keys( $request['payload'], array( 'if_match', 'settings' ) ) || ! $this->abilities_v2_valid_hash( $request['payload']['if_match'] ) ) {
             return $this->abilities_v2_error( 'replace_settings' );
         }
         $settings = $this->abilities_v2_validate_public_settings( $request['payload']['settings'] );

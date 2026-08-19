@@ -107,18 +107,138 @@ class Test_MainWP_Child_Timecapsule_V2 extends WP_UnitTestCase {
 		parent::tear_down();
 	}
 
-	public function test_capabilities_are_closed_and_publish_the_complete_typed_surface() {
-		$result = $this->subject->abilities_v2(
+	/**
+	 * Restore and staging mutations have no Child-side adapter, so capabilities must not
+	 * advertise them and dispatch must refuse them by name instead of blaming the provider.
+	 */
+	public function test_capabilities_advertise_exactly_the_operations_dispatch_accepts() {
+		$fixture                      = new Timecapsule_V2_Default_Provider_Fixture();
+		$fixture->is_plugin_installed = true;
+		$fixture->backups             = array( (object) array( 'backupID' => 1723456789 ) );
+
+		$result = $fixture->abilities_v2(
 			array(
 				'protocol'  => '2',
 				'operation' => 'capabilities',
 				'payload'   => array(),
 			)
 		);
-
 		$this->assertSame( array( 'protocol', 'operation', 'ok', 'operations', 'mutation_supported' ), array_keys( $result ) );
-		$this->assertSame( array( 'site', 'policy', 'replace_policy', 'list_backups', 'start_backup', 'operation_status', 'cancel_operation', 'preview_restore', 'restore_backup', 'list_staging', 'start_staging', 'delete_staging' ), $result['operations'] );
 		$this->assertTrue( $result['mutation_supported'] );
+
+		$requests = $this->protocol_requests();
+		$refused  = array();
+		foreach ( $requests as $operation => $request ) {
+			$response = $fixture->abilities_v2( $request );
+			if ( isset( $response['code'] ) && 'unsupported_operation' === $response['code'] ) {
+				$refused[] = $operation;
+			}
+		}
+
+		$this->assertSame( array( 'restore_backup', 'start_staging', 'delete_staging' ), $refused );
+		$this->assertSame( array_values( array_diff( array_keys( $requests ), $refused ) ), $result['operations'] );
+	}
+
+	/**
+	 * One request per protocol operation, keyed by operation name and ordered so the wired
+	 * operations come first.
+	 *
+	 * @return array Closed protocol requests.
+	 */
+	private function protocol_requests() {
+		$hash      = str_repeat( 'a', 64 );
+		$mutations = array( 'replace_policy', 'start_backup', 'cancel_operation', 'restore_backup', 'start_staging', 'delete_staging' );
+		$payloads  = array(
+			'site'             => array(),
+			'policy'           => array(),
+			'list_backups'     => array( 'limit' => 50, 'after_backup_ref' => null ),
+			'operation_status' => array( 'operation_ref' => $hash ),
+			'preview_restore'  => array( 'backup_ref' => $hash, 'backup_generation' => $hash, 'scope' => 'full' ),
+			'list_staging'     => array( 'limit' => 20, 'after_clone_ref' => null ),
+			'replace_policy'   => array( 'schedule_time' => '7:00 am', 'retention_days' => 45, 'backup_before_update' => false, 'if_match' => $hash ),
+			'start_backup'     => array( 'scope' => 'full', 'label' => null, 'policy_generation' => $hash ),
+			'cancel_operation' => array( 'operation_ref' => $hash, 'if_match' => $hash ),
+			'restore_backup'   => array( 'backup_ref' => $hash, 'backup_generation' => $hash, 'scope' => 'full', 'preview_token' => str_repeat( 'P', 43 ) ),
+			'start_staging'    => array( 'label' => 'staging', 'register_in_mainwp' => false, 'settings_generation' => $hash ),
+			'delete_staging'   => array( 'clone_ref' => $hash, 'clone_generation' => $hash ),
+		);
+
+		$requests = array();
+		$index    = 0;
+		foreach ( $payloads as $operation => $payload ) {
+			++$index;
+			$request = array(
+				'protocol'  => '2',
+				'operation' => $operation,
+				'payload'   => $payload,
+			);
+			if ( in_array( $operation, $mutations, true ) ) {
+				$request['request_ref'] = sprintf( '123e4567-e89b-42d3-a456-4266141749%02d', $index );
+			}
+			$requests[ $operation ] = $request;
+		}
+		return $requests;
+	}
+
+	/**
+	 * The reference is validated case-insensitively, so a re-cased retry of the same UUID
+	 * must replay the first receipt instead of starting a second backup.
+	 */
+	public function test_recased_request_ref_replays_the_same_receipt() {
+		$fixture                          = new Timecapsule_V2_Protocol_Fixture();
+		$fixture->is_plugin_installed     = true;
+		$fixture->results['start_backup'] = array(
+			'operation_ref' => str_repeat( 'a', 64 ),
+			'state'         => 'queued',
+			'scope'         => 'full',
+		);
+		$request = array(
+			'protocol'    => '2',
+			'operation'   => 'start_backup',
+			'request_ref' => '123E4567-E89B-42D3-A456-426614174965',
+			'payload'     => array( 'scope' => 'full', 'label' => null, 'policy_generation' => str_repeat( 'b', 64 ) ),
+		);
+
+		$first = $fixture->abilities_v2( $request );
+		$this->assertTrue( $first['ok'] );
+		$this->assertSame( strtolower( $request['request_ref'] ), $first['request_ref'] );
+
+		$request['request_ref'] = strtolower( $request['request_ref'] );
+		$this->assertSame( $first, $fixture->abilities_v2( $request ) );
+		$this->assertCount( 1, $fixture->calls );
+		$this->assertSame( array( '123e4567-e89b-42d3-a456-426614174965' ), array_keys( get_option( 'mainwp_timecapsule_abilities_v2_receipts' ) ) );
+	}
+
+	/**
+	 * last_backup_time is site-wide: a backup started anywhere else satisfies it. The status
+	 * read must not read success out of it, and must not rewrite the stored operation row.
+	 */
+	public function test_operation_status_neither_infers_success_from_site_wide_time_nor_writes() {
+		$fixture                      = new Timecapsule_V2_Default_Provider_Fixture();
+		$fixture->is_plugin_installed = true;
+		$policy                       = $fixture->abilities_v2( array( 'protocol' => '2', 'operation' => 'policy', 'payload' => array() ) );
+		$start                        = $fixture->abilities_v2(
+			array(
+				'protocol'    => '2',
+				'operation'   => 'start_backup',
+				'request_ref' => '123e4567-e89b-42d3-a456-426614174966',
+				'payload'     => array( 'scope' => 'full', 'label' => null, 'policy_generation' => $policy['policy_generation'] ),
+			)
+		);
+		$this->assertSame( 'running', $start['state'] );
+
+		// Some other backup finishes after ours started, and ours stops being in progress.
+		Timecapsule_V2_Factory::$config->set_option( 'in_progress', false );
+		Timecapsule_V2_Factory::$config->set_option( 'last_backup_time', time() + 60 );
+
+		$status = $fixture->abilities_v2( array( 'protocol' => '2', 'operation' => 'operation_status', 'payload' => array( 'operation_ref' => $start['operation_ref'] ) ) );
+		$this->assertTrue( $status['ok'] );
+		$this->assertSame( 'uncertain', $status['state'] );
+		$this->assertNull( $status['result_ref'] );
+		$this->assertNull( $status['finished_at'] );
+
+		$stored = get_option( 'mainwp_timecapsule_abilities_v2_operations' );
+		$this->assertSame( 'running', $stored[ $start['operation_ref'] ]['state'], 'operation_status is a read and must not settle the stored row.' );
 	}
 
 	public function test_typed_mutations_require_request_ref_and_replay_the_exact_receipt() {
@@ -338,6 +458,52 @@ class Test_MainWP_Child_Timecapsule_V2 extends WP_UnitTestCase {
 			)
 		);
 		$this->assertTrue( $preview['ok'] );
+	}
+
+	/**
+	 * Restore has no Child-side adapter, so the preview cannot mint a redeemable token, and Time
+	 * Capsule publishes no per-backup table list. Counts it cannot compute must read as unknown,
+	 * and the one it can compute must come from the provider's own rows.
+	 */
+	public function test_preview_restore_reports_real_counts_and_mints_no_unredeemable_token() {
+		global $wpdb;
+
+		$table = $wpdb->base_prefix . 'wptc_processed_files';
+		$wpdb->query( "DROP TABLE IF EXISTS {$table}" ); // phpcs:ignore WordPress.DB -- Fixture table for a provider-owned schema.
+		$wpdb->query( "CREATE TABLE {$table} ( id BIGINT NOT NULL AUTO_INCREMENT, backupID BIGINT NOT NULL, file_path VARCHAR(190) NOT NULL, PRIMARY KEY (id) )" ); // phpcs:ignore WordPress.DB -- Fixture table for a provider-owned schema.
+		foreach ( array( 1723456789 => 2, 1723543189 => 3 ) as $backup_id => $files ) {
+			for ( $index = 0; $index < $files; $index++ ) {
+				$wpdb->insert( $table, array( 'backupID' => $backup_id, 'file_path' => 'wp-content/file-' . $index . '.php' ) ); // phpcs:ignore WordPress.DB -- Fixture rows for a provider-owned schema.
+			}
+		}
+
+		$list = $this->subject->abilities_v2(
+			array(
+				'protocol'  => '2',
+				'operation' => 'list_backups',
+				'payload'   => array( 'limit' => 50, 'after_backup_ref' => null ),
+			)
+		);
+		$this->assertTrue( $list['ok'] );
+		$this->assertSame( gmdate( 'Y-m-d\TH:i:s\Z', 1723543189 ), $list['backups'][0]['created_at'] );
+
+		$preview = $this->subject->abilities_v2(
+			array(
+				'protocol'  => '2',
+				'operation' => 'preview_restore',
+				'payload'   => array(
+					'backup_ref'        => $list['backups'][0]['backup_ref'],
+					'backup_generation' => $list['backups'][0]['generation'],
+					'scope'             => 'full',
+				),
+			)
+		);
+		$this->assertTrue( $preview['ok'] );
+		$this->assertSame( 3, $preview['file_count'] );
+		$this->assertNull( $preview['table_count'] );
+		$this->assertNull( $preview['preview_token'] );
+		$this->assertNull( $preview['expires_at'] );
+		$this->assertSame( 'blocked', $preview['preflight'] );
 	}
 
 	private function request( $operation ) {

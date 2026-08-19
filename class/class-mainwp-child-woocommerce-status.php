@@ -40,6 +40,16 @@ class MainWP_Child_WooCommerce_Status {
     public static $instance = null;
 
     /**
+     * Inventory counts captured once per request.
+     *
+     * The generation hash and the page body must describe the same inventory read;
+     * a second read inside one request would let a page contradict its own generation.
+     *
+     * @var array<string,mixed>|false|null
+     */
+    private $abilities_v2_inventory_memo = null;
+
+    /**
      * Method instance()
      *
      * Create a public static instance.
@@ -236,9 +246,6 @@ class MainWP_Child_WooCommerce_Status {
         if ( ! is_string( $encoded ) || 2097152 < strlen( $encoded ) ) {
             return $this->abilities_v2_error( 'status_v2_page', 'response_too_large' );
         }
-        if ( $response['complete'] && ! $this->abilities_v2_record_observation( $response['response_hash'], $response['generated_at'] ) ) {
-            return $this->abilities_v2_error( 'status_v2_page', 'storage_unavailable' );
-        }
         return $response;
     }
 
@@ -318,7 +325,12 @@ class MainWP_Child_WooCommerce_Status {
             $this->abilities_v2_release_db_lease( $payload['request_ref'] );
             return $this->abilities_v2_error( 'db_update_v2_start', 'update_failed' );
         }
-        $state    = 'current' === $fresh['state'] ? 'completed' : ( 0 < $started ? 'requested' : 'reconciliation_required' );
+        $state = 'current' === $fresh['state'] ? 'completed' : ( 0 < $started ? 'requested' : 'reconciliation_required' );
+        if ( 'completed' === $state ) {
+            // Nothing was queued, so the lease guards no work. Release it here, on the
+            // mutation path, instead of from the status read.
+            $this->abilities_v2_release_db_lease( $payload['request_ref'] );
+        }
         $response = array(
             'protocol'         => '2',
             'operation'        => 'db_update_v2_start',
@@ -355,11 +367,10 @@ class MainWP_Child_WooCommerce_Status {
         if ( ! is_array( $readiness ) ) {
             return $this->abilities_v2_error( 'db_update_v2_status', 'readiness_unavailable' );
         }
-        $observation = $this->abilities_v2_observation();
-        $requested   = isset( $receipt['requested_at'] ) && is_int( $receipt['requested_at'] ) ? $receipt['requested_at'] : 0;
-        if ( $runtime['current_db_version'] === $runtime['target_db_version'] && array() === $readiness['callback_hashes'] && is_array( $observation ) && isset( $observation['observed_at'] ) && is_int( $observation['observed_at'] ) && $observation['observed_at'] >= $requested ) {
+        // WooCommerce's background updater only stamps woocommerce_db_version once the queue
+        // drains, so version parity plus an empty callback set is the evidence of completion.
+        if ( $runtime['current_db_version'] === $runtime['target_db_version'] && array() === $readiness['callback_hashes'] ) {
             $state = 'completed';
-            $this->abilities_v2_release_db_lease( $payload['request_ref'] );
         } elseif ( array() !== $readiness['conflict_hashes'] ) {
             $state = 'reconciliation_required';
         } elseif ( array() !== $readiness['callback_hashes'] ) {
@@ -425,13 +436,10 @@ class MainWP_Child_WooCommerce_Status {
      * @return array|false
      */
     protected function abilities_v2_order_page( $payload, $runtime ) { // phpcs:ignore -- Closed bounded provider adapter.
-        if ( ! function_exists( 'wc_get_orders' ) ) {
-            return false;
-        }
         $offset = null === $payload['cursor'] ? 0 : $payload['cursor'];
         $start  = $this->abilities_v2_utc_timestamp( $payload['start_at'] );
         $end    = $this->abilities_v2_utc_timestamp( $payload['end_at'] );
-        $result = wc_get_orders(
+        $result = $this->abilities_v2_query_orders(
             array(
                 'status'       => array( 'wc-completed', 'wc-processing', 'wc-on-hold' ),
                 'date_created' => $start . '...' . ( $end - 1 ),
@@ -515,7 +523,7 @@ class MainWP_Child_WooCommerce_Status {
                 return 0 !== $compare ? $compare : $left['product_id'] <=> $right['product_id'];
             }
         );
-        $inventory = $this->abilities_v2_inventory_counts();
+        $inventory = $this->abilities_v2_inventory_snapshot();
         if ( ! is_array( $inventory ) ) {
             return false;
         }
@@ -528,7 +536,7 @@ class MainWP_Child_WooCommerce_Status {
             'order_count'           => $returned,
             'total_orders'          => $result->total,
             'currency_totals'       => array_values( $currency_totals ),
-            'top_sellers'           => array_values( $sellers ),
+            'top_sellers'           => array_slice( array_values( $sellers ), 0, $payload['top_limit'] ),
             'processing_orders'     => $inventory['processing_orders'],
             'on_hold_orders'        => $inventory['on_hold_orders'],
             'low_stock'             => $inventory['low_stock'],
@@ -542,18 +550,19 @@ class MainWP_Child_WooCommerce_Status {
     }
 
     /**
-     * Bind every page to a stable order-set generation without exposing order data.
+     * Bind every page to a stable order-set and inventory generation without exposing order data.
      *
      * @param array $payload Closed report identity.
      * @return string|false
      */
     protected function abilities_v2_source_generation( $payload ) {
-        if ( ! function_exists( 'wc_get_orders' ) ) {
+        $inventory = $this->abilities_v2_inventory_snapshot();
+        if ( ! is_array( $inventory ) ) {
             return false;
         }
         $start  = $this->abilities_v2_utc_timestamp( $payload['start_at'] );
         $end    = $this->abilities_v2_utc_timestamp( $payload['end_at'] );
-        $result = wc_get_orders(
+        $result = $this->abilities_v2_query_orders(
             array(
                 'status'       => array( 'wc-completed', 'wc-processing', 'wc-on-hold' ),
                 'date_created' => $start . '...' . ( $end - 1 ),
@@ -567,28 +576,61 @@ class MainWP_Child_WooCommerce_Status {
         if ( ! is_object( $result ) || ! isset( $result->orders, $result->total ) || ! is_array( $result->orders ) || ! is_int( $result->total ) || 0 > $result->total || 100000 < $result->total || 1 < count( $result->orders ) ) {
             return false;
         }
-        $latest = empty( $result->orders ) ? null : reset( $result->orders );
-        if ( null === $latest ) {
-            return hash( 'sha256', 'empty|0' );
-        }
-        if ( ! is_object( $latest ) || ! method_exists( $latest, 'get_id' ) || ! method_exists( $latest, 'get_date_modified' ) ) {
-            return false;
-        }
-        $modified = $latest->get_date_modified();
-        $order_id = (int) $latest->get_id();
-        if ( 1 > $order_id || ! is_object( $modified ) || ! method_exists( $modified, 'getTimestamp' ) ) {
-            return false;
+        $latest        = empty( $result->orders ) ? null : reset( $result->orders );
+        $order_binding = array( 'empty', 0, 0 );
+        if ( null !== $latest ) {
+            if ( ! is_object( $latest ) || ! method_exists( $latest, 'get_id' ) || ! method_exists( $latest, 'get_date_modified' ) ) {
+                return false;
+            }
+            $modified = $latest->get_date_modified();
+            $order_id = (int) $latest->get_id();
+            if ( 1 > $order_id || ! is_object( $modified ) || ! method_exists( $modified, 'getTimestamp' ) ) {
+                return false;
+            }
+            $order_binding = array( $result->total, $order_id, (int) $modified->getTimestamp() );
         }
 
-        return hash( 'sha256', wp_json_encode( array( $result->total, $order_id, (int) $modified->getTimestamp() ) ) );
+        return hash(
+            'sha256',
+            wp_json_encode(
+                array(
+                    $order_binding,
+                    // The inventory counts ride in the generation so a stock or order-state
+                    // change between pages surfaces as preparation_drift instead of two pages
+                    // of one generation quietly disagreeing.
+                    array( $inventory['processing_orders'], $inventory['on_hold_orders'], $inventory['low_stock'], $inventory['out_of_stock'] ),
+                )
+            )
+        );
+    }
+
+    /**
+     * Run one bounded WooCommerce order query.
+     *
+     * @param array $args Query arguments.
+     * @return object|false
+     */
+    protected function abilities_v2_query_orders( $args ) {
+        if ( ! function_exists( 'wc_get_orders' ) ) {
+            return false;
+        }
+        return wc_get_orders( $args );
+    }
+
+    /** Read the request's single inventory capture. */
+    private function abilities_v2_inventory_snapshot() {
+        if ( null === $this->abilities_v2_inventory_memo ) {
+            $this->abilities_v2_inventory_memo = $this->abilities_v2_inventory_counts();
+        }
+        return $this->abilities_v2_inventory_memo;
     }
 
     /** Read separately timestamped order and stock counts. */
     protected function abilities_v2_inventory_counts() {
-        if ( ! function_exists( 'wc_get_orders' ) || ! function_exists( 'wc_get_products' ) ) {
+        if ( ! function_exists( 'wc_get_products' ) ) {
             return false;
         }
-        $processing = wc_get_orders(
+        $processing = $this->abilities_v2_query_orders(
             array(
                 'status'   => 'wc-processing',
                 'limit'    => 1,
@@ -596,20 +638,12 @@ class MainWP_Child_WooCommerce_Status {
                 'return'   => 'ids',
             )
         );
-        $on_hold    = wc_get_orders(
+        $on_hold    = $this->abilities_v2_query_orders(
             array(
                 'status'   => 'wc-on-hold',
                 'limit'    => 1,
                 'paginate' => true,
                 'return'   => 'ids',
-            )
-        );
-        $low        = wc_get_products(
-            array(
-                'stock_status' => 'onbackorder',
-                'limit'        => 1,
-                'paginate'     => true,
-                'return'       => 'ids',
             )
         );
         $out        = wc_get_products(
@@ -620,18 +654,56 @@ class MainWP_Child_WooCommerce_Status {
                 'return'       => 'ids',
             )
         );
-        foreach ( array( $processing, $on_hold, $low, $out ) as $counted ) {
+        foreach ( array( $processing, $on_hold, $out ) as $counted ) {
             if ( ! is_object( $counted ) || ! isset( $counted->total ) || ! is_int( $counted->total ) || 0 > $counted->total || 10000 < $counted->total ) {
                 return false;
             }
         }
+        $low = $this->abilities_v2_low_stock_count();
+        if ( false === $low ) {
+            return false;
+        }
         return array(
             'processing_orders'     => $processing->total,
             'on_hold_orders'        => $on_hold->total,
-            'low_stock'             => $low->total,
+            'low_stock'             => $low,
             'out_of_stock'          => $out->total,
             'inventory_observed_at' => gmdate( 'Y-m-d\TH:i:s\Z' ),
         );
+    }
+
+    /**
+     * Count stock-managed products sitting at or below the store's low-stock threshold.
+     *
+     * Mirrors the v1 sync figure: WooCommerce has no low-stock query var, and its
+     * 'onbackorder' stock status counts a different thing entirely — stores that never
+     * enable backorders have none, which is how v2 came to report zero.
+     *
+     * @return int|false
+     */
+    protected function abilities_v2_low_stock_count() {
+        global $wpdb;
+
+        $low     = absint( max( get_option( 'woocommerce_notify_low_stock_amount' ), 1 ) );
+        $no      = absint( max( get_option( 'woocommerce_notify_no_stock_amount' ), 0 ) );
+        $counted = $wpdb->get_var( // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Bounded count with no cacheable identity.
+            $wpdb->prepare(
+                "SELECT COUNT( DISTINCT posts.ID )
+                FROM {$wpdb->posts} AS posts
+                INNER JOIN {$wpdb->postmeta} AS stock ON posts.ID = stock.post_id AND stock.meta_key = '_stock'
+                LEFT JOIN {$wpdb->postmeta} AS managed ON posts.ID = managed.post_id AND managed.meta_key = '_manage_stock'
+                WHERE posts.post_type IN ( 'product', 'product_variation' )
+                AND posts.post_status = 'publish'
+                AND stock.meta_value != ''
+                AND CAST( stock.meta_value AS SIGNED ) <= %d
+                AND CAST( stock.meta_value AS SIGNED ) > %d
+                AND ( managed.meta_value = 'yes' OR posts.post_type = 'product_variation' )", // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- Only table names are interpolated.
+                $low,
+                $no
+            )
+        );
+
+        return null === $counted || 10000 < (int) $counted ? false : (int) $counted;
     }
 
     /**
@@ -643,7 +715,7 @@ class MainWP_Child_WooCommerce_Status {
      */
     private function abilities_v2_valid_page_data( $page, $payload ) {
         $keys = array( 'next_cursor', 'complete', 'page_size', 'order_count', 'total_orders', 'currency_totals', 'top_sellers', 'processing_orders', 'on_hold_orders', 'low_stock', 'out_of_stock', 'inventory_observed_at', 'generated_at', 'source', 'storage_mode', 'accounting_profile' );
-        if ( ! $this->abilities_v2_exact_keys( $page, $keys ) || ! is_bool( $page['complete'] ) || $page['page_size'] !== $payload['page_size'] || ! is_int( $page['order_count'] ) || 0 > $page['order_count'] || $payload['page_size'] < $page['order_count'] || ! is_int( $page['total_orders'] ) || 0 > $page['total_orders'] || 100000 < $page['total_orders'] || ( $page['complete'] && null !== $page['next_cursor'] ) || ( ! $page['complete'] && ( ! is_int( $page['next_cursor'] ) || 1 > $page['next_cursor'] || 100000 < $page['next_cursor'] ) ) || ! is_array( $page['currency_totals'] ) || 20 < count( $page['currency_totals'] ) || ! is_array( $page['top_sellers'] ) || 10000 < count( $page['top_sellers'] ) || 'woocommerce_crud' !== $page['source'] || 'net-order-total-v1' !== $page['accounting_profile'] || ! in_array( $page['storage_mode'], array( 'hpos', 'legacy' ), true ) ) {
+        if ( ! $this->abilities_v2_exact_keys( $page, $keys ) || ! is_bool( $page['complete'] ) || $page['page_size'] !== $payload['page_size'] || ! is_int( $page['order_count'] ) || 0 > $page['order_count'] || $payload['page_size'] < $page['order_count'] || ! is_int( $page['total_orders'] ) || 0 > $page['total_orders'] || 100000 < $page['total_orders'] || ( $page['complete'] && null !== $page['next_cursor'] ) || ( ! $page['complete'] && ( ! is_int( $page['next_cursor'] ) || 1 > $page['next_cursor'] || 100000 < $page['next_cursor'] ) ) || ! is_array( $page['currency_totals'] ) || 20 < count( $page['currency_totals'] ) || ! is_array( $page['top_sellers'] ) || $payload['top_limit'] < count( $page['top_sellers'] ) || 'woocommerce_crud' !== $page['source'] || 'net-order-total-v1' !== $page['accounting_profile'] || ! in_array( $page['storage_mode'], array( 'hpos', 'legacy' ), true ) ) {
             return false;
         }
         foreach ( array( 'processing_orders', 'on_hold_orders', 'low_stock', 'out_of_stock' ) as $field ) {
@@ -826,33 +898,6 @@ class MainWP_Child_WooCommerce_Status {
             && 10000 >= $response['queued_callbacks']
             && in_array( $response['state'], array( 'requested', 'completed', 'reconciliation_required' ), true )
             && ( null === $payload || ( $payload['request_ref'] === $response['request_ref'] && $payload['site_fingerprint'] === $response['site_fingerprint'] ) );
-    }
-
-    /**
-     * Record one complete v2 observation for database-update completion proof.
-     *
-     * @param string $generation Observation generation.
-     * @param string $observed_at Observation timestamp.
-     * @return bool
-     */
-    protected function abilities_v2_record_observation( $generation, $observed_at ) {
-        $timestamp = $this->abilities_v2_utc_timestamp( $observed_at );
-        if ( ! $this->abilities_v2_digest( $generation ) || false === $timestamp ) {
-            return false;
-        }
-        $record   = array(
-            'generation'  => $generation,
-            'observed_at' => $timestamp,
-        );
-        $written  = update_option( 'mainwp_wc_status_v2_last_observation', $record, false );
-        $readback = get_option( 'mainwp_wc_status_v2_last_observation', null );
-        return ( $written || $readback === $record ) && $readback === $record;
-    }
-
-    /** Read the latest complete v2 observation marker. */
-    protected function abilities_v2_observation() {
-        $record = get_option( 'mainwp_wc_status_v2_last_observation', null );
-        return is_array( $record ) && $this->abilities_v2_exact_keys( $record, array( 'generation', 'observed_at' ) ) && $this->abilities_v2_digest( $record['generation'] ) && is_int( $record['observed_at'] ) && 0 < $record['observed_at'] ? $record : null;
     }
 
     /**

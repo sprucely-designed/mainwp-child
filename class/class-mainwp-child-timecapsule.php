@@ -352,7 +352,6 @@ class MainWP_Child_Timecapsule { //phpcs:ignore -- NOSONAR - multi methods.
     // phpcs:disable Generic.Commenting.DocComment.MissingShort,Squiz.Commenting.FunctionComment,Generic.Formatting.MultipleStatementAlignment,WordPress.Arrays.ArrayDeclarationSpacing.AssociativeArrayFound,WordPress.Arrays.MultipleStatementAlignment,WordPress.PHP.YodaConditions.NotYoda,WordPress.PHP.DiscouragedPHPFunctions.obfuscation_base64_encode -- Closed protocol block follows the legacy file's compact style.
     public function abilities_v2( $request ) { // phpcs:ignore Generic.Metrics.CyclomaticComplexity.TooHigh -- Closed protocol dispatcher is easier to audit linearly.
         $operation = is_array( $request ) && isset( $request['operation'] ) && is_string( $request['operation'] ) ? $request['operation'] : 'unknown';
-        $reads     = array( 'site', 'policy', 'list_backups', 'operation_status', 'preview_restore', 'list_staging' );
         $mutations = array( 'replace_policy', 'start_backup', 'cancel_operation', 'restore_backup', 'start_staging', 'delete_staging' );
         $root_keys = in_array( $operation, $mutations, true ) ? array( 'protocol', 'operation', 'request_ref', 'payload' ) : array( 'protocol', 'operation', 'payload' );
         if ( ! is_array( $request ) || ! $this->abilities_v2_exact_keys( $request, $root_keys ) || '2' !== ( isset( $request['protocol'] ) ? $request['protocol'] : null ) || ! isset( $request['payload'] ) || ! is_array( $request['payload'] ) ) {
@@ -363,16 +362,21 @@ class MainWP_Child_Timecapsule { //phpcs:ignore -- NOSONAR - multi methods.
             if ( array() !== $request['payload'] ) {
                 return $this->abilities_v2_error( $operation );
             }
+            $supported = $this->abilities_v2_supported_operations();
             return array(
                 'protocol'           => '2',
                 'operation'          => 'capabilities',
                 'ok'                 => true,
-                'operations'         => array_merge( array( 'site', 'policy' ), array( 'replace_policy', 'list_backups', 'start_backup', 'operation_status', 'cancel_operation', 'preview_restore', 'restore_backup', 'list_staging', 'start_staging', 'delete_staging' ) ),
-                'mutation_supported' => true,
+                'operations'         => $supported,
+                'mutation_supported' => array() !== array_intersect( $mutations, $supported ),
             );
         }
-        if ( ! in_array( $operation, array_merge( $reads, $mutations ), true ) || ! $this->abilities_v2_valid_payload( $operation, $request['payload'] ) ) {
-            return $this->abilities_v2_error( $operation, in_array( $operation, array_merge( $reads, $mutations ), true ) ? 'invalid_request' : 'unsupported_operation' );
+        // Anything this Child cannot execute is refused by name, whether the protocol knows it or not.
+        if ( ! in_array( $operation, $this->abilities_v2_supported_operations(), true ) ) {
+            return $this->abilities_v2_error( $operation, 'unsupported_operation' );
+        }
+        if ( ! $this->abilities_v2_valid_payload( $operation, $request['payload'] ) ) {
+            return $this->abilities_v2_error( $operation );
         }
 
         if ( in_array( $operation, array( 'site', 'policy' ), true ) ) {
@@ -385,16 +389,19 @@ class MainWP_Child_Timecapsule { //phpcs:ignore -- NOSONAR - multi methods.
 
         $effect_hash = hash( 'sha256', wp_json_encode( array( $operation, $request['payload'] ) ) );
         $receipts    = array();
+        $request_ref = null;
         if ( in_array( $operation, $mutations, true ) ) {
             if ( ! $this->abilities_v2_valid_request_ref( $request['request_ref'] ) ) {
                 return $this->abilities_v2_error( $operation );
             }
-            $receipts = get_option( 'mainwp_timecapsule_abilities_v2_receipts', array() );
+            // The reference is validated case-insensitively, so it has to be folded before it keys a receipt.
+            $request_ref = strtolower( $request['request_ref'] );
+            $receipts    = get_option( 'mainwp_timecapsule_abilities_v2_receipts', array() );
             if ( ! is_array( $receipts ) ) {
                 return $this->abilities_v2_error( $operation, 'storage_unavailable' );
             }
-            if ( isset( $receipts[ $request['request_ref'] ] ) ) {
-                $receipt = $receipts[ $request['request_ref'] ];
+            if ( isset( $receipts[ $request_ref ] ) ) {
+                $receipt = $receipts[ $request_ref ];
                 if ( ! is_array( $receipt ) || ! $this->abilities_v2_exact_keys( $receipt, array( 'effect_hash', 'response' ) ) || ! is_string( $receipt['effect_hash'] ) || ! is_array( $receipt['response'] ) ) {
                     return $this->abilities_v2_error( $operation, 'storage_unavailable' );
                 }
@@ -421,19 +428,32 @@ class MainWP_Child_Timecapsule { //phpcs:ignore -- NOSONAR - multi methods.
                 'operation' => $operation,
                 'ok'        => true,
             ),
-            in_array( $operation, $mutations, true ) ? array( 'request_ref' => $request['request_ref'] ) : array(),
+            in_array( $operation, $mutations, true ) ? array( 'request_ref' => $request_ref ) : array(),
             $result
         );
         if ( in_array( $operation, $mutations, true ) ) {
             if ( 100 <= count( $receipts ) ) {
                 array_shift( $receipts );
             }
-            $receipts[ $request['request_ref'] ] = array( 'effect_hash' => $effect_hash, 'response' => $response );
+            $receipts[ $request_ref ] = array( 'effect_hash' => $effect_hash, 'response' => $response );
             if ( ! update_option( 'mainwp_timecapsule_abilities_v2_receipts', $receipts, false ) && $receipts !== get_option( 'mainwp_timecapsule_abilities_v2_receipts', array() ) ) {
                 return $this->abilities_v2_error( $operation, 'outcome_unknown' );
             }
         }
         return $response;
+    }
+
+    /**
+     * List the operations this Child can actually execute.
+     *
+     * Restore and staging mutations have no Child-side adapter: they are part of
+     * the protocol but nothing here can carry them out, so they are neither
+     * advertised nor dispatched. A build that wires them extends this list.
+     *
+     * @return array Executable operation names.
+     */
+    protected function abilities_v2_supported_operations() {
+        return array( 'site', 'policy', 'list_backups', 'operation_status', 'preview_restore', 'list_staging', 'replace_policy', 'start_backup', 'cancel_operation' );
     }
 
     /**
@@ -607,16 +627,13 @@ class MainWP_Child_Timecapsule { //phpcs:ignore -- NOSONAR - multi methods.
                 return new \WP_Error( 'provider_schema_invalid' );
             }
             if ( ! $in_progress ) {
-                $last_backup = $config->get_option( 'last_backup_time' );
-                $started     = strtotime( $row['started_at'] );
-                $row['state']            = $this->abilities_v2_timestamp( $last_backup ) && (int) $last_backup >= $started ? 'succeeded' : 'uncertain';
-                $row['progress_percent'] = 'succeeded' === $row['state'] ? 100 : 0;
-                $row['finished_at']      = gmdate( 'Y-m-d\TH:i:s\Z' );
-                $row['result_ref']       = 'succeeded' === $row['state'] ? $this->abilities_v2_backup_ref( (string) $last_backup ) : null;
-                $row['generation']       = hash( 'sha256', wp_json_encode( array_diff_key( $row, array( 'generation' => true ) ) ) );
-                if ( ! $this->abilities_v2_store_operation( $row ) ) {
-                    return new \WP_Error( 'storage_unavailable' );
-                }
+                // Time Capsule keeps no per-operation outcome: last_backup_time is site-wide, so any
+                // parallel backup would satisfy a "finished after we started" comparison. Nothing here
+                // can tell this operation's success from another's, and the finish time is unknown.
+                // Derived on read only - a read must not write the operations option.
+                $row['state']      = 'uncertain';
+                $row['result_ref'] = null;
+                $row['generation'] = hash( 'sha256', wp_json_encode( array_diff_key( $row, array( 'generation' => true ) ) ) );
             }
         }
         return $row;
@@ -659,18 +676,38 @@ class MainWP_Child_Timecapsule { //phpcs:ignore -- NOSONAR - multi methods.
         if ( ! hash_equals( $generation, $payload['backup_generation'] ) ) {
             return new \WP_Error( 'stale_generation' );
         }
-        $expires = time() + 300;
-        $token   = rtrim( strtr( base64_encode( hash_hmac( 'sha256', wp_json_encode( array( $payload, $expires ) ), wp_salt( 'auth' ), true ) ), '+/', '-_' ), '=' );
+        // No preview token is minted: restore_backup has no Child-side adapter, so nothing could ever
+        // redeem one. Time Capsule exposes no per-backup table manifest, so table_count stays unknown.
         return array(
-            'preview_token'     => $token,
-            'expires_at'        => gmdate( 'Y-m-d\TH:i:s\Z', $expires ),
+            'preview_token'     => null,
+            'expires_at'        => null,
             'backup_ref'        => $payload['backup_ref'],
             'scope'             => $payload['scope'],
-            'file_count'        => 0,
-            'table_count'       => 0,
+            'file_count'        => $this->abilities_v2_processed_file_count( $raw ),
+            'table_count'       => null,
             'overwrite_expected' => true,
             'preflight'         => 'blocked',
         );
+    }
+
+    /** @param string $raw_id Provider backup identity. @return int|null Processed files, or null when the provider table cannot answer. */
+    private function abilities_v2_processed_file_count( $raw_id ) {
+        global $wpdb;
+
+        // The count doubles as the existence check. SHOW TABLES cannot serve here: it never lists
+        // temporary tables, so it answers "absent" for a table the very next query reads fine.
+        // A query error means the preview cannot answer, which is not the same as counting zero files.
+        $suppress = $wpdb->suppress_errors( true );
+        $count    = $wpdb->get_var( //phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Provider-owned table, count changes with every backup run.
+            $wpdb->prepare(
+                "SELECT COUNT(*) FROM {$wpdb->base_prefix}wptc_processed_files WHERE backupID = %d",
+                (int) $raw_id
+            )
+        );
+        $failed = '' !== $wpdb->last_error;
+        $wpdb->suppress_errors( $suppress );
+
+        return $failed || null === $count ? null : (int) $count;
     }
 
     /** @param array $payload Closed staging inventory request. @return array|WP_Error */
@@ -895,7 +932,16 @@ class MainWP_Child_Timecapsule { //phpcs:ignore -- NOSONAR - multi methods.
             return $this->abilities_v2_exact_keys( $result, array( 'operation_ref', 'state', 'quiescent' ) ) && $this->abilities_v2_valid_hash( $result['operation_ref'] ) && in_array( $result['state'], array( 'running', 'cancelled', 'reconciliation_required' ), true ) && is_bool( $result['quiescent'] );
         }
         if ( 'preview_restore' === $operation ) {
-            return $this->abilities_v2_exact_keys( $result, array( 'preview_token', 'expires_at', 'backup_ref', 'scope', 'file_count', 'table_count', 'overwrite_expected', 'preflight' ) ) && is_string( $result['preview_token'] ) && 1 === preg_match( '/^[A-Za-z0-9_-]{43,128}$/D', $result['preview_token'] ) && $this->abilities_v2_valid_date( $result['expires_at'] ) && $this->abilities_v2_valid_hash( $result['backup_ref'] ) && in_array( $result['scope'], array( 'full', 'database', 'files' ), true ) && is_int( $result['file_count'] ) && 0 <= $result['file_count'] && is_int( $result['table_count'] ) && 0 <= $result['table_count'] && is_bool( $result['overwrite_expected'] ) && in_array( $result['preflight'], array( 'ready', 'blocked' ), true );
+            if ( ! $this->abilities_v2_exact_keys( $result, array( 'preview_token', 'expires_at', 'backup_ref', 'scope', 'file_count', 'table_count', 'overwrite_expected', 'preflight' ) ) ) {
+                return false;
+            }
+            // A null token means no restore was authorized, so it may not carry an expiry; unknown
+            // counts are null rather than a fabricated zero.
+            $token = null === $result['preview_token'] ? null === $result['expires_at'] : is_string( $result['preview_token'] ) && 1 === preg_match( '/^[A-Za-z0-9_-]{43,128}$/D', $result['preview_token'] ) && null !== $result['expires_at'] && $this->abilities_v2_valid_date( $result['expires_at'] );
+            $count = static function ( $value ) {
+                return null === $value || ( is_int( $value ) && 0 <= $value );
+            };
+            return $token && $this->abilities_v2_valid_hash( $result['backup_ref'] ) && in_array( $result['scope'], array( 'full', 'database', 'files' ), true ) && $count( $result['file_count'] ) && $count( $result['table_count'] ) && is_bool( $result['overwrite_expected'] ) && in_array( $result['preflight'], array( 'ready', 'blocked' ), true );
         }
         if ( 'restore_backup' === $operation ) {
             return $this->abilities_v2_exact_keys( $result, array( 'operation_ref', 'backup_ref', 'state' ) ) && $this->abilities_v2_valid_hash( $result['operation_ref'] ) && $this->abilities_v2_valid_hash( $result['backup_ref'] ) && in_array( $result['state'], array( 'queued', 'reconciliation_required' ), true );

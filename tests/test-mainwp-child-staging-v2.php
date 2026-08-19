@@ -15,6 +15,9 @@ class Test_MainWP_Child_Staging_V2_Fixture extends MainWP_Child_Staging {
 	/** @var array */
 	public $clones = array();
 
+	/** @var string */
+	public $clone_source = 'provider';
+
 	/** @var array */
 	public $settings = array();
 
@@ -39,6 +42,11 @@ class Test_MainWP_Child_Staging_V2_Fixture extends MainWP_Child_Staging {
 	/** @return array */
 	protected function abilities_v2_provider_clones() {
 		return $this->clones;
+	}
+
+	/** @return string */
+	protected function abilities_v2_clone_source() {
+		return $this->clone_source;
 	}
 
 	/** @return array */
@@ -105,6 +113,7 @@ class Test_MainWP_Child_Staging_V2 extends WP_UnitTestCase {
 				'path'                      => $this->clone_path,
 				'url'                       => 'https://secret-clone.example.test',
 				'databasePrefix'            => 'secret_prefix_',
+				'status'                    => 'finished',
 				'isolated'                  => true,
 				'searchIndexBlocked'        => true,
 				'outboundSideEffectsBlocked' => true,
@@ -152,6 +161,7 @@ class Test_MainWP_Child_Staging_V2 extends WP_UnitTestCase {
 		$row = $result['clones'][0];
 		$this->assertMatchesRegularExpression( '/^[a-f0-9]{64}$/', $row['clone_ref'] );
 		$this->assertMatchesRegularExpression( '/^[a-f0-9]{64}$/', $row['revision'] );
+		$this->assertSame( 'ready', $row['state'] );
 		$this->assertTrue( $row['isolated'] );
 		$this->assertTrue( $row['search_index_blocked'] );
 		$this->assertTrue( $row['outbound_side_effects_blocked'] );
@@ -162,6 +172,39 @@ class Test_MainWP_Child_Staging_V2 extends WP_UnitTestCase {
 		$this->assertStringNotContainsString( 'secret_prefix_', $encoded );
 		$this->assertStringNotContainsString( $this->clone_path, $encoded );
 		$this->assertSame( 0, $this->staging->preview_calls );
+	}
+
+	/** Guards WP Staging never records report as unobserved, not as observed-off. */
+	public function test_inventory_reports_unknown_state_and_guards_when_the_provider_records_none() {
+		unset(
+			$this->staging->clones['provider-clone-secret']['status'],
+			$this->staging->clones['provider-clone-secret']['isolated'],
+			$this->staging->clones['provider-clone-secret']['searchIndexBlocked'],
+			$this->staging->clones['provider-clone-secret']['outboundSideEffectsBlocked']
+		);
+
+		$row = $this->invoke_v2( 'inventory', array() )['clones'][0];
+
+		$this->assertSame( 'unknown', $row['state'] );
+		$this->assertNull( $row['isolated'] );
+		$this->assertNull( $row['search_index_blocked'] );
+		$this->assertNull( $row['outbound_side_effects_blocked'] );
+	}
+
+	/** An interrupted clone is not reported as ready. */
+	public function test_inventory_reports_an_unfinished_clone_as_incomplete() {
+		$this->staging->clones['provider-clone-secret']['status'] = 'unfinished';
+
+		$this->assertSame( 'incomplete', $this->invoke_v2( 'inventory', array() )['clones'][0]['state'] );
+	}
+
+	/** The pre-registry option fallback cannot claim a complete clone set. */
+	public function test_legacy_option_fallback_is_not_reported_as_complete() {
+		$this->assertTrue( $this->invoke_v2( 'inventory', array() )['complete'] );
+
+		$this->staging->clone_source = 'legacy_option';
+
+		$this->assertFalse( $this->invoke_v2( 'inventory', array() )['complete'] );
 	}
 
 	/** Settings are clamped to the public policy and private fields are absent. */
@@ -228,6 +271,11 @@ class Test_MainWP_Child_Staging_V2 extends WP_UnitTestCase {
 			array( 'protocol' => '2', 'operation' => 'inventory', 'payload' => array(), 'extra' => true ),
 			array( 'protocol' => '2', 'operation' => 'preview', 'payload' => array( 'kind' => 'create', 'clone_ref' => str_repeat( 'a', 64 ) ) ),
 			array( 'protocol' => '2', 'operation' => 'preview', 'payload' => array( 'kind' => 'update', 'clone_ref' => null ) ),
+			array( 'protocol' => '2', 'operation' => 'inventory', 'payload' => 'not-an-array' ),
+			array( 'protocol' => '2', 'operation' => 'inventory' ),
+			array( 'protocol' => '2', 'operation' => 'create_clone', 'request_ref' => '123e4567-e89b-42d3-a456-426614174940', 'payload' => 'not-an-array' ),
+			array( 'protocol' => '2', 'operation' => 'create_clone', 'request_ref' => '123e4567-e89b-42d3-a456-426614174941', 'payload' => array( 'inventory_revision' => str_repeat( 'a', 64 ) ), 'extra' => true ),
+			array( 'protocol' => '2', 'operation' => 'create_clone', 'payload' => array( 'inventory_revision' => str_repeat( 'a', 64 ) ) ),
 		);
 		foreach ( $cases as $case ) {
 			$result = $this->staging->abilities_v2( $case );
@@ -235,6 +283,7 @@ class Test_MainWP_Child_Staging_V2 extends WP_UnitTestCase {
 			$this->assertArrayHasKey( 'error_code', $result );
 		}
 		$this->assertSame( 0, $this->staging->preview_calls );
+		$this->assertSame( array(), $this->staging->operation_calls );
 	}
 
 	/** Settings replacement preserves hidden fields and replays without a second write. */

@@ -42,9 +42,16 @@ class Test_MainWP_Child_BackupBuddy_V2_Fixture extends MainWP_Child_Back_Up_Budd
 	/** @var bool */
 	public $transfer_result = true;
 
+	/** @var bool */
+	public $release_result = true;
+
 	/** Avoid product hooks in the isolated fixture. */
 	public function __construct() {
 		$this->is_backupbuddy_installed = true;
+	}
+
+	/** The fixture supplies provider state directly, so no globally defined provider class may decide these tests. */
+	protected function abilities_v2_load_provider() {
 	}
 
 	/** @return int */
@@ -100,7 +107,7 @@ class Test_MainWP_Child_BackupBuddy_V2_Fixture extends MainWP_Child_Back_Up_Budd
 			return false;
 		}
 		$this->lock_held = false;
-		return true;
+		return $this->release_result;
 	}
 
 	/**
@@ -166,8 +173,11 @@ class Test_MainWP_Child_BackupBuddy_V2_Fixture extends MainWP_Child_Back_Up_Budd
 /**
  * Smallest usable stand-in for the BackupBuddy load seam. The production loader only ever calls
  * plugin_path(), load(), and reads $options, so the ordering it must honour is observable here.
+ *
+ * Named for this file and aliased onto the provider name inside set_up(), so loading the suite
+ * never puts a fake BackupBuddy in front of another test file's bridge.
  */
-class pb_backupbuddy { // phpcs:ignore PEAR.NamingConventions.ValidClassName.StartWithCapital -- The provider class name is fixed by BackupBuddy.
+class Test_MainWP_BackupBuddy_Provider_Stub {
 
 	/** @var array|null */
 	public static $options;
@@ -202,7 +212,7 @@ class pb_backupbuddy { // phpcs:ignore PEAR.NamingConventions.ValidClassName.Sta
 }
 
 /** Stand-in for the BackupBuddy core helpers the archive and delete paths call statically. */
-class backupbuddy_core { // phpcs:ignore PEAR.NamingConventions.ValidClassName.StartWithCapital -- The provider class name is fixed by BackupBuddy.
+class Test_MainWP_BackupBuddy_Core_Stub {
 
 	/** @var string */
 	public static $backup_directory = '';
@@ -258,24 +268,39 @@ class Test_MainWP_Child_BackupBuddy_V2_Provider_Boundary extends WP_UnitTestCase
 
 	public function set_up(): void {
 		parent::set_up();
+		// The production code calls \pb_backupbuddy and \backupbuddy_core by their fixed names. Claim
+		// those names here rather than at file scope, and refuse to run against anyone else's version.
+		foreach (
+			array(
+				'pb_backupbuddy'   => Test_MainWP_BackupBuddy_Provider_Stub::class,
+				'backupbuddy_core' => Test_MainWP_BackupBuddy_Core_Stub::class,
+			) as $provider => $stub
+		) {
+			if ( ! class_exists( $provider, false ) ) {
+				class_alias( $stub, $provider );
+			} elseif ( ! is_a( $provider, $stub, true ) ) {
+				$this->markTestSkipped( $provider . ' is already defined elsewhere, so this provider boundary cannot be observed.' );
+			}
+		}
 		$this->root = rtrim( get_temp_dir(), '/' ) . '/mainwp-bb-v2-' . wp_generate_password( 12, false );
 		wp_mkdir_p( $this->root . '/backups' );
 		wp_mkdir_p( $this->root . '/logs/fileoptions' );
 		wp_mkdir_p( $this->root . '/plugin/classes' );
 		// The archive scan resolves symlinked temp paths, so the fixture must speak the resolved form too.
 		$this->root = realpath( $this->root );
-		backupbuddy_core::$backup_directory = $this->root . '/backups/';
-		backupbuddy_core::$log_directory    = $this->root . '/logs/';
-		pb_backupbuddy::$path               = $this->root . '/plugin';
-		pb_backupbuddy::$options            = null;
-		pb_backupbuddy::$load_calls         = 0;
+		Test_MainWP_BackupBuddy_Core_Stub::$backup_directory = $this->root . '/backups/';
+		Test_MainWP_BackupBuddy_Core_Stub::$log_directory    = $this->root . '/logs/';
+		Test_MainWP_BackupBuddy_Provider_Stub::$path         = $this->root . '/plugin';
+		Test_MainWP_BackupBuddy_Provider_Stub::$options      = null;
+		Test_MainWP_BackupBuddy_Provider_Stub::$load_calls   = 0;
 		delete_option( 'mainwp_backupbuddy_ability_operations_v1' );
 		delete_option( 'mainwp_backupbuddy_ability_effect_lock_v1' );
 	}
 
 	public function tear_down(): void {
 		$this->remove_tree( $this->root );
-		pb_backupbuddy::$options = null;
+		Test_MainWP_BackupBuddy_Provider_Stub::$options = null;
+		unset( $GLOBALS['mainwp_test_bb_core_loaded'], $GLOBALS['mainwp_test_bb_v1_core_path'] );
 		delete_option( 'mainwp_backupbuddy_ability_operations_v1' );
 		delete_option( 'mainwp_backupbuddy_ability_effect_lock_v1' );
 		parent::tear_down();
@@ -302,11 +327,11 @@ class Test_MainWP_Child_BackupBuddy_V2_Provider_Boundary extends WP_UnitTestCase
 
 	/** Deleting an archive reports the outcome the filesystem actually has, and the receipt settles. */
 	public function test_delete_archive_effect_reports_real_filesystem_outcome() {
-		$archive_path = backupbuddy_core::$backup_directory . 'backup-example_com-full-serial01.zip';
+		$archive_path = Test_MainWP_BackupBuddy_Core_Stub::$backup_directory . 'backup-example_com-full-serial01.zip';
 		file_put_contents( $archive_path, str_repeat( 'z', 64 ) );
 		$auxiliary = array(
-			backupbuddy_core::$log_directory . 'fileoptions/serial01.txt',
-			backupbuddy_core::$log_directory . 'fileoptions/serial01.txt.lock',
+			Test_MainWP_BackupBuddy_Core_Stub::$log_directory . 'fileoptions/serial01.txt',
+			Test_MainWP_BackupBuddy_Core_Stub::$log_directory . 'fileoptions/serial01.txt.lock',
 		);
 		foreach ( $auxiliary as $file ) {
 			file_put_contents( $file, 'x' );
@@ -332,7 +357,7 @@ class Test_MainWP_Child_BackupBuddy_V2_Provider_Boundary extends WP_UnitTestCase
 		);
 		$deleted = $fixture->abilities_v2( $request );
 
-		$this->assertArrayNotHasKey( 'error', $deleted, 'A completed unlink must not be reported as an unknown outcome.' );
+		$this->assertArrayNotHasKey( 'code', $deleted, 'A completed unlink must not be reported as an unknown outcome.' );
 		$this->assertTrue( $deleted['deleted'] );
 		$this->assertFalse( $deleted['already_absent'] );
 		$this->assertSame( 2, $deleted['auxiliary_records_removed'] );
@@ -350,11 +375,11 @@ class Test_MainWP_Child_BackupBuddy_V2_Provider_Boundary extends WP_UnitTestCase
 	 * filter lets a site remove the file through its own storage layer and report failure.
 	 */
 	public function test_delete_archive_is_decided_by_readback_not_by_the_return_value() {
-		$archive_path = backupbuddy_core::$backup_directory . 'backup-example_com-full-serial03.zip';
+		$archive_path = Test_MainWP_BackupBuddy_Core_Stub::$backup_directory . 'backup-example_com-full-serial03.zip';
 		file_put_contents( $archive_path, str_repeat( 'z', 64 ) );
 		$auxiliary = array(
-			backupbuddy_core::$log_directory . 'fileoptions/serial03.txt',
-			backupbuddy_core::$log_directory . 'fileoptions/serial03.txt.lock',
+			Test_MainWP_BackupBuddy_Core_Stub::$log_directory . 'fileoptions/serial03.txt',
+			Test_MainWP_BackupBuddy_Core_Stub::$log_directory . 'fileoptions/serial03.txt.lock',
 		);
 		foreach ( $auxiliary as $file ) {
 			file_put_contents( $file, 'x' );
@@ -391,7 +416,7 @@ class Test_MainWP_Child_BackupBuddy_V2_Provider_Boundary extends WP_UnitTestCase
 		$deleted = $fixture->abilities_v2( $request );
 
 		$this->assertFileDoesNotExist( $archive_path );
-		$this->assertArrayNotHasKey( 'error', $deleted, 'A removed archive must not be reported as an unknown outcome.' );
+		$this->assertArrayNotHasKey( 'code', $deleted, 'A removed archive must not be reported as an unknown outcome.' );
 		$this->assertTrue( $deleted['deleted'] );
 		$this->assertSame( 2, $deleted['auxiliary_records_removed'] );
 		$this->assertSame( $deleted, $fixture->abilities_v2( $request ), 'The settled receipt must replay the recorded response.' );
@@ -399,7 +424,7 @@ class Test_MainWP_Child_BackupBuddy_V2_Provider_Boundary extends WP_UnitTestCase
 
 	/** An archive that cannot be removed is reported as an unknown outcome, not a success. */
 	public function test_delete_archive_effect_reports_failure_when_the_file_survives() {
-		$directory = backupbuddy_core::$backup_directory . 'backup-example_com-full-serial02.zip';
+		$directory = Test_MainWP_BackupBuddy_Core_Stub::$backup_directory . 'backup-example_com-full-serial02.zip';
 		wp_mkdir_p( $directory );
 
 		$fixture = new Test_MainWP_Child_BackupBuddy_V2_Effect_Fixture();
@@ -418,7 +443,7 @@ class Test_MainWP_Child_BackupBuddy_V2_Provider_Boundary extends WP_UnitTestCase
 	public function test_v2_reads_see_loaded_provider_state() {
 		$core_class = 'Test_MainWP_BackupBuddy_Late_Core';
 		file_put_contents(
-			pb_backupbuddy::$path . '/classes/core.php',
+			Test_MainWP_BackupBuddy_Provider_Stub::$path . '/classes/core.php',
 			"<?php\n\$GLOBALS['mainwp_test_bb_core_loaded'] = true;\nclass " . $core_class . " {}\n"
 		);
 		unset( $GLOBALS['mainwp_test_bb_core_loaded'] );
@@ -433,7 +458,7 @@ class Test_MainWP_Child_BackupBuddy_V2_Provider_Boundary extends WP_UnitTestCase
 			)
 		);
 
-		$this->assertSame( 1, pb_backupbuddy::$load_calls, 'The dispatcher must load provider options before reading them.' );
+		$this->assertSame( 1, Test_MainWP_BackupBuddy_Provider_Stub::$load_calls, 'The dispatcher must load provider options before reading them.' );
 		$this->assertTrue( isset( $GLOBALS['mainwp_test_bb_core_loaded'] ), 'The dispatcher must require the provider core file before reading.' );
 		$this->assertSame( 2, $profiles['total'], 'A site with real profiles must not report an empty page.' );
 		$this->assertTrue( class_exists( $core_class, false ) );
@@ -451,8 +476,74 @@ class Test_MainWP_Child_BackupBuddy_V2_Provider_Boundary extends WP_UnitTestCase
 			)
 		);
 
-		$this->assertSame( 'backupbuddy_unavailable', $result['error']['code'] );
-		$this->assertSame( 0, pb_backupbuddy::$load_calls );
+		$this->assertSame( 'backupbuddy_unavailable', $result['code'] );
+		$this->assertSame( 0, Test_MainWP_BackupBuddy_Provider_Stub::$load_calls );
+	}
+
+	/** A malformed request is malformed on a site without BackupBuddy too, and never loads the provider. */
+	public function test_invalid_payload_is_invalid_request_on_a_site_without_backupbuddy() {
+		$fixture                           = new Test_MainWP_Child_BackupBuddy_V2_Effect_Fixture();
+		$fixture->is_backupbuddy_installed = false;
+
+		$bad_type = $fixture->abilities_v2(
+			array(
+				'operation' => 'list_archives',
+				'page'      => 1,
+				'per_page'  => 25,
+				'type'      => 'everything',
+			)
+		);
+		$this->assertSame( 'invalid_request', $bad_type['code'], 'An unknown archive type is an invalid request, not a missing provider.' );
+
+		$bad_kind = $fixture->abilities_v2(
+			array(
+				'operation'   => 'preview_run',
+				'target_kind' => 'site',
+				'target_ref'  => str_repeat( 'a', 24 ),
+			)
+		);
+		$this->assertSame( 'invalid_request', $bad_kind['code'], 'An unknown preview target kind is an invalid request, not a missing provider.' );
+
+		$bad_ref = $fixture->abilities_v2(
+			array(
+				'operation'            => 'delete_archive',
+				'archive_ref'          => 'too-short',
+				'expected_size_bytes'  => 1,
+				'expected_modified_at' => 1,
+				'request_ref'          => $this->request_ref,
+			)
+		);
+		$this->assertSame( 'invalid_request', $bad_ref['code'] );
+		$this->assertSame( 0, Test_MainWP_BackupBuddy_Provider_Stub::$load_calls );
+	}
+
+	/**
+	 * The legacy v1 path loads the provider core file from the configured path. Before the fix the
+	 * expression was $$this->path_core_file, a variable-variable that PHP resolves by casting $this
+	 * to a string, so every v1 action on a site whose core class was not already loaded died with a
+	 * PHP Error instead of requiring the file.
+	 */
+	public function test_legacy_action_requires_the_provider_core_file_from_the_configured_path() {
+		$core_file = Test_MainWP_BackupBuddy_Provider_Stub::$path . '/classes/core.php';
+		file_put_contents(
+			$core_file,
+			"<?php\n\$GLOBALS['mainwp_test_bb_v1_core_path'] = __FILE__;\nthrow new RuntimeException( 'mainwp-test-v1-core-loaded' );\n"
+		);
+
+		$fixture                         = new Test_MainWP_Child_BackupBuddy_V2_Effect_Fixture();
+		$fixture->backupbuddy_core_class = 'Test_MainWP_BackupBuddy_Absent_Core';
+		$_POST['mwp_action']             = 'get_notifications';
+
+		$thrown = null;
+		try {
+			$fixture->action();
+		} catch ( \Throwable $throwable ) {
+			$thrown = $throwable;
+		}
+
+		$this->assertInstanceOf( RuntimeException::class, $thrown, 'v1 must reach the required core file instead of failing on the path expression.' );
+		$this->assertSame( 'mainwp-test-v1-core-loaded', $thrown->getMessage() );
+		$this->assertSame( $core_file, $GLOBALS['mainwp_test_bb_v1_core_path'] );
 	}
 }
 
@@ -560,7 +651,7 @@ class Test_MainWP_Child_BackupBuddy_Abilities_V2 extends WP_UnitTestCase {
 				'extra'     => 'PRIVATE',
 			)
 		);
-		$this->assertSame( 'invalid_request', $result['error']['code'] );
+		$this->assertSame( 'invalid_request', $result['code'] );
 		$this->assertStringNotContainsString( 'PRIVATE', wp_json_encode( $result ) );
 
 		$result = $this->dispatch(
@@ -659,7 +750,7 @@ class Test_MainWP_Child_BackupBuddy_Abilities_V2 extends WP_UnitTestCase {
 				'request_ref'   => $this->request_ref,
 			)
 		);
-		$this->assertSame( 'preview_stale', $result['error']['code'] );
+		$this->assertSame( 'preview_stale', $result['code'] );
 		$this->assertSame( array(), $fixture->effects );
 	}
 
@@ -721,7 +812,7 @@ class Test_MainWP_Child_BackupBuddy_Abilities_V2 extends WP_UnitTestCase {
 				'target_ref'  => $schedule_ref,
 			)
 		);
-		$this->assertSame( 'request_conflict', $result['error']['code'] );
+		$this->assertSame( 'request_conflict', $result['code'] );
 
 		$fixture = $this->fixture();
 		$fixture->options['schedules'][8]['remote_destinations'] = range( 1, 11 );
@@ -741,7 +832,7 @@ class Test_MainWP_Child_BackupBuddy_Abilities_V2 extends WP_UnitTestCase {
 				'target_ref'  => $schedule_ref,
 			)
 		);
-		$this->assertSame( 'too_large', $result['error']['code'] );
+		$this->assertSame( 'too_large', $result['code'] );
 	}
 
 	/** Start, replay, status, and cancellation use one durable operation identity. */
@@ -852,7 +943,7 @@ class Test_MainWP_Child_BackupBuddy_Abilities_V2 extends WP_UnitTestCase {
 				'delete_local_after' => false,
 			)
 		);
-		$this->assertSame( 'request_conflict', $result['error']['code'] );
+		$this->assertSame( 'request_conflict', $result['code'] );
 	}
 
 	/** Archive delete is metadata-bound, verified, replay-safe, and exact. */
@@ -942,7 +1033,7 @@ class Test_MainWP_Child_BackupBuddy_Abilities_V2 extends WP_UnitTestCase {
 			'request_ref'          => $this->request_ref,
 		);
 		$busy               = $this->dispatch( $fixture, $delete_request );
-		$this->assertSame( 'lock_busy', $busy['error']['code'] );
+		$this->assertSame( 'lock_busy', $busy['code'] );
 		$this->assertSame( array(), $fixture->effects );
 
 		$fixture->lock_busy = false;
@@ -978,7 +1069,7 @@ class Test_MainWP_Child_BackupBuddy_Abilities_V2 extends WP_UnitTestCase {
 			'delete_local_after' => false,
 		);
 		$failed                   = $this->dispatch( $fixture, $request );
-		$this->assertSame( 'effect_failed', $failed['error']['code'] );
+		$this->assertSame( 'effect_failed', $failed['code'] );
 		$replay = $this->dispatch( $fixture, $request );
 		$this->assertSame( 'failed', $replay['operation']['state'] );
 	}
@@ -997,7 +1088,7 @@ class Test_MainWP_Child_BackupBuddy_Abilities_V2 extends WP_UnitTestCase {
 				'operation_ref' => str_repeat( 'a', 24 ),
 			)
 		);
-		$this->assertSame( 'storage_failed', $result['error']['code'] );
+		$this->assertSame( 'storage_failed', $result['code'] );
 	}
 
 	/** Tampered refs, invalid UUID names, and private input never escape. */
@@ -1020,7 +1111,7 @@ class Test_MainWP_Child_BackupBuddy_Abilities_V2 extends WP_UnitTestCase {
 				'target_ref'  => $tampered,
 			)
 		);
-		$this->assertSame( 'not_found', $result['error']['code'] );
+		$this->assertSame( 'not_found', $result['code'] );
 
 		$result = $this->dispatch(
 			$fixture,
@@ -1031,7 +1122,198 @@ class Test_MainWP_Child_BackupBuddy_Abilities_V2 extends WP_UnitTestCase {
 				'request_ref'   => 'bad-id',
 			)
 		);
-		$this->assertSame( 'invalid_request', $result['error']['code'] );
+		$this->assertSame( 'invalid_request', $result['code'] );
 		$this->assertStringNotContainsString( 'PRIVATE', wp_json_encode( $result ) );
+	}
+
+	/**
+	 * Protocol errors are a flat envelope with a scalar code, like every other v2 bridge. The
+	 * Dashboard reads $information['error'] as a string, so an array under that reserved key was
+	 * unreadable to it.
+	 */
+	public function test_protocol_errors_are_a_flat_scalar_code_envelope() {
+		$fixture = $this->fixture();
+		$result  = $this->dispatch(
+			$fixture,
+			array(
+				'operation'     => 'get_operation',
+				'operation_ref' => str_repeat( 'a', 24 ),
+			)
+		);
+
+		$this->assertSame( array( 'protocol', 'operation', 'ok', 'code' ), array_keys( $result ) );
+		$this->assertSame( '2', $result['protocol'] );
+		$this->assertSame( 'get_operation', $result['operation'] );
+		$this->assertFalse( $result['ok'] );
+		$this->assertSame( 'not_found', $result['code'] );
+		$this->assertArrayNotHasKey( 'error', $result );
+
+		$unknown = $this->dispatch( $fixture, array( 'operation' => 'PRIVATE_operation' ) );
+		$this->assertSame( 'unknown', $unknown['operation'], 'An unrecognised operation must not be echoed back.' );
+		$this->assertSame( 'invalid_request', $unknown['code'] );
+		$this->assertStringNotContainsString( 'PRIVATE', wp_json_encode( $unknown ) );
+	}
+
+	/** A committed mutation keeps its outcome when the lock release fails, and says the release failed. */
+	public function test_committed_mutation_survives_a_failed_lock_release() {
+		$fixture                 = $this->fixture();
+		$fixture->release_result = false;
+		$archive                 = $this->dispatch(
+			$fixture,
+			array(
+				'operation' => 'list_archives',
+				'page'      => 1,
+				'per_page'  => 25,
+				'type'      => 'all',
+			)
+		)['archives'][0];
+		$request                 = array(
+			'operation'            => 'delete_archive',
+			'archive_ref'          => $archive['archive_ref'],
+			'expected_size_bytes'  => $archive['size_bytes'],
+			'expected_modified_at' => $archive['modified_at'],
+			'request_ref'          => $this->request_ref,
+		);
+		$deleted                 = $this->dispatch( $fixture, $request );
+
+		$this->assertArrayNotHasKey( 'code', $deleted, 'The archive really was deleted, so the response must not be an error.' );
+		$this->assertTrue( $deleted['deleted'] );
+		$this->assertSame( 2, $deleted['auxiliary_records_removed'] );
+		$this->assertCount( 1, $fixture->archives, 'The deletion committed before the release failed.' );
+		$this->assertSame( array( 'lock_release_failed' ), $deleted['warning_codes'] );
+
+		$fixture->release_result = true;
+		$replay                  = $this->dispatch( $fixture, $request );
+		$this->assertTrue( $replay['deleted'] );
+		$this->assertArrayNotHasKey( 'warning_codes', $replay, 'A later request that released the lock has nothing to warn about.' );
+
+		$fixture                 = $this->fixture();
+		$fixture->release_result = false;
+		$profiles                = $this->dispatch(
+			$fixture,
+			array(
+				'operation' => 'list_profiles',
+				'page'      => 1,
+				'per_page'  => 25,
+			)
+		);
+		$profile_ref             = $this->full_profile_ref( $profiles );
+		$preview                 = $this->dispatch(
+			$fixture,
+			array(
+				'operation'   => 'preview_run',
+				'target_kind' => 'profile',
+				'target_ref'  => $profile_ref,
+			)
+		);
+		$started                 = $this->dispatch(
+			$fixture,
+			array(
+				'operation'     => 'start_backup',
+				'profile_ref'   => $profile_ref,
+				'preview_token' => $preview['preview_token'],
+				'request_ref'   => $this->request_ref,
+			)
+		);
+
+		$this->assertCount( 1, $fixture->effects, 'The backup was started, so the response must report the operation.' );
+		$this->assertSame( 'queued', $started['operation']['state'] );
+		$this->assertSame( array( 'lock_release_failed' ), $started['warning_codes'] );
+	}
+
+	/** An operation nothing has reported on for a day is reported unknown, not still queued. */
+	public function test_a_stalled_operation_is_reported_unknown_instead_of_in_flight() {
+		$fixture           = $this->fixture();
+		$stalled           = $this->operation_record( 1, 'queued', $fixture->now - ( 2 * DAY_IN_SECONDS ) );
+		$live              = $this->operation_record( 2, 'running', $fixture->now - 60 );
+		$fixture->records  = array(
+			'operations' => array(
+				$stalled['operation_ref'] => $stalled,
+				$live['operation_ref']    => $live,
+			),
+			'receipts'   => array(),
+		);
+
+		$stalled_status = $this->dispatch(
+			$fixture,
+			array(
+				'operation'     => 'get_operation',
+				'operation_ref' => $stalled['operation_ref'],
+			)
+		);
+		$live_status    = $this->dispatch(
+			$fixture,
+			array(
+				'operation'     => 'get_operation',
+				'operation_ref' => $live['operation_ref'],
+			)
+		);
+
+		$this->assertSame( 'unknown', $stalled_status['operation']['state'] );
+		$this->assertSame( $fixture->now - ( 2 * DAY_IN_SECONDS ), $stalled_status['operation']['updated_at'], 'Settling is not an observation, so the last-seen time stands.' );
+		$this->assertSame( 'running', $live_status['operation']['state'] );
+		$this->assertSame( 0, $fixture->writes, 'Reading an operation must not write the ledger.' );
+	}
+
+	/** Abandoned in-flight records age out, so they cannot fill the ledger and refuse every new mutation. */
+	public function test_abandoned_operations_cannot_brick_the_operation_ledger() {
+		$fixture    = $this->fixture();
+		$operations = array();
+		for ( $index = 1; $index <= 100; $index++ ) {
+			$record = $this->operation_record( $index, 'running', $fixture->now - ( 8 * DAY_IN_SECONDS ) );
+			$operations[ $record['operation_ref'] ] = $record;
+		}
+		$fixture->records = array(
+			'operations' => $operations,
+			'receipts'   => array(),
+		);
+
+		$archive = $this->dispatch(
+			$fixture,
+			array(
+				'operation' => 'list_archives',
+				'page'      => 1,
+				'per_page'  => 25,
+				'type'      => 'all',
+			)
+		)['archives'][0];
+		$deleted = $this->dispatch(
+			$fixture,
+			array(
+				'operation'            => 'delete_archive',
+				'archive_ref'          => $archive['archive_ref'],
+				'expected_size_bytes'  => $archive['size_bytes'],
+				'expected_modified_at' => $archive['modified_at'],
+				'request_ref'          => $this->request_ref,
+			)
+		);
+
+		$this->assertArrayNotHasKey( 'code', $deleted, 'Records nothing has reported on for eight days must not refuse a new mutation.' );
+		$this->assertTrue( $deleted['deleted'] );
+		$this->assertSame( array(), $fixture->records['operations'], 'The abandoned records settle and then age out.' );
+	}
+
+	/**
+	 * @param int    $index      Record index.
+	 * @param string $state      Stored state.
+	 * @param int    $updated_at Last time the Child observed the operation.
+	 * @return array
+	 */
+	private function operation_record( $index, $state, $updated_at ) {
+		$digest = hash( 'sha256', 'fixture-operation-' . $index );
+		return array(
+			'operation_ref'   => 'op.v1.' . $digest,
+			'request_ref'     => sprintf( '123e4567-e89b-42d3-a456-%012d', $index ),
+			'request_hash'    => $digest,
+			'kind'            => 'backup',
+			'state'           => $state,
+			'created_at'      => $updated_at,
+			'updated_at'      => $updated_at,
+			'progress'        => 0,
+			'archive_ref'     => null,
+			'destination_ref' => null,
+			'warnings'        => array(),
+			'serial'          => substr( $digest, 0, 10 ),
+		);
 	}
 }

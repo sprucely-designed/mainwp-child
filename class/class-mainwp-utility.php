@@ -1213,6 +1213,33 @@ class MainWP_Utility { //phpcs:ignore -- NOSONAR - multi methods.
     }
 
     /**
+     * Return the stable identity used by Reports to de-duplicate a backup.
+     *
+     * @param string $provider Backup provider slug.
+     * @param mixed  ...$parts Provider-specific identity parts.
+     * @return string
+     */
+    public static function backup_fingerprint( $provider, ...$parts ) {
+        $parts = array_map( 'strval', $parts );
+        return sanitize_key( $provider ) . ':' . implode( ':', array_map( 'sanitize_text_field', $parts ) );
+    }
+
+    /**
+     * Check the Reports fingerprint registry without writing to mainwp_stream.
+     *
+     * @param string $fingerprint Backup fingerprint.
+     * @return bool
+     */
+    public static function backup_fingerprint_logged( $fingerprint ) {
+        if ( class_exists( '\WP_MainWP_Stream\Connector_MainWP_Backups' ) && method_exists( '\WP_MainWP_Stream\Connector_MainWP_Backups', 'was_fingerprint_logged' ) ) {
+            return \WP_MainWP_Stream\Connector_MainWP_Backups::was_fingerprint_logged( $fingerprint );
+        }
+
+        // Fallback to the legacy option-based registry.
+        return true;
+    }
+
+    /**
      * Method remove_filters_by_hook_name()
      *
      * Remove filters with method name.

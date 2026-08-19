@@ -206,7 +206,13 @@ class MainWP_Child_Updraft_Plus_Backups { //phpcs:ignore -- NOSONAR - multi meth
             return false;
         }
 
-        return false !== strpos( $package, 'downloads.wordpress.org/' ) || false !== strpos( $package, 'api.wordpress.org/' );
+        $host = wp_parse_url( $package, PHP_URL_HOST );
+
+        if ( ! is_string( $host ) ) {
+            return false;
+        }
+
+        return in_array( strtolower( $host ), array( 'downloads.wordpress.org', 'api.wordpress.org' ), true );
     }
 
     /**
@@ -225,7 +231,7 @@ class MainWP_Child_Updraft_Plus_Backups { //phpcs:ignore -- NOSONAR - multi meth
 
         if ( isset( $last_backup['backup_time'] ) ) {
             $backup_time = $last_backup['backup_time'];
-            if ( $last_backup['success'] ) {
+            if ( ! empty( $last_backup['success'] ) ) {
                 MainWP_Utility::update_lasttime_backup( 'updraftplus', $backup_time );
             }
         }

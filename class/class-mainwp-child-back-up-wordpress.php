@@ -333,7 +333,7 @@ class MainWP_Child_Back_Up_WordPress {
      *
      * @used-by \MainWP\Child\MainWP_Child_Back_Up_WordPress::do_site_stats() Add support for the reporting system.
      */
-    public function do_reports_log( $ext = '' ) {
+    public function do_reports_log( $ext = '' ) {  // phpcs:ignore -- NOSONAR - complex.
         if ( 'backupwordpress' !== $ext ) {
             return;
         }
@@ -347,7 +347,10 @@ class MainWP_Child_Back_Up_WordPress {
 
             // Refresh the schedules from the database to make sure we have the latest changes.
             \HM\BackUpWordPress\Schedules::get_instance()->refresh_schedules();
-            $schedules = \HM\BackUpWordPress\Schedules::get_instance()->get_schedules();
+            $schedules          = \HM\BackUpWordPress\Schedules::get_instance()->get_schedules();
+            $lasttime_logged    = (int) MainWP_Utility::get_lasttime_backup( 'backupwordpress' );
+            $new_lasttime       = $lasttime_logged;
+            $can_advance_cursor = true;
             if ( is_array( $schedules ) && count( $schedules ) > 0 ) {
                 $check = current( $schedules );
                 MainWP_Helper::instance()->check_methods( $check, array( 'get_backups', 'get_type' ) );
@@ -360,12 +363,20 @@ class MainWP_Child_Back_Up_WordPress {
                         if ( file_exists( $file ) ) {
                             $date = filemtime( $file );
                             if ( ! empty( $date ) ) {
-                                do_action( 'mainwp_reports_backupwordpress_backup', $destination, $message, 'finished', $backup_type, $date );
-                                MainWP_Utility::update_lasttime_backup( 'backupwordpress', $date ); // to support backup before update feature.
+                                $fingerprint = MainWP_Utility::backup_fingerprint( 'backupwordpress', basename( $file ), $date );
+                                do_action( 'mainwp_reports_backupwordpress_backup', $destination, $message, 'finished', $backup_type, $date, $fingerprint );
+                                if ( MainWP_Utility::backup_fingerprint_logged( $fingerprint ) ) {
+                                    $new_lasttime = max( $new_lasttime, (int) $date );
+                                } else {
+                                    $can_advance_cursor = false;
+                                }
                             }
                         }
                     }
                 }
+            }
+            if ( $can_advance_cursor && $new_lasttime > $lasttime_logged ) {
+                MainWP_Utility::update_lasttime_backup( 'backupwordpress', $new_lasttime ); // to support backup before update feature.
             }
         } catch ( MainWP_Exception $e ) {
             // ok!

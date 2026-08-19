@@ -29,7 +29,7 @@ class Test_MainWP_Child_Termageddon_V2 extends WP_UnitTestCase {
 	}
 
 	public function test_get_returns_only_closed_redacted_identity() {
-		$post_id = $this->create_marked_page( 'Private policy body' );
+		$post_id = $this->create_page( 'Private policy body' );
 		$result  = $this->subject->get_page_v2( $this->get_request( $post_id, 'Private policy body' ) );
 
 		$this->assertSame( array( 'contract_version', 'operation', 'ok', 'found', 'state', 'post_type', 'post_status', 'content_generation', 'content_hash' ), array_keys( $result ) );
@@ -40,21 +40,68 @@ class Test_MainWP_Child_Termageddon_V2 extends WP_UnitTestCase {
 		$this->assertStringNotContainsString( 'Private policy body', wp_json_encode( $result ) );
 	}
 
-	public function test_get_rejects_unmarked_reused_and_drifted_pages() {
-		$unmarked = self::factory()->post->create( array( 'post_type' => 'page', 'post_status' => 'publish' ) );
-		$this->assertSame( 'marker_mismatch', $this->subject->get_page_v2( $this->get_request( $unmarked, '' ) )['state'] );
+	public function test_content_bound_page_answers_current_then_deletes_with_truthful_readback() {
+		$post_id = $this->create_page( 'Bound body' );
+		$request = array_merge(
+			$this->get_request( $post_id, 'Bound body' ),
+			array(
+				'request_ref' => '123e4567-e89b-42d3-a456-426614173010',
+				'dry_run'     => false,
+			)
+		);
 
-		$post_id = $this->create_marked_page( 'Original' );
-		wp_update_post( array( 'ID' => $post_id, 'post_content' => 'Changed' ) );
-		$this->assertSame( 'content_drift', $this->subject->get_page_v2( $this->get_request( $post_id, 'Original' ) )['state'] );
+		$this->assertSame( 'current', $this->subject->get_page_v2( $this->get_request( $post_id, 'Bound body' ) )['state'] );
 
-		$request                    = $this->get_request( $post_id, 'Original' );
-		$request['site_generation'] = str_repeat( 'c', 64 );
-		$this->assertSame( 'marker_mismatch', $this->subject->get_page_v2( $request )['state'] );
+		$deleted = $this->subject->delete_page_v2( $request );
+		$this->assertSame( 'deleted', $deleted['state'] );
+		$this->assertFalse( $deleted['exists_after'] );
+		$this->assertNull( get_post( $post_id ) );
+
+		$readback = $this->subject->get_page_v2( $this->get_request( $post_id, 'Bound body' ) );
+		$this->assertFalse( $readback['found'] );
+		$this->assertSame( 'not_found', $readback['state'] );
+	}
+
+	public function test_get_rejects_reused_drifted_and_mistargeted_pages() {
+		$reused = $this->create_page( 'Some unrelated page that now holds this id' );
+		$result = $this->subject->get_page_v2( $this->get_request( $reused, 'Original' ) );
+		$this->assertSame( 'content_drift', $result['state'] );
+		$this->assertSame( hash( 'sha256', 'Original' ), $result['content_generation'] );
+		$this->assertSame( hash( 'sha256', 'Some unrelated page that now holds this id' ), $result['content_hash'] );
+
+		$drifted = $this->create_page( 'Original' );
+		wp_update_post( array( 'ID' => $drifted, 'post_content' => 'Changed' ) );
+		$this->assertSame( 'content_drift', $this->subject->get_page_v2( $this->get_request( $drifted, 'Original' ) )['state'] );
+
+		$wrong_type = $this->create_page( 'Original', 'post' );
+		$this->assertSame( 'type_mismatch', $this->subject->get_page_v2( $this->get_request( $wrong_type, 'Original' ) )['state'] );
+
+		$wrong_status = $this->create_page( 'Original', 'page', 'draft' );
+		$this->assertSame( 'status_mismatch', $this->subject->get_page_v2( $this->get_request( $wrong_status, 'Original' ) )['state'] );
+	}
+
+	public function test_delete_refuses_drifted_and_mistargeted_pages() {
+		$drifted = $this->create_page( 'Original' );
+		wp_update_post( array( 'ID' => $drifted, 'post_content' => 'Changed' ) );
+		$request = array_merge(
+			$this->get_request( $drifted, 'Original' ),
+			array(
+				'request_ref' => '123e4567-e89b-42d3-a456-426614173011',
+				'dry_run'     => false,
+			)
+		);
+		$this->assertSame( 'target_drift', $this->subject->delete_page_v2( $request )['code'] );
+		$this->assertNotNull( get_post( $drifted ) );
+
+		$wrong_status               = $this->create_page( 'Original', 'page', 'draft' );
+		$request['post_id']         = $wrong_status;
+		$request['request_ref']     = '123e4567-e89b-42d3-a456-426614173012';
+		$this->assertSame( 'target_drift', $this->subject->delete_page_v2( $request )['code'] );
+		$this->assertNotNull( get_post( $wrong_status ) );
 	}
 
 	public function test_delete_previews_then_deletes_with_terminal_readback_and_replay() {
-		$post_id = $this->create_marked_page( 'Delete me' );
+		$post_id = $this->create_page( 'Delete me' );
 		$request = array_merge(
 			$this->get_request( $post_id, 'Delete me' ),
 			array(
@@ -77,7 +124,7 @@ class Test_MainWP_Child_Termageddon_V2 extends WP_UnitTestCase {
 	}
 
 	public function test_delete_rejects_uuid_id_alias_and_mismatched_replay() {
-		$post_id = $this->create_marked_page( 'Keep me' );
+		$post_id = $this->create_page( 'Keep me' );
 		$request = array_merge(
 			$this->get_request( $post_id, 'Keep me' ),
 			array(
@@ -106,26 +153,14 @@ class Test_MainWP_Child_Termageddon_V2 extends WP_UnitTestCase {
 		$this->assertSame( 'termageddon_page_v2_delete', $callables['termageddon_page_v2_delete'] );
 	}
 
-	private function create_marked_page( $content ) {
-		$post_id            = self::factory()->post->create(
+	private function create_page( $content, $post_type = 'page', $post_status = 'publish' ) {
+		return self::factory()->post->create(
 			array(
-				'post_type'    => 'page',
-				'post_status'  => 'publish',
+				'post_type'    => $post_type,
+				'post_status'  => $post_status,
 				'post_content' => $content,
 			)
 		);
-		$content_generation = hash( 'sha256', $content );
-		update_post_meta(
-			$post_id,
-			MainWP_Child_Termageddon::MARKER_META,
-			array(
-				'page_ref'          => $this->page_ref,
-				'page_type'         => 'privacy',
-				'site_generation'   => $this->site_generation,
-				'content_generation' => $content_generation,
-			)
-		);
-		return $post_id;
 	}
 
 	private function get_request( $post_id, $content ) {

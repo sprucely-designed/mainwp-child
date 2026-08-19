@@ -172,6 +172,72 @@ class Test_Post_Plus_Child_V2 extends WP_UnitTestCase {
 		$this->assertSame( 'invalid_request', $this->request( 'post_plus_newpost_v2', $page )['code'] );
 	}
 
+	public function test_transport_size_cap_admits_a_maximal_legal_create_envelope() {
+		$envelope = wp_json_encode(
+			array(
+				'protocol'  => '2',
+				'operation' => 'post_plus_newpost_v2',
+				'payload'   => $this->maximal_delivery_payload( '123e4567-e89b-42d3-a456-426614174619' ),
+			)
+		);
+
+		$this->assertLessThanOrEqual( $this->callable_request_cap( 'post_plus_capabilities_v2' ), strlen( $envelope ) );
+		$this->assertTrue( MainWP_Child_Posts::get_instance()->post_plus_capabilities_v2( json_decode( $envelope, true ) )['ok'] );
+	}
+
+	/**
+	 * Read the request-size cap the callable transport enforces on the raw envelope.
+	 *
+	 * MainWP_Helper::write() ends the request with die(), so the dispatcher itself cannot run
+	 * inside the suite; reading its own bound keeps the assertion tied to the shipped guard
+	 * instead of a copy of the number.
+	 */
+	private function callable_request_cap( $method ) {
+		$reflection = new \ReflectionMethod( MainWP_Child_Callable::class, $method );
+		$lines      = file( $reflection->getFileName() );
+		$source     = implode( '', array_slice( $lines, $reflection->getStartLine() - 1, $reflection->getEndLine() - $reflection->getStartLine() + 1 ) );
+		$this->assertSame( 1, preg_match( '/([A-Za-z0-9_:]+)\s*<\s*strlen\(\s*\$raw\s*\)/', $source, $bound ) );
+		return 0 === strpos( $bound[1], 'self::' ) ? constant( MainWP_Child_Callable::class . '::' . substr( $bound[1], 6 ) ) : (int) $bound[1];
+	}
+
+	private function maximal_delivery_payload( $operation_ref ) {
+		$slugs = array();
+		for ( $index = 0; $index < 100; $index++ ) {
+			$slugs[] = str_pad( 'bound-' . $index . '-', 200, 'x' );
+		}
+		sort( $slugs, SORT_STRING );
+		$post = array(
+			'post_type'      => 'post',
+			'status'         => 'draft',
+			'title'          => str_repeat( '記', 170 ),
+			'content'        => str_repeat( '記', 66666 ),
+			'excerpt'        => str_repeat( '記', 1666 ),
+			'slug'           => str_pad( 'maximal-', 200, 'x' ),
+			'comment_status' => 'closed',
+			'ping_status'    => 'closed',
+			'categories'     => $slugs,
+			'tags'           => $slugs,
+		);
+		$randomization = array(
+			'roles'           => array( 'author' ),
+			'random_category' => false,
+			'date_from'       => '2025-08-01',
+			'date_to'         => '2025-08-31',
+			'timezone'        => 'America/New_York',
+		);
+		return array(
+			'dashboard_ref'     => hash( 'sha256', 'https://dashboard.example.test' ),
+			'operation_ref'     => $operation_ref,
+			'mode'              => 'create',
+			'target_post_id'    => null,
+			'expected_revision' => null,
+			'content_digest'    => hash( 'sha256', wp_json_encode( array( $post, $randomization ) ) ),
+			'expires_at'        => time() + 300,
+			'post'              => $post,
+			'randomization'     => $randomization,
+		);
+	}
+
 	private function delivery_payload( $operation_ref, $title ) {
 		$post = array(
 			'post_type'      => 'post',

@@ -974,22 +974,63 @@ class MainWP_Child_Misc {
             fclose( $handle );
             return false;
         }
-        $temporary = tempnam( dirname( $path ), '.mainwp-cs-' );
-        $ok        = is_string( $temporary ) && false !== file_put_contents( $temporary, $next ) && chmod( $temporary, $mode & 0777 ) && rename( $temporary, $path ) && file_get_contents( $path ) === $next;
+        $temporary = $this->snippet_v2_stage_file( dirname( $path ), '.mainwp-cs-', $next, $mode & 0777 );
+        $renamed   = false !== $temporary && rename( $temporary, $path );
+        $ok        = $renamed && file_get_contents( $path ) === $next;
         if ( ! $ok ) {
-            if ( is_string( $temporary ) && file_exists( $temporary ) ) {
+            if ( false !== $temporary && file_exists( $temporary ) ) {
                 unlink( $temporary );
             }
-            $rollback = tempnam( dirname( $path ), '.mainwp-cs-rollback-' );
-            if ( is_string( $rollback ) ) {
-                file_put_contents( $rollback, $expected );
-                chmod( $rollback, $mode & 0777 );
-                rename( $rollback, $path );
+            // Only a rename that already replaced the live file needs the original bytes put back; a
+            // rename that failed left wp-config.php untouched, and writing over it there would risk
+            // replacing an intact configuration with a partial copy.
+            $rollback = $renamed ? $this->snippet_v2_stage_file( dirname( $path ), '.mainwp-cs-rollback-', $expected, $mode & 0777 ) : false;
+            if ( false !== $rollback && ! rename( $rollback, $path ) && file_exists( $rollback ) ) {
+                unlink( $rollback );
             }
         }
         flock( $handle, LOCK_UN );
         fclose( $handle );
         return $ok && file_get_contents( $path ) === $next;
+    }
+
+    /**
+     * Write wp-config.php bytes to a staging file beside the target, ready to be renamed over it.
+     *
+     * Staying in the target directory keeps the rename on one filesystem, so it stays atomic. The
+     * staged copy carries a .php suffix because it holds the whole configuration: database
+     * credentials and salts. An extensionless file left in the web root is served verbatim by
+     * common server configurations, while a .php one is executed and discloses nothing.
+     *
+     * @param string $directory   Directory holding the configuration file.
+     * @param string $prefix      Staging name prefix.
+     * @param string $contents    Bytes to stage.
+     * @param int    $permissions Permissions to apply to the staged file.
+     * @return string|false Staged path, or false when the bytes did not reach disk complete.
+     */
+    protected function snippet_v2_stage_file( $directory, $prefix, $contents, $permissions ) {
+        // tempnam() silently falls back to the system temporary directory when it cannot write to
+        // $directory, which would put the configuration outside the site and break atomicity.
+        if ( ! is_writable( $directory ) ) {
+            return false;
+        }
+        $temporary = tempnam( $directory, $prefix );
+        if ( ! is_string( $temporary ) ) {
+            return false;
+        }
+        $staged = $temporary . '.php';
+        if ( realpath( dirname( $temporary ) ) !== realpath( $directory ) || file_exists( $staged ) || ! rename( $temporary, $staged ) ) {
+            unlink( $temporary );
+            return false;
+        }
+        $written = file_put_contents( $staged, $contents );
+        // A short write (a full disk) must never reach the live configuration, so the byte count is
+        // compared exactly rather than trusting the non-false return.
+        if ( strlen( $contents ) !== $written || ! chmod( $staged, $permissions ) ) {
+            unlink( $staged );
+            return false;
+        }
+        return $staged;
     }
 
     /**

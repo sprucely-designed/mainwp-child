@@ -68,6 +68,54 @@ class Test_MainWP_Child_Virusdie_V1 extends WP_UnitTestCase {
 		$this->assertSame( 0, $existing->gateway_reads );
 	}
 
+	public function test_failed_install_reports_the_observed_absent_target() {
+		$subject                = new Testable_MainWP_Child_Virusdie();
+		$subject->gateway_bytes = 'wrong';
+		$request                = $this->install_request( 'expected' );
+
+		$result = $subject->request_v1( $request );
+		$this->assertSame( 'failed', $result['status'] );
+		$this->assertSame( 'digest_mismatch', $result['code'] );
+		$this->assertFalse( $result['installed'] );
+		$this->assertSame( 0, $subject->installs );
+
+		$status = $subject->request_v1( $this->request( 'status', array( 'request_ref' => $request['payload']['request_ref'] ) ) );
+		$this->assertSame( $result, $status );
+	}
+
+	public function test_failed_remove_reports_the_still_present_target() {
+		$subject                = new Testable_MainWP_Child_Virusdie();
+		$subject->target_exists = true;
+		$subject->target_bytes  = 'installed bytes';
+		$subject->remove_fails  = true;
+		$request                = $this->remove_request( $subject->target_bytes );
+
+		$result = $subject->request_v1( $request );
+		$this->assertSame( 'unknown', $result['status'] );
+		$this->assertSame( 'outcome_unknown', $result['code'] );
+		$this->assertTrue( $result['installed'] );
+		$this->assertTrue( $subject->target_exists );
+
+		$status = $subject->request_v1( $this->request( 'status', array( 'request_ref' => $request['payload']['request_ref'] ) ) );
+		$this->assertSame( $result, $status );
+	}
+
+	public function test_unreadable_target_settles_installed_as_unknown() {
+		$subject                             = new Testable_MainWP_Child_Virusdie();
+		$subject->durable_receipts           = true;
+		$subject->gateway_bytes              = 'wrong';
+		$subject->break_snapshot_on_download = true;
+		$request                             = $this->install_request( 'expected' );
+
+		$result = $subject->request_v1( $request );
+		$this->assertSame( 'failed', $result['status'] );
+		$this->assertSame( 'digest_mismatch', $result['code'] );
+		$this->assertNull( $result['installed'] );
+
+		$status = $subject->request_v1( $this->request( 'status', array( 'request_ref' => $request['payload']['request_ref'] ) ) );
+		$this->assertSame( $result, $status );
+	}
+
 	public function test_remove_requires_exact_current_hash_and_replays() {
 		$subject                = new Testable_MainWP_Child_Virusdie();
 		$subject->target_exists = true;
@@ -138,6 +186,18 @@ class Test_MainWP_Child_Virusdie_V1 extends WP_UnitTestCase {
 		);
 	}
 
+	private function remove_request( $bytes ) {
+		return $this->request(
+			'remove',
+			array(
+				'request_ref'     => '123e4567-e89b-42d3-a456-426614175004',
+				'basename'        => 'virusdie_fixture.php',
+				'expected_sha256' => hash( 'sha256', $bytes ),
+				'site_generation' => str_repeat( 'b', 64 ),
+			)
+		);
+	}
+
 	private function request( $operation, $payload ) {
 		return array( 'protocol' => '1', 'operation' => $operation, 'payload' => $payload );
 	}
@@ -152,9 +212,18 @@ class Testable_MainWP_Child_Virusdie extends MainWP_Child_Virusdie {
 	public $installs = 0;
 	public $removals = 0;
 	public $receipts = array();
+	public $remove_fails = false;
+	public $durable_receipts = false;
+	public $break_snapshot_on_download = false;
+
+	/** Target becomes unreadable once the gateway has been read. */
+	private $snapshot_unreadable = false;
 
 	protected function target_snapshot( $basename ) {
 		unset( $basename );
+		if ( $this->snapshot_unreadable ) {
+			return false;
+		}
 		return array(
 			'exists' => $this->target_exists,
 			'bytes'  => $this->target_exists ? strlen( $this->target_bytes ) : null,
@@ -169,6 +238,9 @@ class Testable_MainWP_Child_Virusdie extends MainWP_Child_Virusdie {
 	protected function download_artifact( $url, $token, $expected_bytes ) {
 		unset( $url, $token, $expected_bytes );
 		++$this->gateway_reads;
+		if ( $this->break_snapshot_on_download ) {
+			$this->snapshot_unreadable = true;
+		}
 		return $this->gateway_bytes;
 	}
 
@@ -183,16 +255,25 @@ class Testable_MainWP_Child_Virusdie extends MainWP_Child_Virusdie {
 	protected function remove_artifact( $basename ) {
 		unset( $basename );
 		++$this->removals;
+		if ( $this->remove_fails ) {
+			return false;
+		}
 		$this->target_exists = false;
 		$this->target_bytes  = '';
 		return true;
 	}
 
 	protected function load_receipt( $request_ref ) {
+		if ( $this->durable_receipts ) {
+			return parent::load_receipt( $request_ref );
+		}
 		return isset( $this->receipts[ $request_ref ] ) ? $this->receipts[ $request_ref ] : null;
 	}
 
 	protected function create_receipt( $request_ref, $receipt ) {
+		if ( $this->durable_receipts ) {
+			return parent::create_receipt( $request_ref, $receipt );
+		}
 		if ( isset( $this->receipts[ $request_ref ] ) ) {
 			return false;
 		}
@@ -201,6 +282,9 @@ class Testable_MainWP_Child_Virusdie extends MainWP_Child_Virusdie {
 	}
 
 	protected function settle_receipt( $request_ref, $expected, $receipt ) {
+		if ( $this->durable_receipts ) {
+			return parent::settle_receipt( $request_ref, $expected, $receipt );
+		}
 		if ( ! isset( $this->receipts[ $request_ref ] ) || $expected !== $this->receipts[ $request_ref ] ) {
 			return false;
 		}

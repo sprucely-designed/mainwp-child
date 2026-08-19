@@ -180,6 +180,13 @@ class MainWP_Child_IThemes_Security { //phpcs:ignore -- NOSONAR - multi methods.
         $information = array();
 
         $mwp_action = MainWP_System::instance()->validate_params( 'mwp_action' );
+
+        $abilities_v2_response = $this->abilities_v2_action_response( $mwp_action );
+        if ( null !== $abilities_v2_response ) {
+            MainWP_Helper::write( $abilities_v2_response );
+            return;
+        }
+
         if ( ! class_exists( '\ITSEC_Core' ) || ! class_exists( '\ITSEC_Modules' ) ) {
             $information['error'] = 'NO_ITHEME';
             MainWP_Helper::write( $information );
@@ -194,15 +201,6 @@ class MainWP_Child_IThemes_Security { //phpcs:ignore -- NOSONAR - multi methods.
         global $mainwp_itsec_modules_path;
 
         $mainwp_itsec_modules_path = \ITSEC_Core::get_core_dir() . '/modules/';
-
-        if ( 'abilities_v2' === $mwp_action ) {
-            // phpcs:disable WordPress.Security.NonceVerification
-            $raw_request = isset( $_POST['request'] ) && is_string( $_POST['request'] ) ? wp_unslash( $_POST['request'] ) : '';
-            // phpcs:enable
-            $request = 4096 >= strlen( $raw_request ) ? json_decode( $raw_request, true ) : null;
-            MainWP_Helper::write( $this->abilities_v2( $request ) );
-            return;
-        }
 
         if ( ! empty( $mwp_action ) ) {
             switch ( $mwp_action ) {
@@ -262,6 +260,41 @@ class MainWP_Child_IThemes_Security { //phpcs:ignore -- NOSONAR - multi methods.
             }
         }
         MainWP_Helper::write( $information );
+    }
+
+    /**
+     * Answer an abilities_v2 request ahead of the v1 provider gate.
+     *
+     * This has to run before the NO_ITHEME bail: on a site without Solid the v2
+     * protocol still owes the Dashboard its own closed envelope (capabilities,
+     * plugin_unavailable), and the v1 bail would take the whole protocol off the
+     * air instead.
+     *
+     * @param string $mwp_action Validated action name.
+     * @return array<string,mixed>|null Closed protocol response, or null for a v1 request.
+     */
+    protected function abilities_v2_action_response( $mwp_action ) {
+        if ( 'abilities_v2' !== $mwp_action ) {
+            return null;
+        }
+
+        /**
+         * Itsec modules path.
+         *
+         * @global string $mainwp_itsec_modules_path MainWP itsec modules path.
+         */
+        global $mainwp_itsec_modules_path;
+
+        // Mutations reach v1 helpers that read this global, and action() now assigns it downstream of this branch.
+        if ( is_callable( array( '\ITSEC_Core', 'get_core_dir' ) ) ) {
+            $mainwp_itsec_modules_path = \ITSEC_Core::get_core_dir() . '/modules/';
+        }
+
+        // phpcs:disable WordPress.Security.NonceVerification
+        $raw_request = isset( $_POST['request'] ) && is_string( $_POST['request'] ) ? wp_unslash( $_POST['request'] ) : '';
+        // phpcs:enable
+        $request = 4096 >= strlen( $raw_request ) ? json_decode( $raw_request, true ) : null;
+        return $this->abilities_v2( $request );
     }
 
     /**
@@ -1145,8 +1178,41 @@ class MainWP_Child_IThemes_Security { //phpcs:ignore -- NOSONAR - multi methods.
         return $this->abilities_v2_coarse_operation_result( 'file_scan', $ok, false, $ok ? 'accepted' : 'failed' );
     }
 
+    /**
+     * Load the Solid File Change module the way the v1 file_change() path does.
+     *
+     * Solid leaves this module unloaded on a normal request, so a poll arrives
+     * with both classes absent and would report plugin_unavailable forever on a
+     * site that is in fact running Solid.
+     */
+    private function abilities_v2_load_file_change_module() {
+        /**
+         * Itsec modules path.
+         *
+         * @global string $mainwp_itsec_modules_path MainWP itsec modules path.
+         */
+        global $mainwp_itsec_modules_path;
+
+        if ( ! is_string( $mainwp_itsec_modules_path ) || '' === $mainwp_itsec_modules_path ) {
+            return;
+        }
+
+        $files = array(
+            '\ITSEC_File_Change_Scanner' => $mainwp_itsec_modules_path . 'file-change/scanner.php',
+            '\ITSEC_File_Change'         => $mainwp_itsec_modules_path . 'file-change/class-itsec-file-change.php',
+        );
+        foreach ( $files as $class => $file ) {
+            // Unlike v1, this path also runs where Solid is absent or has moved the module, so a missing file must not fatal.
+            if ( ! class_exists( $class ) && file_exists( $file ) ) {
+                require_once $file; // NOSONAR - WP compatible.
+            }
+        }
+    }
+
     /** Poll the active File Change scan without submitting a second scan request. */
     private function abilities_v2_poll_file_scan() {
+        $this->abilities_v2_load_file_change_module();
+
         if ( ! class_exists( '\ITSEC_File_Change_Scanner' ) || ! is_callable( array( '\ITSEC_File_Change_Scanner', 'get_status' ) ) ) {
             return new \WP_Error( 'plugin_unavailable' );
         }

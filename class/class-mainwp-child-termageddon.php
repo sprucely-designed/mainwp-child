@@ -13,12 +13,13 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Marker-bound Termageddon page read and deletion protocol.
+ * Content-bound Termageddon page read and deletion protocol.
+ *
+ * The Child stores no Termageddon provenance of its own, so a page is bound to the
+ * Dashboard's record by the exact post ID, the expected type and status, and a
+ * SHA-256 of the live post content matching the recorded content generation.
  */
 class MainWP_Child_Termageddon {
-
-    /** Dedicated marker written only by the typed Termageddon publication path. */
-    const MARKER_META = '_mainwp_termageddon_page_v2';
 
     /** Durable deletion receipt option. */
     const RECEIPTS_OPTION = 'mainwp_child_termageddon_v2_receipts';
@@ -41,7 +42,7 @@ class MainWP_Child_Termageddon {
     }
 
     /**
-     * Read one exact marker-bound page without returning content or URLs.
+     * Read one exact content-bound page without returning content or URLs.
      *
      * @param mixed $request Request payload.
      * @return array
@@ -55,7 +56,7 @@ class MainWP_Child_Termageddon {
     }
 
     /**
-     * Preview or delete one exact marker-bound page.
+     * Preview or delete one exact content-bound page.
      *
      * @param mixed $request Request payload.
      * @return array
@@ -128,15 +129,6 @@ class MainWP_Child_Termageddon {
             return $this->get_result( false, 'not_found', null, null, null, null );
         }
 
-        $marker = get_post_meta( $request['post_id'], self::MARKER_META, true );
-        if ( ! $this->valid_marker( $marker )
-            || ! hash_equals( $marker['page_ref'], $request['page_ref'] )
-            || ! hash_equals( $marker['site_generation'], $request['site_generation'] )
-            || ! hash_equals( $marker['content_generation'], $request['content_generation'] )
-            || $marker['page_type'] !== $request['page_type'] ) {
-            return $this->get_result( true, 'marker_mismatch', null, null, null, null );
-        }
-
         if ( $post->post_type !== $request['expected_post_type'] ) {
             return $this->get_result( true, 'type_mismatch', null, null, null, null );
         }
@@ -144,6 +136,7 @@ class MainWP_Child_Termageddon {
             return $this->get_result( true, 'status_mismatch', null, null, null, null );
         }
 
+        // The only Child-side proof that this post is still the page the Dashboard recorded.
         $content_hash = hash( 'sha256', (string) $post->post_content );
         if ( ! hash_equals( $request['content_generation'], $content_hash ) ) {
             return $this->get_result( true, 'content_drift', $post->post_type, $post->post_status, $request['content_generation'], $content_hash );
@@ -154,6 +147,10 @@ class MainWP_Child_Termageddon {
 
     /**
      * Validate the common request shape.
+     *
+     * The page_ref, page_type and site_generation fields are Dashboard-side identity the
+     * Child cannot verify against anything local; they are shape-checked and folded into
+     * the delete digest so a replay under a different identity is rejected as a conflict.
      *
      * @param mixed $request Request payload.
      * @return bool
@@ -192,21 +189,6 @@ class MainWP_Child_Termageddon {
             && is_string( $request['request_ref'] )
             && 1 === preg_match( '/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/D', $request['request_ref'] )
             && is_bool( $request['dry_run'] );
-    }
-
-    /**
-     * Validate the stored marker.
-     *
-     * @param mixed $marker Marker value.
-     * @return bool
-     */
-    private function valid_marker( $marker ) {
-        return is_array( $marker )
-            && $this->exact_keys( $marker, array( 'page_ref', 'page_type', 'site_generation', 'content_generation' ) )
-            && $this->hash_value( $marker['page_ref'] )
-            && in_array( $marker['page_type'], array( 'privacy', 'terms', 'disclaimer', 'cookie-consent' ), true )
-            && $this->hash_value( $marker['site_generation'] )
-            && $this->hash_value( $marker['content_generation'] );
     }
 
     /**

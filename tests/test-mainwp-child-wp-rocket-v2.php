@@ -77,7 +77,7 @@ class Test_MainWP_Child_WP_Rocket_V2 extends WP_UnitTestCase {
 
 		$this->assertSame( array( 'protocol', 'operation', 'ok', 'status', 'categories' ), array_keys( $result ) );
 		$this->assertTrue( $result['ok'] );
-		$this->assertSame( 'completed', $result['status'] );
+		$this->assertSame( 'requested', $result['status'] );
 		$this->assertSame( $this->public_categories(), $result['categories'] );
 		$this->assertSame(
 			array(
@@ -94,6 +94,22 @@ class Test_MainWP_Child_WP_Rocket_V2 extends WP_UnitTestCase {
 			),
 			$this->rocket->provider_calls
 		);
+	}
+
+	/** A truthy provider return only proves the queue accepted the work, never that it ran. */
+	public function test_accepted_optimization_reports_dispatch_not_completion() {
+		$result = $this->invoke_v2(
+			array(
+				'protocol'    => '2',
+				'operation'   => 'optimize_database',
+				'request_ref' => '123e4567-e89b-42d3-a456-426614174916',
+				'payload'     => array( 'categories' => array( 'revisions' ) ),
+			)
+		);
+
+		$this->assertTrue( $result['ok'] );
+		$this->assertNotSame( 'completed', $result['status'] );
+		$this->assertSame( 'requested', $result['status'] );
 	}
 
 	/** Invalid requests fail closed before provider work. */

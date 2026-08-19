@@ -418,7 +418,9 @@ class MainWP_Child_Patchstack { //phpcs:ignore -- NOSONAR - multi methods.
         if ( ! in_array( $state, array( 'absent', 'installed', 'active', 'protected', 'unknown' ), true ) || ! in_array( $visibility, array( 'shown', 'hidden' ), true ) ) {
             return $this->abilities_v2_error( $operation, 'invalid_snapshot' );
         }
-        $revision = $this->abilities_v2_state_revision( $common, $state, $visibility );
+        // The preview that issued if_match binds the real package state, so the default would never match on a site without Patchstack.
+        $package_state = $this->abilities_v2_package_state( $state );
+        $revision      = $this->abilities_v2_state_revision( $common, $state, $visibility, $package_state );
         if ( ! hash_equals( $revision, $payload['if_match'] ) ) {
             return $this->abilities_v2_error( $operation, 'stale_revision' );
         }
@@ -456,7 +458,7 @@ class MainWP_Child_Patchstack { //phpcs:ignore -- NOSONAR - multi methods.
             'operation_ref'  => $payload['operation_ref'],
             'visibility'     => $current,
             'changed'        => $changed,
-            'state_revision' => $this->abilities_v2_state_revision( $common, $state, $current ),
+            'state_revision' => $this->abilities_v2_state_revision( $common, $state, $current, $package_state ),
         );
         return $this->abilities_v2_complete_receipt( $receipts, $payload['operation_ref'], $effect_hash, $response );
     }

@@ -24,6 +24,9 @@ class Test_MainWP_Child_Code_Snippets_V2_Fixture extends MainWP_Child_Misc {
 	/** @var string|false */
 	public $config_path = false;
 
+	/** @var array<int,string|false> Every staging attempt, recorded without altering the real result. */
+	public $staged = array();
+
 	/** @return mixed */
 	protected function snippet_v2_get_option( $name, $fallback = false ) {
 		return array_key_exists( $name, $this->options ) ? $this->options[ $name ] : $fallback;
@@ -57,6 +60,13 @@ class Test_MainWP_Child_Code_Snippets_V2_Fixture extends MainWP_Child_Misc {
 	protected function snippet_v2_write_file_atomic( $path, $expected, $next ) {
 		return ! $this->write_fails && parent::snippet_v2_write_file_atomic( $path, $expected, $next );
 	}
+
+	/** @return string|false */
+	protected function snippet_v2_stage_file( $directory, $prefix, $contents, $permissions ) {
+		$staged         = parent::snippet_v2_stage_file( $directory, $prefix, $contents, $permissions );
+		$this->staged[] = $staged;
+		return $staged;
+	}
 }
 
 /** Code Snippets protocol-v2 contract tests. */
@@ -70,6 +80,9 @@ class Test_MainWP_Child_Code_Snippets_V2 extends WP_UnitTestCase {
 
 	/** @var string */
 	private $config_path;
+
+	/** @var string|null */
+	private $config_dir = null;
 
 	/** Set up one isolated fixture. */
 	public function setUp(): void {
@@ -85,7 +98,33 @@ class Test_MainWP_Child_Code_Snippets_V2 extends WP_UnitTestCase {
 		if ( is_string( $this->config_path ) && file_exists( $this->config_path ) ) {
 			unlink( $this->config_path );
 		}
+		if ( is_string( $this->config_dir ) && is_dir( $this->config_dir ) ) {
+			chmod( $this->config_dir, 0755 );
+			foreach ( (array) glob( $this->config_dir . '/{,.}*', GLOB_BRACE ) as $leftover ) {
+				if ( is_file( $leftover ) ) {
+					unlink( $leftover );
+				}
+			}
+			rmdir( $this->config_dir );
+		}
 		parent::tearDown();
+	}
+
+	/**
+	 * Point the fixture at a wp-config.php that owns its directory, so directory permissions and
+	 * staging leftovers can be observed without touching unrelated temporary files.
+	 *
+	 * @param string $contents Configuration bytes.
+	 * @return string Path to the configuration file.
+	 */
+	private function isolated_config( $contents ) {
+		$this->config_dir = $this->config_path . '-dir';
+		mkdir( $this->config_dir, 0755 );
+		$path = $this->config_dir . '/wp-config.php';
+		file_put_contents( $path, $contents );
+		chmod( $path, 0644 );
+		$this->fixture->config_path = $path;
+		return $path;
 	}
 
 	/** @return array<string,mixed> */
@@ -179,5 +218,59 @@ class Test_MainWP_Child_Code_Snippets_V2 extends WP_UnitTestCase {
 
 		file_put_contents( $this->config_path, $original . "/***snippet_FixtureSlug1***/x/***end_FixtureSlug1***/\n/***snippet_FixtureSlug1***/y/***end_FixtureSlug1***/\n" );
 		$this->assertSame( 'storage_failed', $this->fixture->snippet_v2( 'remove_snippet_v2', $remove )['error_code'] );
+	}
+
+	/** A configuration write that cannot land leaves the live file untouched and stages nothing outside its directory. */
+	public function test_unwritable_config_directory_leaves_original_intact_and_stages_nothing() {
+		$path     = $this->isolated_config( "<?php\ndefine( 'DB_PASSWORD', 'FIXTURE-SECRET' );\n\$table_prefix = 'wp_';\n" );
+		$original = file_get_contents( $path );
+		$inode    = fileinode( $path );
+		$fallback = rtrim( sys_get_temp_dir(), '/' );
+		$before   = (array) glob( $fallback . '/.mainwp-cs-*' );
+
+		chmod( $this->config_dir, 0555 );
+		clearstatcache();
+		if ( is_writable( $this->config_dir ) ) {
+			chmod( $this->config_dir, 0755 );
+			$this->markTestSkipped( 'Directory permissions are not enforced for this user.' );
+		}
+
+		$result = $this->fixture->snippet_v2( 'apply_snippet_v2', $this->request( 'C', "define( 'FIXTURE_VALUE', true );" ) );
+		chmod( $this->config_dir, 0755 );
+
+		$this->assertSame( 'storage_failed', $result['error_code'] );
+		$this->assertSame( $original, file_get_contents( $path ) );
+		$this->assertSame( $inode, fileinode( $path ) );
+		$this->assertSame( array( false ), $this->fixture->staged, 'Staging must refuse rather than fall back outside the configuration directory.' );
+		$this->assertSame( array(), (array) glob( $this->config_dir . '/.mainwp-cs-*' ) );
+		$this->assertSame( $before, (array) glob( $fallback . '/.mainwp-cs-*' ), 'Configuration bytes must not be left in the system temporary directory.' );
+	}
+
+	/** Staged configuration bytes sit beside the target, carry a .php suffix, and leave nothing behind. */
+	public function test_config_staging_is_php_suffixed_beside_the_target_and_removed() {
+		$path   = $this->isolated_config( "<?php\ndefine( 'DB_PASSWORD', 'FIXTURE-SECRET' );\n\$table_prefix = 'wp_';\n/* collateral */\n" );
+		$result = $this->fixture->snippet_v2( 'apply_snippet_v2', $this->request( 'C', "define( 'FIXTURE_VALUE', true );" ) );
+
+		$this->assertSame( 'changed', $result['result'] );
+		$this->assertCount( 1, $this->fixture->staged );
+		$staged = $this->fixture->staged[0];
+		$this->assertIsString( $staged );
+		$this->assertSame( $this->config_dir, dirname( $staged ), 'Staging in another directory would make the rename non-atomic.' );
+		$this->assertSame( '.php', substr( $staged, -4 ) );
+		$this->assertFileDoesNotExist( $staged );
+		$this->assertSame( array(), (array) glob( $this->config_dir . '/.mainwp-cs-*' ) );
+
+		$applied = file_get_contents( $path );
+		$this->assertStringContainsString( 'FIXTURE_VALUE', $applied );
+		$this->assertStringContainsString( '/* collateral */', $applied );
+		$this->assertStringContainsString( "define( 'DB_PASSWORD', 'FIXTURE-SECRET' );", $applied );
+		$this->assertSame( 0644, fileperms( $path ) & 0777 );
+
+		$remove = $this->request( 'C' );
+		unset( $remove['code'] );
+		$this->assertSame( 'removed', $this->fixture->snippet_v2( 'remove_snippet_v2', $remove )['result'] );
+		$this->assertStringNotContainsString( 'FIXTURE_VALUE', file_get_contents( $path ) );
+		$this->assertStringContainsString( '/* collateral */', file_get_contents( $path ) );
+		$this->assertSame( array(), (array) glob( $this->config_dir . '/.mainwp-cs-*' ) );
 	}
 }

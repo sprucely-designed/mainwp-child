@@ -1090,20 +1090,22 @@ class MainWP_Child_WP_Rocket {//phpcs:ignore -- NOSONAR - multi methods.
             return $this->abilities_v2_error( $operation, 'provider_failed' );
         }
 
+        // WP Rocket runs the categories on its own background queue and the Child never reads the outcome back,
+        // so the only claim this response can support is that the request was accepted for processing.
         return array(
             'protocol'   => '2',
             'operation'  => 'optimize_database',
             'ok'         => true,
-            'status'     => 'completed',
+            'status'     => 'requested',
             'categories' => $categories,
         );
     }
 
     /**
-     * Run explicit WP Rocket optimization categories without reading settings.
+     * Queue explicit WP Rocket optimization categories without reading settings.
      *
      * @param array $categories WP Rocket category keys.
-     * @return bool
+     * @return bool True when every category is supported and the work reached WP Rocket's queue.
      * @throws MainWP_Exception Missing provider support.
      */
     protected function abilities_v2_provider_optimize_database( $categories ) {

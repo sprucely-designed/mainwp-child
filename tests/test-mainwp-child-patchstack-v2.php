@@ -170,6 +170,30 @@ class Test_MainWP_Child_Patchstack_V2 extends WP_UnitTestCase {
 		$this->assertSame( 'hidden', $this->subject->visibility );
 	}
 
+	public function test_visibility_replace_accepts_the_preview_revision_when_patchstack_is_absent() {
+		$this->subject->plugin_state = 'absent';
+		$this->subject->visibility   = 'shown';
+		$common                      = $this->base_payload();
+		$preview                     = $this->request( 'patchstack_protection_preview_v2', $common );
+		$this->assertSame( 'verification_unavailable', $preview['package_state'] );
+
+		$payload = array_merge(
+			$common,
+			array(
+				'desired_state' => 'hidden',
+				'if_match'      => $preview['state_revision'],
+			)
+		);
+		$result  = $this->request( 'patchstack_visibility_replace_v2', $payload );
+		$this->assertTrue( $result['ok'] );
+		$this->assertSame( 'hidden', $result['visibility'] );
+		$this->assertTrue( $result['changed'] );
+
+		$follow_up = $this->request( 'patchstack_protection_preview_v2', $this->base_payload( '123e4567-e89b-42d3-a456-426614174513' ) );
+		$this->assertSame( 'hidden', $follow_up['visibility'] );
+		$this->assertSame( $follow_up['state_revision'], $result['state_revision'] );
+	}
+
 	public function test_patchstack_v2_rejects_stale_conflicting_and_malformed_effects() {
 		$this->subject->plugin_state = 'installed';
 		$this->subject->visibility   = 'shown';

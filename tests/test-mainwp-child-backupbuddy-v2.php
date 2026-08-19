@@ -163,6 +163,299 @@ class Test_MainWP_Child_BackupBuddy_V2_Fixture extends MainWP_Child_Back_Up_Budd
 	}
 }
 
+/**
+ * Smallest usable stand-in for the BackupBuddy load seam. The production loader only ever calls
+ * plugin_path(), load(), and reads $options, so the ordering it must honour is observable here.
+ */
+class pb_backupbuddy { // phpcs:ignore PEAR.NamingConventions.ValidClassName.StartWithCapital -- The provider class name is fixed by BackupBuddy.
+
+	/** @var array|null */
+	public static $options;
+
+	/** @var string */
+	public static $path = '';
+
+	/** @var int */
+	public static $load_calls = 0;
+
+	/** @return string */
+	public static function plugin_path() {
+		return self::$path;
+	}
+
+	/** @return void */
+	public static function load() {
+		++self::$load_calls;
+		self::$options = array(
+			'profiles' => array(
+				0 => array(
+					'title' => 'Full',
+					'type'  => 'full',
+				),
+				4 => array(
+					'title' => 'Database',
+					'type'  => 'db',
+				),
+			),
+		);
+	}
+}
+
+/** Stand-in for the BackupBuddy core helpers the archive and delete paths call statically. */
+class backupbuddy_core { // phpcs:ignore PEAR.NamingConventions.ValidClassName.StartWithCapital -- The provider class name is fixed by BackupBuddy.
+
+	/** @var string */
+	public static $backup_directory = '';
+
+	/** @var string */
+	public static $log_directory = '';
+
+	/** @return string */
+	public static function getBackupDirectory() { // phpcs:ignore WordPress.NamingConventions.ValidFunctionName.MethodNameInvalid -- Mirrors the BackupBuddy method name.
+		return self::$backup_directory;
+	}
+
+	/** @return string */
+	public static function getLogDirectory() { // phpcs:ignore WordPress.NamingConventions.ValidFunctionName.MethodNameInvalid -- Mirrors the BackupBuddy method name.
+		return self::$log_directory;
+	}
+
+	/**
+	 * @param string $file Archive file name.
+	 * @return string
+	 */
+	public static function get_serial_from_file( $file ) {
+		$parts = explode( '-', str_replace( '.zip', '', $file ) );
+		return (string) array_pop( $parts );
+	}
+}
+
+/** Runs the real provider-facing v2 code: real options read, real archive scan, real file effects. */
+class Test_MainWP_Child_BackupBuddy_V2_Effect_Fixture extends MainWP_Child_Back_Up_Buddy {
+
+	/** Avoid product hooks in the isolated fixture. */
+	public function __construct() {
+		$this->is_backupbuddy_installed = true;
+	}
+
+	/**
+	 * @param array $archive Archive.
+	 * @return array
+	 */
+	public function call_delete_archive_effect( $archive ) {
+		return $this->abilities_v2_delete_archive_effect( $archive );
+	}
+}
+
+/** BackupBuddy v2 provider-boundary tests that execute the real filesystem and load paths. */
+class Test_MainWP_Child_BackupBuddy_V2_Provider_Boundary extends WP_UnitTestCase {
+
+	/** @var string */
+	private $root = '';
+
+	/** @var string */
+	private $request_ref = '123e4567-e89b-42d3-a456-426614174900';
+
+	public function set_up(): void {
+		parent::set_up();
+		$this->root = rtrim( get_temp_dir(), '/' ) . '/mainwp-bb-v2-' . wp_generate_password( 12, false );
+		wp_mkdir_p( $this->root . '/backups' );
+		wp_mkdir_p( $this->root . '/logs/fileoptions' );
+		wp_mkdir_p( $this->root . '/plugin/classes' );
+		// The archive scan resolves symlinked temp paths, so the fixture must speak the resolved form too.
+		$this->root = realpath( $this->root );
+		backupbuddy_core::$backup_directory = $this->root . '/backups/';
+		backupbuddy_core::$log_directory    = $this->root . '/logs/';
+		pb_backupbuddy::$path               = $this->root . '/plugin';
+		pb_backupbuddy::$options            = null;
+		pb_backupbuddy::$load_calls         = 0;
+		delete_option( 'mainwp_backupbuddy_ability_operations_v1' );
+		delete_option( 'mainwp_backupbuddy_ability_effect_lock_v1' );
+	}
+
+	public function tear_down(): void {
+		$this->remove_tree( $this->root );
+		pb_backupbuddy::$options = null;
+		delete_option( 'mainwp_backupbuddy_ability_operations_v1' );
+		delete_option( 'mainwp_backupbuddy_ability_effect_lock_v1' );
+		parent::tear_down();
+	}
+
+	/**
+	 * @param string $path Directory to remove.
+	 * @return void
+	 */
+	private function remove_tree( $path ) {
+		if ( '' === $path || ! is_dir( $path ) ) {
+			return;
+		}
+		foreach ( array_diff( scandir( $path ), array( '.', '..' ) ) as $entry ) {
+			$child = $path . '/' . $entry;
+			if ( is_dir( $child ) ) {
+				$this->remove_tree( $child );
+				continue;
+			}
+			unlink( $child );
+		}
+		rmdir( $path );
+	}
+
+	/** Deleting an archive reports the outcome the filesystem actually has, and the receipt settles. */
+	public function test_delete_archive_effect_reports_real_filesystem_outcome() {
+		$archive_path = backupbuddy_core::$backup_directory . 'backup-example_com-full-serial01.zip';
+		file_put_contents( $archive_path, str_repeat( 'z', 64 ) );
+		$auxiliary = array(
+			backupbuddy_core::$log_directory . 'fileoptions/serial01.txt',
+			backupbuddy_core::$log_directory . 'fileoptions/serial01.txt.lock',
+		);
+		foreach ( $auxiliary as $file ) {
+			file_put_contents( $file, 'x' );
+		}
+
+		$fixture  = new Test_MainWP_Child_BackupBuddy_V2_Effect_Fixture();
+		$archives = $fixture->abilities_v2(
+			array(
+				'operation' => 'list_archives',
+				'page'      => 1,
+				'per_page'  => 25,
+				'type'      => 'all',
+			)
+		);
+		$this->assertSame( 1, $archives['total'] );
+
+		$request = array(
+			'operation'            => 'delete_archive',
+			'archive_ref'          => $archives['archives'][0]['archive_ref'],
+			'expected_size_bytes'  => $archives['archives'][0]['size_bytes'],
+			'expected_modified_at' => $archives['archives'][0]['modified_at'],
+			'request_ref'          => $this->request_ref,
+		);
+		$deleted = $fixture->abilities_v2( $request );
+
+		$this->assertArrayNotHasKey( 'error', $deleted, 'A completed unlink must not be reported as an unknown outcome.' );
+		$this->assertTrue( $deleted['deleted'] );
+		$this->assertFalse( $deleted['already_absent'] );
+		$this->assertSame( 2, $deleted['auxiliary_records_removed'] );
+		$this->assertFileDoesNotExist( $archive_path );
+		foreach ( $auxiliary as $file ) {
+			$this->assertFileDoesNotExist( $file );
+		}
+
+		$this->assertSame( $deleted, $fixture->abilities_v2( $request ), 'The settled receipt must replay the recorded response.' );
+	}
+
+	/**
+	 * Deletion is decided by reading the filesystem back, never by trusting wp_delete_file()'s
+	 * return value: core returned nothing at all before 6.7, and the documented wp_delete_file
+	 * filter lets a site remove the file through its own storage layer and report failure.
+	 */
+	public function test_delete_archive_is_decided_by_readback_not_by_the_return_value() {
+		$archive_path = backupbuddy_core::$backup_directory . 'backup-example_com-full-serial03.zip';
+		file_put_contents( $archive_path, str_repeat( 'z', 64 ) );
+		$auxiliary = array(
+			backupbuddy_core::$log_directory . 'fileoptions/serial03.txt',
+			backupbuddy_core::$log_directory . 'fileoptions/serial03.txt.lock',
+		);
+		foreach ( $auxiliary as $file ) {
+			file_put_contents( $file, 'x' );
+		}
+
+		$fixture  = new Test_MainWP_Child_BackupBuddy_V2_Effect_Fixture();
+		$archives = $fixture->abilities_v2(
+			array(
+				'operation' => 'list_archives',
+				'page'      => 1,
+				'per_page'  => 25,
+				'type'      => 'all',
+			)
+		);
+
+		$root = $this->root;
+		add_filter(
+			'wp_delete_file',
+			static function ( $file ) use ( $root ) {
+				if ( is_string( $file ) && 0 === strpos( $file, $root ) && is_file( $file ) ) {
+					unlink( $file );
+				}
+				return '';
+			}
+		);
+
+		$request = array(
+			'operation'            => 'delete_archive',
+			'archive_ref'          => $archives['archives'][0]['archive_ref'],
+			'expected_size_bytes'  => $archives['archives'][0]['size_bytes'],
+			'expected_modified_at' => $archives['archives'][0]['modified_at'],
+			'request_ref'          => $this->request_ref,
+		);
+		$deleted = $fixture->abilities_v2( $request );
+
+		$this->assertFileDoesNotExist( $archive_path );
+		$this->assertArrayNotHasKey( 'error', $deleted, 'A removed archive must not be reported as an unknown outcome.' );
+		$this->assertTrue( $deleted['deleted'] );
+		$this->assertSame( 2, $deleted['auxiliary_records_removed'] );
+		$this->assertSame( $deleted, $fixture->abilities_v2( $request ), 'The settled receipt must replay the recorded response.' );
+	}
+
+	/** An archive that cannot be removed is reported as an unknown outcome, not a success. */
+	public function test_delete_archive_effect_reports_failure_when_the_file_survives() {
+		$directory = backupbuddy_core::$backup_directory . 'backup-example_com-full-serial02.zip';
+		wp_mkdir_p( $directory );
+
+		$fixture = new Test_MainWP_Child_BackupBuddy_V2_Effect_Fixture();
+		$effect  = $fixture->call_delete_archive_effect(
+			array(
+				'internal_id' => 'backup-example_com-full-serial02.zip',
+				'path'        => $directory,
+			)
+		);
+
+		$this->assertFalse( $effect['deleted'] );
+		$this->assertSame( 0, $effect['auxiliary_records_removed'] );
+	}
+
+	/** v2 reads run after the provider is loaded, so they see real profiles instead of an empty site. */
+	public function test_v2_reads_see_loaded_provider_state() {
+		$core_class = 'Test_MainWP_BackupBuddy_Late_Core';
+		file_put_contents(
+			pb_backupbuddy::$path . '/classes/core.php',
+			"<?php\n\$GLOBALS['mainwp_test_bb_core_loaded'] = true;\nclass " . $core_class . " {}\n"
+		);
+		unset( $GLOBALS['mainwp_test_bb_core_loaded'] );
+
+		$fixture                          = new Test_MainWP_Child_BackupBuddy_V2_Effect_Fixture();
+		$fixture->backupbuddy_core_class  = $core_class;
+		$profiles                         = $fixture->abilities_v2(
+			array(
+				'operation' => 'list_profiles',
+				'page'      => 1,
+				'per_page'  => 25,
+			)
+		);
+
+		$this->assertSame( 1, pb_backupbuddy::$load_calls, 'The dispatcher must load provider options before reading them.' );
+		$this->assertTrue( isset( $GLOBALS['mainwp_test_bb_core_loaded'] ), 'The dispatcher must require the provider core file before reading.' );
+		$this->assertSame( 2, $profiles['total'], 'A site with real profiles must not report an empty page.' );
+		$this->assertTrue( class_exists( $core_class, false ) );
+	}
+
+	/** A site without BackupBuddy still gets the closed unavailable envelope rather than a fatal. */
+	public function test_missing_backupbuddy_still_fails_closed() {
+		$fixture                         = new Test_MainWP_Child_BackupBuddy_V2_Effect_Fixture();
+		$fixture->is_backupbuddy_installed = false;
+		$result                          = $fixture->abilities_v2(
+			array(
+				'operation' => 'list_profiles',
+				'page'      => 1,
+				'per_page'  => 25,
+			)
+		);
+
+		$this->assertSame( 'backupbuddy_unavailable', $result['error']['code'] );
+		$this->assertSame( 0, pb_backupbuddy::$load_calls );
+	}
+}
+
 /** BackupBuddy v2 protocol contract tests. */
 class Test_MainWP_Child_BackupBuddy_Abilities_V2 extends WP_UnitTestCase {
 

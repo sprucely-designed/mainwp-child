@@ -1210,11 +1210,14 @@ class MainWP_Child_Timecapsule { //phpcs:ignore -- NOSONAR - multi methods.
         global $wpdb;
 
         // Direct query for dynamic backup data; caching would return stale backup progress.
+        // wptc_processed_files holds a row per processed file, so group to one row per backup:
+        // a single full backup is tens of thousands of rows and callers only ever want backups.
         return $wpdb->get_results( //phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
             $wpdb->prepare(
                 "SELECT backupID
                 FROM {$wpdb->base_prefix}wptc_processed_files
-                WHERE backupID > %s ",
+                WHERE backupID > %s
+                GROUP BY backupID ",
                 $last_time
             )
         );

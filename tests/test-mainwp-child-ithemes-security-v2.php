@@ -93,26 +93,126 @@ class Test_MainWP_Child_IThemes_Security_V2 extends WP_UnitTestCase {
 		}
 	}
 
-	public function test_v2_dispatcher_initializes_solid_before_dispatching_without_preload() {
-		$source       = file_get_contents( dirname( __DIR__ ) . '/class/class-mainwp-child-ithemes-security.php' );
-		$provider_gate = strpos( $source, "if ( ! class_exists( '\\ITSEC_Core' ) || ! class_exists( '\\ITSEC_Modules' ) )" );
-		$module_path   = strpos( $source, "\\ITSEC_Core::get_core_dir() . '/modules/';" );
-		$v2_dispatch   = strpos( $source, "if ( 'abilities_v2' === \$mwp_action )" );
+	public function test_v2_requests_reach_the_protocol_on_a_site_without_solid() {
+		$this->assertFalse( class_exists( '\ITSEC_Core' ), 'Solid must be absent, otherwise this test cannot see the v1 bail.' );
+		$respond = $this->action_response_method();
 
-		$this->assertIsInt( $provider_gate );
-		$this->assertIsInt( $module_path );
-		$this->assertIsInt( $v2_dispatch );
-		$this->assertLessThan( $v2_dispatch, $provider_gate );
-		$this->assertLessThan( $v2_dispatch, $module_path );
+		try {
+			$_POST['request'] = wp_json_encode(
+				array(
+					'protocol'  => '2',
+					'operation' => 'capabilities',
+					'payload'   => array(),
+				)
+			);
+			$capabilities     = $respond->invoke( $this->subject, 'abilities_v2' );
+
+			$_POST['request'] = wp_json_encode(
+				array(
+					'protocol'  => '2',
+					'operation' => 'ability_solid_summary_v2',
+					'payload'   => array(),
+				)
+			);
+			$summary          = $respond->invoke( $this->subject, 'abilities_v2' );
+		} finally {
+			unset( $_POST['request'] );
+		}
+
+		$this->assertSame( array( 'protocol', 'operation', 'ok', 'operations', 'mutation_supported' ), array_keys( $capabilities ) );
+		$this->assertTrue( $capabilities['ok'] );
+		$this->assertFalse( $capabilities['mutation_supported'] );
+
+		$this->assertSame( array( 'protocol', 'operation', 'ok', 'code' ), array_keys( $summary ) );
+		$this->assertFalse( $summary['ok'] );
+		$this->assertSame( 'plugin_unavailable', $summary['code'] );
 	}
 
-	public function test_file_scan_receipt_repoll_is_present_and_keeps_the_intermediate_state_closed() {
-		$source = file_get_contents( dirname( __DIR__ ) . '/class/class-mainwp-child-ithemes-security.php' );
+	public function test_v1_actions_are_not_diverted_into_the_v2_protocol() {
+		$respond = $this->action_response_method();
 
-		$this->assertStringContainsString( "'ability_solid_file_scan_v2' === \$operation && true === \$receipt['response']['accepted'] && false === \$receipt['response']['completed']", $source );
-		$this->assertStringContainsString( 'abilities_v2_poll_file_scan()', $source );
-		$this->assertStringContainsString( "'changes_found'", $source );
-		$this->assertStringContainsString( "'clean'", $source );
+		$this->assertNull( $respond->invoke( $this->subject, 'file_change' ) );
+		$this->assertNull( $respond->invoke( $this->subject, '' ) );
+	}
+
+	public function test_file_scan_repoll_keeps_the_intermediate_state_closed_without_rescanning() {
+		$fixture                                       = new IThemes_Security_V2_Protocol_Fixture();
+		$fixture->results['ability_solid_file_scan_v2'] = array(
+			'accepted'   => true,
+			'completed'  => false,
+			'outcome'    => 'accepted',
+			'generation' => str_repeat( 'a', 64 ),
+		);
+		$request                                       = array(
+			'protocol'    => '2',
+			'operation'   => 'ability_solid_file_scan_v2',
+			'request_ref' => '123e4567-e89b-42d3-a456-426614174705',
+			'payload'     => array(),
+		);
+
+		$accepted = $fixture->abilities_v2( $request );
+		$this->assertTrue( $accepted['ok'] );
+		$this->assertTrue( $accepted['accepted'] );
+		$this->assertFalse( $accepted['completed'] );
+		$this->assertSame( 'accepted', $accepted['outcome'] );
+
+		$repoll = $fixture->abilities_v2( $request );
+
+		$this->assertCount( 1, $fixture->calls, 'A repoll must read the running scan, never submit a second one.' );
+		$this->assertSame( array( 'protocol', 'operation', 'ok', 'code' ), array_keys( $repoll ) );
+		$this->assertFalse( $repoll['ok'] );
+		$this->assertSame( 'plugin_unavailable', $repoll['code'] );
+
+		$receipts = get_option( 'mainwp_solid_abilities_v2_receipts', array() );
+		$this->assertSame( $accepted, $receipts[ $request['request_ref'] ]['response'] );
+	}
+
+	public function test_file_scan_poll_loads_the_file_change_module_before_judging_it_absent() {
+		global $mainwp_itsec_modules_path;
+		$previous = $mainwp_itsec_modules_path;
+		$modules  = get_temp_dir() . uniqid( 'solid-modules-' ) . '/';
+		$marker   = $modules . 'loaded.txt';
+		mkdir( $modules . 'file-change', 0777, true );
+		// Stubs record the load and define nothing, so the poll must still fail closed after requiring them.
+		file_put_contents( $modules . 'file-change/scanner.php', '<?php file_put_contents( ' . var_export( $marker, true ) . ", 'scanner', FILE_APPEND );" );
+		file_put_contents( $modules . 'file-change/class-itsec-file-change.php', '<?php file_put_contents( ' . var_export( $marker, true ) . ", 'change', FILE_APPEND );" );
+
+		try {
+			$mainwp_itsec_modules_path = $modules;
+			$result                    = $this->poll_file_scan_method()->invoke( $this->subject );
+			$loaded                    = file_exists( $marker ) ? file_get_contents( $marker ) : '';
+		} finally {
+			$mainwp_itsec_modules_path = $previous;
+			array_map( 'unlink', glob( $modules . 'file-change/*' ) );
+			array_map( 'unlink', glob( $modules . '*.txt' ) );
+			rmdir( $modules . 'file-change' );
+			rmdir( $modules );
+		}
+
+		$this->assertSame( 'scannerchange', $loaded );
+		$this->assertInstanceOf( \WP_Error::class, $result );
+		$this->assertSame( 'plugin_unavailable', $result->get_error_code() );
+	}
+
+	public function test_file_scan_poll_fails_closed_without_a_module_path_or_module_files() {
+		global $mainwp_itsec_modules_path;
+		$previous = $mainwp_itsec_modules_path;
+		$poll     = $this->poll_file_scan_method();
+
+		try {
+			$mainwp_itsec_modules_path = null;
+			$unset_path                = $poll->invoke( $this->subject );
+
+			$mainwp_itsec_modules_path = get_temp_dir() . uniqid( 'solid-absent-' ) . '/';
+			$missing_files             = $poll->invoke( $this->subject );
+		} finally {
+			$mainwp_itsec_modules_path = $previous;
+		}
+
+		$this->assertInstanceOf( \WP_Error::class, $unset_path );
+		$this->assertSame( 'plugin_unavailable', $unset_path->get_error_code() );
+		$this->assertInstanceOf( \WP_Error::class, $missing_files );
+		$this->assertSame( 'plugin_unavailable', $missing_files->get_error_code() );
 	}
 
 	public function test_summary_projection_is_closed_bounded_and_redacted() {
@@ -458,6 +558,20 @@ class Test_MainWP_Child_IThemes_Security_V2 extends WP_UnitTestCase {
 		$result = $this->request( 'capabilities', array( 'extra' => true ) );
 		$this->assertFalse( $result['ok'] );
 		$this->assertSame( 'unsupported_operation', $result['code'] );
+	}
+
+	private function action_response_method() {
+		$method = ( new ReflectionClass( MainWP_Child_IThemes_Security::class ) )->getMethod( 'abilities_v2_action_response' );
+		$method->setAccessible( true );
+
+		return $method;
+	}
+
+	private function poll_file_scan_method() {
+		$method = ( new ReflectionClass( MainWP_Child_IThemes_Security::class ) )->getMethod( 'abilities_v2_poll_file_scan' );
+		$method->setAccessible( true );
+
+		return $method;
 	}
 
 	private function request( $operation, $payload ) {

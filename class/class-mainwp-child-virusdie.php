@@ -211,18 +211,18 @@ class MainWP_Child_Virusdie {
         }
         $bytes = $this->download_artifact( $payload['gateway_url'], $payload['gateway_token'], $payload['expected_bytes'] );
         if ( ! is_string( $bytes ) || strlen( $bytes ) !== $payload['expected_bytes'] || ! hash_equals( $payload['expected_sha256'], hash( 'sha256', is_string( $bytes ) ? $bytes : '' ) ) ) {
-            return $this->settle_failure( $dispatching, 'digest_mismatch' );
+            return $this->settle_failure( $dispatching, 'digest_mismatch', $this->target_snapshot( $payload['basename'] ) );
         }
         $fresh = $this->target_snapshot( $payload['basename'] );
         if ( ! $this->valid_snapshot( $fresh ) || $fresh !== $before ) {
-            return $this->settle_failure( $dispatching, 'stale_target' );
+            return $this->settle_failure( $dispatching, 'stale_target', $fresh );
         }
         if ( true !== $this->install_artifact( $payload['basename'], $bytes ) ) {
-            return $this->settle_failure( $dispatching, 'outcome_unknown', 'unknown' );
+            return $this->settle_failure( $dispatching, 'outcome_unknown', $this->target_snapshot( $payload['basename'] ), 'unknown' );
         }
         $after = $this->target_snapshot( $payload['basename'] );
         if ( ! $this->valid_snapshot( $after ) || ! $after['exists'] || $payload['expected_bytes'] !== $after['bytes'] || ! hash_equals( $payload['expected_sha256'], $after['sha256'] ) ) {
-            return $this->settle_failure( $dispatching, 'outcome_unknown', 'unknown' );
+            return $this->settle_failure( $dispatching, 'outcome_unknown', $after, 'unknown' );
         }
         return $this->settle_result( $dispatching, $this->result( 'install', $payload['request_ref'], 'completed', true, $after['bytes'], $after['sha256'], null ) );
     }
@@ -255,14 +255,14 @@ class MainWP_Child_Virusdie {
         }
         $fresh = $this->target_snapshot( $payload['basename'] );
         if ( ! $this->valid_snapshot( $fresh ) || $fresh !== $before ) {
-            return $this->settle_failure( $dispatching, 'stale_target' );
+            return $this->settle_failure( $dispatching, 'stale_target', $fresh );
         }
         if ( true !== $this->remove_artifact( $payload['basename'] ) ) {
-            return $this->settle_failure( $dispatching, 'outcome_unknown', 'unknown' );
+            return $this->settle_failure( $dispatching, 'outcome_unknown', $this->target_snapshot( $payload['basename'] ), 'unknown' );
         }
         $after = $this->target_snapshot( $payload['basename'] );
         if ( ! $this->valid_snapshot( $after ) || $after['exists'] ) {
-            return $this->settle_failure( $dispatching, 'outcome_unknown', 'unknown' );
+            return $this->settle_failure( $dispatching, 'outcome_unknown', $after, 'unknown' );
         }
         return $this->settle_result( $dispatching, $this->result( 'remove', $payload['request_ref'], 'completed', false, null, null, null ) );
     }
@@ -332,9 +332,14 @@ class MainWP_Child_Virusdie {
         return 'dispatching' === $receipt['state'] ? $this->unknown_result( $receipt ) : $receipt['result'];
     }
 
-    /** Persist one failure. */
-    private function settle_failure( $dispatching, $code, $status = 'failed' ) {
-        return $this->settle_result( $dispatching, $this->result( $dispatching['operation'], $dispatching['request_ref'], $status, 'remove' !== $dispatching['operation'], null, null, $code ) );
+    /** Persist one failure carrying the observed target state. */
+    private function settle_failure( $dispatching, $code, $snapshot, $status = 'failed' ) {
+        return $this->settle_result( $dispatching, $this->result( $dispatching['operation'], $dispatching['request_ref'], $status, $this->observed_installed( $snapshot ), null, null, $code ) );
+    }
+
+    /** Report what the target actually is; null when it cannot be read. */
+    private function observed_installed( $snapshot ) {
+        return $this->valid_snapshot( $snapshot ) ? $snapshot['exists'] : null;
     }
 
     /** Persist one terminal result with exact-read reconciliation. */
@@ -367,7 +372,7 @@ class MainWP_Child_Virusdie {
 
     /** Return truthful unknown state for a reserved effect. */
     private function unknown_result( $receipt ) {
-        return $this->result( $receipt['operation'], $receipt['request_ref'], 'unknown', 'remove' !== $receipt['operation'], null, null, 'outcome_unknown' );
+        return $this->result( $receipt['operation'], $receipt['request_ref'], 'unknown', $this->observed_installed( $this->target_snapshot( $receipt['basename'] ) ), null, null, 'outcome_unknown' );
     }
 
     /** Validate install input. */
@@ -414,7 +419,7 @@ class MainWP_Child_Virusdie {
 
     /** Validate one stored public result. */
     private function valid_result( $result, $operation, $request_ref ) {
-        if ( ! is_array( $result ) || ! $this->exact_keys( $result, array( 'protocol', 'operation', 'ok', 'request_ref', 'status', 'installed', 'bytes', 'sha256', 'code' ) ) || '1' !== $result['protocol'] || $operation !== $result['operation'] || ! is_bool( $result['ok'] ) || $request_ref !== $result['request_ref'] || ! in_array( $result['status'], array( 'completed', 'failed', 'unknown' ), true ) || ! is_bool( $result['installed'] ) || ( null !== $result['bytes'] && ( ! is_int( $result['bytes'] ) || 0 > $result['bytes'] || self::MAX_ARTIFACT_BYTES < $result['bytes'] ) ) || ( null !== $result['sha256'] && ! $this->hash_ref( $result['sha256'] ) ) || ( null !== $result['code'] && ( ! is_string( $result['code'] ) || 1 !== preg_match( '/^[a-z0-9_]{1,64}$/D', $result['code'] ) ) ) ) {
+        if ( ! is_array( $result ) || ! $this->exact_keys( $result, array( 'protocol', 'operation', 'ok', 'request_ref', 'status', 'installed', 'bytes', 'sha256', 'code' ) ) || '1' !== $result['protocol'] || $operation !== $result['operation'] || ! is_bool( $result['ok'] ) || $request_ref !== $result['request_ref'] || ! in_array( $result['status'], array( 'completed', 'failed', 'unknown' ), true ) || ( 'completed' === $result['status'] ? ! is_bool( $result['installed'] ) : ( null !== $result['installed'] && ! is_bool( $result['installed'] ) ) ) || ( null !== $result['bytes'] && ( ! is_int( $result['bytes'] ) || 0 > $result['bytes'] || self::MAX_ARTIFACT_BYTES < $result['bytes'] ) ) || ( null !== $result['sha256'] && ! $this->hash_ref( $result['sha256'] ) ) || ( null !== $result['code'] && ( ! is_string( $result['code'] ) || 1 !== preg_match( '/^[a-z0-9_]{1,64}$/D', $result['code'] ) ) ) ) {
             return false;
         }
         return ( 'completed' === $result['status'] ) === $result['ok'] && ( $result['ok'] ? null === $result['code'] : null !== $result['code'] );

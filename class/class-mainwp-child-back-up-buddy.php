@@ -587,6 +587,7 @@ class MainWP_Child_Back_Up_Buddy { //phpcs:ignore -- NOSONAR - multi methods.
         if ( ! $this->is_backupbuddy_installed ) {
             return $this->abilities_v2_error( 'backupbuddy_unavailable' );
         }
+        $this->abilities_v2_load_provider();
 
         if ( 0 === strpos( $operation, 'list_' ) ) {
             $page     = isset( $request['page'] ) ? $request['page'] : 1;
@@ -627,6 +628,28 @@ class MainWP_Child_Back_Up_Buddy { //phpcs:ignore -- NOSONAR - multi methods.
                 return $this->abilities_v2_start_transfer( $request );
         }
         return $this->abilities_v2_error( 'invalid_request' );
+    }
+
+    /**
+     * The v2 dispatcher never reaches the legacy action() branch that loads BackupBuddy, so every
+     * v2 read would otherwise see an unset \pb_backupbuddy::$options and a missing core class and
+     * report an empty site. Each step is guarded so a site without BackupBuddy cannot fatal here.
+     *
+     * @return void
+     */
+    protected function abilities_v2_load_provider() {
+        if ( ! class_exists( '\\pb_backupbuddy' ) || ! method_exists( '\\pb_backupbuddy', 'plugin_path' ) ) {
+            return;
+        }
+        if ( ! class_exists( $this->backupbuddy_core_class ) ) {
+            $core_file = \pb_backupbuddy::plugin_path() . $this->path_core_file;
+            if ( file_exists( $core_file ) ) {
+                require_once $core_file; // NOSONAR - WP compatible.
+            }
+        }
+        if ( ! isset( \pb_backupbuddy::$options ) && method_exists( '\\pb_backupbuddy', 'load' ) ) {
+            \pb_backupbuddy::load();
+        }
     }
 
     /** @return int */
@@ -1705,14 +1728,23 @@ class MainWP_Child_Back_Up_Buddy { //phpcs:ignore -- NOSONAR - multi methods.
         if ( ! isset( $archive['path'] ) || ! is_string( $archive['path'] ) || ! file_exists( $archive['path'] ) || is_link( $archive['path'] ) ) {
             return array( 'deleted' => false, 'auxiliary_records_removed' => 0 );
         }
-        if ( true !== wp_delete_file( $archive['path'] ) || file_exists( $archive['path'] ) ) {
+        // wp_delete_file() only gained a return value in WP 6.7 and the wp_delete_file filter can move
+        // the delete elsewhere, so on the 6.2+ range we support absence on readback is the only truth.
+        wp_delete_file( $archive['path'] );
+        clearstatcache( true, $archive['path'] );
+        if ( file_exists( $archive['path'] ) ) {
             return array( 'deleted' => false, 'auxiliary_records_removed' => 0 );
         }
         $removed = 0;
         if ( class_exists( $this->backupbuddy_core_class ) && method_exists( $this->backupbuddy_core_class, 'get_serial_from_file' ) && method_exists( $this->backupbuddy_core_class, 'getLogDirectory' ) ) {
             $serial = \backupbuddy_core::get_serial_from_file( $archive['internal_id'] );
             foreach ( array( \backupbuddy_core::getLogDirectory() . 'fileoptions/' . $serial . '.txt', \backupbuddy_core::getLogDirectory() . 'fileoptions/' . $serial . '.txt.lock' ) as $auxiliary ) {
-                if ( file_exists( $auxiliary ) && true === wp_delete_file( $auxiliary ) && ! file_exists( $auxiliary ) ) {
+                if ( ! file_exists( $auxiliary ) ) {
+                    continue;
+                }
+                wp_delete_file( $auxiliary );
+                clearstatcache( true, $auxiliary );
+                if ( ! file_exists( $auxiliary ) ) {
                     ++$removed;
                 }
             }

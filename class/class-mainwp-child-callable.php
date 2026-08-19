@@ -27,6 +27,15 @@ class MainWP_Child_Callable { //phpcs:ignore -- NOSONAR - multi methods.
     const POST_DRIPPER_REQUEST_MAX_BYTES = 262144;
 
     /**
+     * Maximum serialized Post Plus v2 request.
+     *
+     * The handler's own field limits add up to roughly 246 KB, and JSON encoding can expand a
+     * legal payload sixfold because every control byte becomes \u00XX, so anything below ~1.5 MB
+     * would drop valid posts here before the handler ever saw them.
+     */
+    const POST_PLUS_REQUEST_MAX_BYTES = 2097152;
+
+    /**
      * Public static variable to hold the single instance of the class.
      *
      * @var mixed Default null
@@ -468,7 +477,7 @@ class MainWP_Child_Callable { //phpcs:ignore -- NOSONAR - multi methods.
 
         // phpcs:ignore WordPress.Security.NonceVerification.Missing,WordPress.Security.ValidatedSanitizedInput.InputNotSanitized -- Closed JSON is validated by the handler.
         $raw = wp_unslash( $_POST['request'] );
-        if ( '' === $raw || 4096 < strlen( $raw ) ) {
+        if ( '' === $raw || self::POST_PLUS_REQUEST_MAX_BYTES < strlen( $raw ) ) {
             MainWP_Helper::write( MainWP_Child_Posts::get_instance()->post_plus_capabilities_v2( null ) );
         }
 

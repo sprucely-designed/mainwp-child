@@ -99,8 +99,11 @@ class Test_MainWP_Child_Timecapsule_V2 extends WP_UnitTestCase {
 	}
 
 	public function tear_down(): void {
+		global $wpdb;
 		delete_option( 'mainwp_timecapsule_abilities_v2_receipts' );
 		delete_option( 'mainwp_timecapsule_abilities_v2_operations' );
+		// DDL commits outside the harness transaction, so the fixture table has to be dropped explicitly.
+		$wpdb->query( 'DROP TABLE IF EXISTS ' . $wpdb->base_prefix . 'wptc_processed_files' ); // phpcs:ignore WordPress.DB -- Fixture table for a provider-owned schema.
 		parent::tear_down();
 	}
 
@@ -281,6 +284,60 @@ class Test_MainWP_Child_Timecapsule_V2 extends WP_UnitTestCase {
 		);
 		$this->assertFalse( $this->request( 'site' )['ok'] );
 		$this->assertFalse( $this->request( 'policy' )['ok'] );
+	}
+
+	/**
+	 * wptc_processed_files holds one row per processed file, so a single real backup is tens of
+	 * thousands of rows. The v2 reads must see backups, not files, and must not trip the bound.
+	 */
+	public function test_get_backups_projects_distinct_backups_from_processed_file_rows() {
+		global $wpdb;
+
+		$table = $wpdb->base_prefix . 'wptc_processed_files';
+		$wpdb->query( "DROP TABLE IF EXISTS {$table}" ); // phpcs:ignore WordPress.DB -- Fixture table for a provider-owned schema.
+		$wpdb->query( "CREATE TABLE {$table} ( id BIGINT NOT NULL AUTO_INCREMENT, backupID BIGINT NOT NULL, file_path VARCHAR(190) NOT NULL, PRIMARY KEY (id) )" ); // phpcs:ignore WordPress.DB -- Fixture table for a provider-owned schema.
+
+		$backup_ids = array( 1723456789, 1723543189 );
+		foreach ( $backup_ids as $backup_id ) {
+			for ( $chunk = 0; $chunk < 3; $chunk++ ) {
+				$values = array();
+				for ( $index = 0; $index < 2000; $index++ ) {
+					$values[] = $wpdb->prepare( '(%d, %s)', $backup_id, 'wp-content/file-' . $chunk . '-' . $index . '.php' );
+				}
+				$wpdb->query( "INSERT INTO {$table} (backupID, file_path) VALUES " . implode( ',', $values ) ); // phpcs:ignore WordPress.DB -- Fixture rows for a provider-owned schema.
+			}
+		}
+		$this->assertSame( '12000', $wpdb->get_var( "SELECT COUNT(*) FROM {$table}" ) ); // phpcs:ignore WordPress.DB -- Fixture table for a provider-owned schema.
+
+		$method = new \ReflectionMethod( MainWP_Child_Timecapsule::class, 'get_backups' );
+		$method->setAccessible( true );
+		$rows = $method->invoke( $this->subject, 1 );
+		$this->assertCount( 2, $rows, 'get_backups() must return one row per backup, not per processed file.' );
+		$this->assertSame( $backup_ids, array_map( 'intval', wp_list_pluck( $rows, 'backupID' ) ) );
+
+		$list = $this->subject->abilities_v2(
+			array(
+				'protocol'  => '2',
+				'operation' => 'list_backups',
+				'payload'   => array( 'limit' => 50, 'after_backup_ref' => null ),
+			)
+		);
+		$this->assertTrue( $list['ok'], 'A site with a realistic processed-file table must not report an invalid schema.' );
+		$this->assertCount( 2, $list['backups'] );
+		$this->assertFalse( $list['truncated'] );
+
+		$preview = $this->subject->abilities_v2(
+			array(
+				'protocol'  => '2',
+				'operation' => 'preview_restore',
+				'payload'   => array(
+					'backup_ref'        => $list['backups'][0]['backup_ref'],
+					'backup_generation' => $list['backups'][0]['generation'],
+					'scope'             => 'full',
+				),
+			)
+		);
+		$this->assertTrue( $preview['ok'] );
 	}
 
 	private function request( $operation ) {

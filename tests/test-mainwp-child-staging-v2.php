@@ -36,6 +36,9 @@ class Test_MainWP_Child_Staging_V2_Fixture extends MainWP_Child_Staging {
 	/** @var bool */
 	public $jobs_ready = true;
 
+	/** @var bool */
+	public $preview_ready = true;
+
 	/** Avoid installed-plugin lookup. */
 	public function __construct() {
 		$this->is_plugin_installed = true;
@@ -60,6 +63,11 @@ class Test_MainWP_Child_Staging_V2_Fixture extends MainWP_Child_Staging {
 	/** @return bool */
 	protected function abilities_v2_provider_supports_mutation() {
 		return $this->jobs_ready;
+	}
+
+	/** @return bool */
+	protected function abilities_v2_provider_supports_preview() {
+		return $this->preview_ready;
 	}
 
 	/** @return array */
@@ -349,7 +357,7 @@ class Test_MainWP_Child_Staging_V2 extends WP_UnitTestCase {
 				'payload'   => array(),
 			)
 		);
-		$this->assertSame( array( 'inventory', 'settings', 'preview' ), $capabilities['operations'] );
+		$this->assertSame( array( 'inventory', 'settings' ), $capabilities['operations'] );
 		$this->assertFalse( $capabilities['mutation_supported'] );
 
 		$current = $subject->abilities_v2(
@@ -385,6 +393,57 @@ class Test_MainWP_Child_Staging_V2 extends WP_UnitTestCase {
 		$this->assertSame( 'unsupported_operation', $result['error_code'] );
 		$this->assertFalse( get_option( 'wpstg_settings', false ), 'A provider-absent site must not gain WP Staging settings.' );
 		$this->assertSame( array(), get_option( 'mainwp_staging_abilities_v2_receipts', array() ) );
+	}
+
+	/**
+	 * Preview answers from a provider scanner, and the base Child has none. Advertising it anyway
+	 * sends the Dashboard into a request that can only come back provider_schema_invalid.
+	 */
+	public function test_preview_is_neither_advertised_nor_dispatched_without_a_provider_scanner() {
+		$subject = ( new ReflectionClass( MainWP_Child_Staging::class ) )->newInstanceWithoutConstructor();
+
+		$capabilities = $subject->abilities_v2(
+			array(
+				'protocol'  => '2',
+				'operation' => 'capabilities',
+				'payload'   => array(),
+			)
+		);
+		$this->assertNotContains( 'preview', $capabilities['operations'] );
+
+		$preview = $subject->abilities_v2(
+			array(
+				'protocol'  => '2',
+				'operation' => 'preview',
+				'payload'   => array(
+					'kind'      => 'create',
+					'clone_ref' => null,
+				),
+			)
+		);
+
+		$this->assertFalse( $preview['ok'] );
+		$this->assertSame( 'unsupported_operation', $preview['error_code'] );
+	}
+
+	/** A Child that has wired a scanner keeps advertising and running preview. */
+	public function test_preview_stays_available_where_a_provider_scanner_is_wired() {
+		$this->assertContains( 'preview', $this->invoke_v2( 'capabilities', array() )['operations'] );
+
+		$this->staging->preview_ready = false;
+
+		$capabilities = $this->invoke_v2( 'capabilities', array() );
+		$preview      = $this->invoke_v2(
+			'preview',
+			array(
+				'kind'      => 'create',
+				'clone_ref' => null,
+			)
+		);
+
+		$this->assertNotContains( 'preview', $capabilities['operations'] );
+		$this->assertSame( 'unsupported_operation', $preview['error_code'] );
+		$this->assertSame( 0, $this->staging->preview_calls, 'A refused preview must never reach the provider seam.' );
 	}
 
 	/** Job status is an adapter read, so a Child without the adapter must not offer it. */

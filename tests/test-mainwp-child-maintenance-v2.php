@@ -446,7 +446,12 @@ class Test_MainWP_Child_Maintenance_V2 extends WP_UnitTestCase {
 		);
 	}
 
-	public function test_orphaned_transient_does_not_discard_completed_deletions() {
+	/**
+	 * A timeout row whose value option is already gone is a transient that is deleted, not one the
+	 * Child was refused. The run clears the leftover row and counts it, instead of reporting a
+	 * failure for work nothing is left to do.
+	 */
+	public function test_orphaned_transient_row_is_cleared_and_counted_instead_of_failing_the_run() {
 		if ( wp_using_ext_object_cache() ) {
 			$this->markTestSkipped( 'Transient maintenance reports unsupported behind an external object cache.' );
 		}
@@ -459,17 +464,68 @@ class Test_MainWP_Child_Maintenance_V2 extends WP_UnitTestCase {
 
 		$this->assertSame( 3, $preview['impacts'][0]['would_affect'] );
 		$this->assertTrue( $result['ok'] );
+		$this->assertSame( 'succeeded', $result['status'] );
 		$this->assertSame(
 			array(
 				'action'     => 'transients_expired',
-				'status'     => 'failed',
-				'affected'   => 2,
-				'error_code' => 'mutation_failed',
+				'status'     => 'succeeded',
+				'affected'   => 3,
+				'error_code' => null,
 			),
 			$result['outcomes'][0]
 		);
 		$this->assertFalse( get_option( '_transient_mwp_maint_a' ) );
 		$this->assertFalse( get_option( '_transient_mwp_maint_b' ) );
+		$this->assertFalse( get_option( '_transient_timeout_mwp_maint_ghost' ) );
+	}
+
+	/**
+	 * A transient can be named after the prefix itself, and `_transient_ghost` is stored as
+	 * `_transient__transient_ghost`. Stripping every occurrence instead of the leading one turns
+	 * that into `ghost`, a different transient the run would delete in its place.
+	 */
+	public function test_a_transient_named_after_the_prefix_round_trips_through_preview_and_execute() {
+		if ( wp_using_ext_object_cache() ) {
+			$this->markTestSkipped( 'Transient maintenance reports unsupported behind an external object cache.' );
+		}
+		$this->clear_transients();
+		set_transient( '_transient_ghost', 'target', HOUR_IN_SECONDS );
+		set_transient( 'ghost', 'bystander', HOUR_IN_SECONDS );
+
+		list( $preview, $result ) = $this->real_execute( $this->real_subject(), array( 'transients_all' ), 5, '123e4567-e89b-42d3-a456-426614174519' );
+
+		$this->assertSame( 2, $preview['impacts'][0]['would_affect'] );
+		$this->assertSame( 'succeeded', $result['status'] );
+		$this->assertSame( 2, $result['outcomes'][0]['affected'] );
+		$this->assertFalse( get_option( '_transient__transient_ghost' ) );
+		$this->assertFalse( get_option( '_transient_ghost' ) );
+	}
+
+	/**
+	 * The legacy maintenance paths strip the same prefixes. Unanchored, an expired transient named
+	 * `x_transient_timeout_y` resolves to `xy` and the sweep deletes that unexpired transient
+	 * instead, and a `_transient_ghost` row survives a delete-all run for the same reason.
+	 */
+	public function test_legacy_transient_cleanup_strips_only_the_leading_prefix() {
+		if ( wp_using_ext_object_cache() ) {
+			$this->markTestSkipped( 'Transient maintenance reports unsupported behind an external object cache.' );
+		}
+		$this->clear_transients();
+		$subject = $this->real_subject();
+		set_transient( 'x_transient_timeout_y', 'target', -100 );
+		set_transient( 'xy', 'bystander', HOUR_IN_SECONDS );
+
+		$this->invoke_private( $subject, 'maintenance_delete_expired_transients' );
+
+		$this->assertFalse( get_option( '_transient_x_transient_timeout_y' ) );
+		$this->assertSame( 'bystander', get_transient( 'xy' ) );
+
+		set_transient( '_transient_ghost', 'target', HOUR_IN_SECONDS );
+
+		$this->invoke_private( $subject, 'maintenance_delete_all_transients' );
+
+		$this->assertFalse( get_option( '_transient__transient_ghost' ) );
+		$this->assertFalse( get_option( '_transient_xy' ) );
 	}
 
 	public function test_transient_preview_counts_each_transient_once() {
@@ -527,6 +583,60 @@ class Test_MainWP_Child_Maintenance_V2 extends WP_UnitTestCase {
 		$this->assertLessThanOrEqual( 2, count( $deletes ) );
 		$remaining = $wpdb->get_col( $wpdb->prepare( "SELECT ID FROM $wpdb->posts WHERE post_type = 'revision' AND post_parent = %d ORDER BY post_modified DESC, ID DESC", $parent_id ) );
 		$this->assertSame( array( $revisions[19], $revisions[18] ), array_map( 'intval', $remaining ) );
+	}
+
+	/**
+	 * A sweep that pages can run past the 300s mutation lock. Once the lock cannot be renewed the
+	 * run has to stop deleting, and still report the rows it destroyed before it stopped.
+	 */
+	public function test_revision_sweep_stops_when_the_mutation_lock_cannot_be_renewed() {
+		global $wpdb;
+		$parent_id = self::factory()->post->create();
+		for ( $index = 0; $index < 6; $index++ ) {
+			$when = gmdate( 'Y-m-d H:i:s', time() - ( 3600 * ( 6 - $index ) ) );
+			wp_insert_post(
+				array(
+					'post_type'         => 'revision',
+					'post_parent'       => $parent_id,
+					'post_status'       => 'inherit',
+					'post_title'        => 'lock-revision-' . $index,
+					'post_name'         => $parent_id . '-lock-revision-' . $index,
+					'post_date'         => $when,
+					'post_date_gmt'     => $when,
+					'post_modified'     => $when,
+					'post_modified_gmt' => $when,
+				)
+			);
+		}
+		$subject = new Renewal_Limited_MainWP_Child_Maintenance();
+		// The execute loop renews once before the action, and the first parent page renews once more.
+		$subject->renewals_before_failure = 2;
+
+		list( , $result ) = $this->real_execute( $subject, array( 'revisions' ), 2, '123e4567-e89b-42d3-a456-426614174518' );
+
+		$this->assertTrue( $result['ok'] );
+		$this->assertSame( 'unknown', $result['status'] );
+		$this->assertSame(
+			array(
+				'action'     => 'revisions',
+				'status'     => 'unknown',
+				'affected'   => 4,
+				'error_code' => 'outcome_unknown',
+			),
+			$result['outcomes'][0]
+		);
+		$this->assertFalse( $result['retryable'] );
+		$this->assertSame(
+			'2',
+			$wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM $wpdb->posts WHERE post_type = 'revision' AND post_parent = %d", $parent_id ) ),
+			'The rows the outcome reports as destroyed must really be gone.'
+		);
+	}
+
+	private function invoke_private( $subject, $method ) {
+		$reflection = new \ReflectionMethod( MainWP_Child_Maintenance::class, $method );
+		$reflection->setAccessible( true );
+		$reflection->invoke( $subject );
 	}
 
 	private function real_subject() {
@@ -674,5 +784,17 @@ class Testable_MainWP_Child_Maintenance extends MainWP_Child_Maintenance {
 
 	protected function abilities_v2_renew_mutation() {
 		return true;
+	}
+}
+
+/** Real maintenance behaviour, with a mutation lock that stops renewing after a set number of calls. */
+class Renewal_Limited_MainWP_Child_Maintenance extends MainWP_Child_Maintenance {
+
+	public $renewals_before_failure = 0;
+	public $renewal_calls = 0;
+
+	protected function abilities_v2_renew_mutation() {
+		++$this->renewal_calls;
+		return $this->renewal_calls <= $this->renewals_before_failure && parent::abilities_v2_renew_mutation();
 	}
 }

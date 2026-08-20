@@ -269,6 +269,9 @@ class Test_Post_Plus_Child_V2 extends WP_UnitTestCase {
 			)
 		);
 
+		// A CJK body at the field limit doubles once JSON escapes it, which is what the old 256 KB
+		// transport cap rejected; without this bound the test would still pass on an empty envelope.
+		$this->assertGreaterThan( 262144, strlen( $envelope ) );
 		$this->assertLessThanOrEqual( $this->callable_request_cap( 'post_plus_capabilities_v2' ), strlen( $envelope ) );
 		$this->assertTrue( MainWP_Child_Posts::get_instance()->post_plus_capabilities_v2( json_decode( $envelope, true ) )['ok'] );
 	}

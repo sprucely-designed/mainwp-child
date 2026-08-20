@@ -523,7 +523,9 @@ class MainWP_Child_Staging { //phpcs:ignore -- NOSONAR - multi methods.
      * is no provider state to replace and creating `wpstg_settings` would invent some. Clone jobs need
      * that adapter, so they are neither advertised nor dispatched until a build wires it. Reading a
      * job's status needs it just as much: the adapter owns the step records, so without it there is
-     * no operation to report on and every read would answer provider_unavailable.
+     * no operation to report on and every read would answer provider_unavailable. Preview needs a
+     * side-effect-free provider scanner, and without one every request would reach the seam and
+     * come back provider_schema_invalid, so it is refused by name instead of being advertised.
      *
      * @return array Executable operation names.
      */
@@ -533,6 +535,9 @@ class MainWP_Child_Staging { //phpcs:ignore -- NOSONAR - multi methods.
         $supported  = array();
         foreach ( array( 'inventory', 'settings', 'preview', 'replace_settings', 'create_clone', 'update_clone', 'delete_clone', 'operation_status', 'cancel_operation', 'reconcile_operation' ) as $operation ) {
             if ( 'replace_settings' === $operation && ! $this->is_plugin_installed ) {
+                continue;
+            }
+            if ( 'preview' === $operation && ! $this->abilities_v2_provider_supports_preview() ) {
                 continue;
             }
             if ( ! $jobs_ready && in_array( $operation, $clone_jobs, true ) ) {
@@ -967,6 +972,11 @@ class MainWP_Child_Staging { //phpcs:ignore -- NOSONAR - multi methods.
      */
     protected function abilities_v2_provider_preview( $kind, $clone_ref, $inventory ) {
         unset( $kind, $clone_ref, $inventory );
+        return false;
+    }
+
+    /** @return bool Whether a build has wired a real preview scanner behind the seam above. */
+    protected function abilities_v2_provider_supports_preview() {
         return false;
     }
 

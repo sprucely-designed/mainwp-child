@@ -413,7 +413,7 @@ class MainWP_Child_Maintenance {
         $keys = array();
         foreach ( $names as $name ) {
             if ( is_string( $name ) ) {
-                $key = str_replace( array( '_transient_timeout_', '_transient_' ), '', $name );
+                $key = $this->transient_name_from_option( $name, false );
                 if ( '' !== $key ) {
                     $keys[ 'local:' . $key ] = true;
                 }
@@ -421,7 +421,7 @@ class MainWP_Child_Maintenance {
         }
         foreach ( $site_names as $name ) {
             if ( is_string( $name ) ) {
-                $key = str_replace( array( '_site_transient_timeout_', '_site_transient_' ), '', $name );
+                $key = $this->transient_name_from_option( $name, true );
                 if ( '' !== $key ) {
                     $keys[ 'site:' . $key ] = true;
                 }
@@ -977,6 +977,17 @@ class MainWP_Child_Maintenance {
         }
         $affected = 0;
         while ( true ) {
+            // A site with enough parents keeps paging past the 300s lock TTL, so the lock is renewed
+            // and re-verified before every page. Once this run can no longer prove it owns the lock
+            // it stops deleting and reports the rows it already destroyed alongside the unknown,
+            // rather than claiming a sweep it could not finish under the lock.
+            if ( ! $this->abilities_v2_renew_mutation() ) {
+                return array(
+                    'status'     => 'unknown',
+                    'affected'   => $affected,
+                    'error_code' => 'outcome_unknown',
+                );
+            }
             $wpdb->last_error = '';
             // A parent drops out of this result set once its surplus is gone, so the same first
             // page is re-read until nothing is over retention; an OFFSET would step over parents.
@@ -1157,23 +1168,27 @@ class MainWP_Child_Maintenance {
         }
         $affected = 0;
         $refused  = 0;
-        foreach ( $names['local'] as $name ) {
-            if ( delete_transient( $name ) ) {
-                ++$affected;
-            } else {
-                ++$refused;
+        $scopes   = array(
+            'local' => false,
+            'site'  => true,
+        );
+        foreach ( $scopes as $scope => $site ) {
+            foreach ( $names[ $scope ] as $name ) {
+                if ( $site ? delete_site_transient( $name ) : delete_transient( $name ) ) {
+                    ++$affected;
+                    continue;
+                }
+                $settled = $this->abilities_v2_settle_orphaned_transient( $name, $site );
+                if ( null === $settled ) {
+                    ++$refused;
+                    continue;
+                }
+                $affected += $settled;
             }
         }
-        foreach ( $names['site'] as $name ) {
-            if ( delete_site_transient( $name ) ) {
-                ++$affected;
-            } else {
-                ++$refused;
-            }
-        }
-        // One transient that will not go (an orphaned timeout row has no value option left to
-        // delete) says nothing about the rest, so the run finishes the list and reports both the
-        // deletions it made and the fact that it did not clear everything it listed.
+        // A transient the delete API would not take, whose value option is still there, says
+        // nothing about the rest, so the run finishes the list and reports both the deletions it
+        // made and the fact that it did not clear everything it listed.
         if ( 0 < $refused ) {
             return $this->abilities_v2_failed_outcome( 'mutation_failed', $affected );
         }
@@ -1182,6 +1197,28 @@ class MainWP_Child_Maintenance {
             'affected'   => $affected,
             'error_code' => null,
         );
+    }
+
+    /**
+     * Settle one transient the delete API refused.
+     *
+     * The delete API answers false when the value option is already gone, which means the transient
+     * is deleted rather than that the Child was refused; what can be left behind is the orphaned
+     * timeout row the sweep listed it from. Removing that row is the deletion this run performs, so
+     * it is counted. A value option that is still there is a real failure.
+     *
+     * @param string $name Transient name.
+     * @param bool   $site Whether the name is a site transient.
+     * @return int|null Rows this run removed, or null when the value option survives.
+     */
+    private function abilities_v2_settle_orphaned_transient( $name, $site ) {
+        $absent = '__mainwp_child_transient_absent__';
+        $value  = $site ? get_site_option( '_site_transient_' . $name, $absent ) : get_option( '_transient_' . $name, $absent );
+        if ( $absent !== $value ) {
+            return null;
+        }
+        $removed = $site ? delete_site_option( '_site_transient_timeout_' . $name ) : delete_option( '_transient_timeout_' . $name );
+        return $removed ? 1 : 0;
     }
 
     /**
@@ -1234,7 +1271,7 @@ class MainWP_Child_Maintenance {
             if ( ! is_string( $name ) ) {
                 return false;
             }
-            $key = str_replace( array( '_transient_timeout_', '_transient_' ), '', $name );
+            $key = $this->transient_name_from_option( $name, false );
             if ( '' !== $key ) {
                 $result['local'][ $key ] = $key;
             }
@@ -1243,7 +1280,7 @@ class MainWP_Child_Maintenance {
             if ( ! is_string( $name ) ) {
                 return false;
             }
-            $key = str_replace( array( '_site_transient_timeout_', '_site_transient_' ), '', $name );
+            $key = $this->transient_name_from_option( $name, true );
             if ( '' !== $key ) {
                 $result['site'][ $key ] = $key;
             }
@@ -1251,6 +1288,28 @@ class MainWP_Child_Maintenance {
         $result['local'] = array_values( $result['local'] );
         $result['site']  = array_values( $result['site'] );
         return $result;
+    }
+
+    /**
+     * Read the transient name out of one stored option or meta name.
+     *
+     * The prefix is a prefix, not a substring: a transient named `_transient_ghost` is stored as
+     * `_transient__transient_ghost`, and stripping every occurrence yields `ghost`, which is a
+     * different transient the delete path would then destroy instead. Preview and execute share
+     * this so the two can never disagree about which names a run covers.
+     *
+     * @param string $option_name Stored option or meta name.
+     * @param bool   $site        Whether the name belongs to a site transient.
+     * @return string Transient name, or '' when the name carries no matching prefix.
+     */
+    private function transient_name_from_option( $option_name, $site ) {
+        $prefixes = $site ? array( '_site_transient_timeout_', '_site_transient_' ) : array( '_transient_timeout_', '_transient_' );
+        foreach ( $prefixes as $prefix ) {
+            if ( 0 === strpos( $option_name, $prefix ) ) {
+                return substr( $option_name, strlen( $prefix ) );
+            }
+        }
+        return '';
     }
 
     /**
@@ -1553,8 +1612,10 @@ class MainWP_Child_Maintenance {
 
         if ( ! empty( $expired_transients ) ) {
             foreach ( $expired_transients as $option_name ) {
-                $transient = str_replace( '_transient_timeout_', '', $option_name );
-                delete_transient( $transient );
+                $transient = $this->transient_name_from_option( $option_name, false );
+                if ( '' !== $transient ) {
+                    delete_transient( $transient );
+                }
             }
         }
 
@@ -1580,8 +1641,10 @@ class MainWP_Child_Maintenance {
 
         if ( ! empty( $expired_site_transients ) ) {
             foreach ( $expired_site_transients as $option_name ) {
-                $transient = str_replace( '_site_transient_timeout_', '', $option_name );
-                delete_site_transient( $transient );
+                $transient = $this->transient_name_from_option( $option_name, true );
+                if ( '' !== $transient ) {
+                    delete_site_transient( $transient );
+                }
             }
         }
     }
@@ -1614,11 +1677,7 @@ class MainWP_Child_Maintenance {
 
         if ( ! empty( $transient_names ) ) {
             foreach ( $transient_names as $option_name ) {
-                if ( strpos( $option_name, '_transient_timeout_' ) === 0 ) {
-                    $transients[] = str_replace( '_transient_timeout_', '', $option_name );
-                } else {
-                    $transients[] = str_replace( '_transient_', '', $option_name );
-                }
+                $transients[] = $this->transient_name_from_option( $option_name, false );
             }
         }
 
@@ -1649,11 +1708,7 @@ class MainWP_Child_Maintenance {
 
         if ( ! empty( $site_names ) ) {
             foreach ( $site_names as $option_name ) {
-                if ( strpos( $option_name, '_site_transient_timeout_' ) === 0 ) {
-                    $site_transients[] = str_replace( '_site_transient_timeout_', '', $option_name );
-                } else {
-                    $site_transients[] = str_replace( '_site_transient_', '', $option_name );
-                }
+                $site_transients[] = $this->transient_name_from_option( $option_name, true );
             }
         }
 

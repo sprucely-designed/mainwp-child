@@ -282,6 +282,33 @@ class Test_MainWP_Child_File_Deployment_V2 extends WP_UnitTestCase {
 		wp_delete_file( $target );
 	}
 
+	/**
+	 * A backslash segment clears the prefix check and hides from every '/' segment rule, so it has
+	 * to be rejected by name. On Windows it is a path separator and this destination leaves the
+	 * uploads tree entirely.
+	 */
+	public function test_backslash_traversal_is_refused_by_preflight_and_deploy() {
+		$subject  = new Testable_MainWP_Child_File_Deployment();
+		$hostile  = 'wp-content/uploads/..\\..\\..\\wp-config.php';
+
+		$request = $this->preflight_request();
+		$request['payload']['relative_destination'] = $hostile;
+		$preflight = $subject->preflight_v2( $request );
+
+		$this->assertFalse( $preflight['ok'] );
+		$this->assertSame( 'destination_forbidden', $preflight['code'] );
+
+		$subject->gateway_bytes = 'verified fixture bytes';
+		$deploy                 = $this->deploy_request( $subject->preflight_v2( $this->preflight_request() ), 'verified fixture bytes' );
+		$deploy['payload']['relative_destination'] = $hostile;
+
+		$result = $subject->deploy_v2( $deploy );
+		$this->assertSame( 'destination_forbidden', $result['code'] );
+		$this->assertSame( 0, $subject->gateway_reads );
+		$this->assertSame( 0, $subject->writes );
+		$this->assertSame( array(), $subject->receipts );
+	}
+
 	public function test_authenticated_callable_map_exposes_the_four_v2_operations() {
 		$callable   = MainWP_Child_Callable::get_instance();
 		$reflection = new \ReflectionClass( $callable );

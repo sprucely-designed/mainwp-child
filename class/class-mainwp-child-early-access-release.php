@@ -253,7 +253,26 @@ class MainWP_Child_Early_Access_Release {
         if ( null === $value ) {
             return null;
         }
-        return $this->valid_receipt( $value ) ? $value : false;
+        if ( ! $this->valid_receipt( $value ) ) {
+            return false;
+        }
+        if ( $this->receipt_expired( $value ) ) {
+            delete_option( $this->receipt_key( $request_ref ) );
+            return null;
+        }
+        return $value;
+    }
+
+    /**
+     * Report whether one settled result has passed retention.
+     *
+     * Nothing else prunes these options, so the read that finds one past retention is what
+     * reclaims it, and the reference becomes free for a new request. A dispatch marker is
+     * exempt: its effect was never resolved, so the only truthful answer stays outcome_unknown
+     * however old the marker is, and dropping it would let a retry run the transition twice.
+     */
+    private function receipt_expired( $receipt ) {
+        return 'settled' === $receipt['state'] && $receipt['expires_at'] <= time();
     }
 
     /** Reserve one request. */
@@ -646,18 +665,25 @@ class MainWP_Child_Early_Access_Release {
         if ( is_link( $root ) || ! is_dir( $root ) ) {
             return false;
         }
-        $iterator = new \RecursiveIteratorIterator(
-            new \RecursiveDirectoryIterator( $root, \FilesystemIterator::SKIP_DOTS ),
-            \RecursiveIteratorIterator::CHILD_FIRST
-        );
-        foreach ( $iterator as $item ) {
-            $path = $item->getPathname();
-            if ( $item->isLink() ) {
-                return false;
+        try {
+            $iterator = new \RecursiveIteratorIterator(
+                new \RecursiveDirectoryIterator( $root, \FilesystemIterator::SKIP_DOTS ),
+                \RecursiveIteratorIterator::CHILD_FIRST
+            );
+            foreach ( $iterator as $item ) {
+                $path = $item->getPathname();
+                if ( $item->isLink() ) {
+                    return false;
+                }
+                if ( $item->isDir() ? ! rmdir( $path ) : ! unlink( $path ) ) {
+                    return false;
+                }
             }
-            if ( $item->isDir() ? ! rmdir( $path ) : ! unlink( $path ) ) {
-                return false;
-            }
+        } catch ( \UnexpectedValueException $exception ) {
+            // An unreadable directory makes the walk throw part-way through. The tree is then
+            // simply not removed, which is this method's own failure result - a cleanup must not
+            // take the transition that already succeeded down with it.
+            return false;
         }
         return rmdir( $root );
     }
@@ -667,14 +693,20 @@ class MainWP_Child_Early_Access_Release {
         if ( ! is_dir( $root ) || is_link( $root ) ) {
             return false;
         }
-        $iterator = new \RecursiveIteratorIterator(
-            new \RecursiveDirectoryIterator( $root, \FilesystemIterator::SKIP_DOTS ),
-            \RecursiveIteratorIterator::SELF_FIRST
-        );
-        foreach ( $iterator as $item ) {
-            if ( $item->isLink() || ( ! $item->isDir() && ! $item->isFile() ) ) {
-                return false;
+        try {
+            $iterator = new \RecursiveIteratorIterator(
+                new \RecursiveDirectoryIterator( $root, \FilesystemIterator::SKIP_DOTS ),
+                \RecursiveIteratorIterator::SELF_FIRST
+            );
+            foreach ( $iterator as $item ) {
+                if ( $item->isLink() || ( ! $item->isDir() && ! $item->isFile() ) ) {
+                    return false;
+                }
             }
+        } catch ( \UnexpectedValueException $exception ) {
+            // A directory the walk cannot read leaves part of the tree uninspected, so nothing here
+            // can be called safe.
+            return false;
         }
         return true;
     }

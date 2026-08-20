@@ -325,7 +325,9 @@ class MainWP_Child_Cache_Purge { //phpcs:ignore -- NOSONAR - multi methods.
                         $information = $this->purge_result( 'Unsupported cache solution; no purge was attempted.', 'ERROR', 'provider_missing' );
                         break;
                 }
-            } catch ( MainWP_Exception $e ) {
+            } catch ( \Throwable $e ) {
+                // Third-party purge code throws whatever it likes; anything escaping here would
+                // break the caller mid-update instead of reporting an attempted purge that failed.
                 // Provider detail stays off the wire; keep it locally reachable for debugging.
                 if ( defined( 'WP_DEBUG' ) && WP_DEBUG ) {
                     error_log( 'MainWP Child cache purge: ' . $e->getMessage() ); // phpcs:ignore -- debug mode only.

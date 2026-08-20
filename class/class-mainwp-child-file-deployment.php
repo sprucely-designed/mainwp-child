@@ -604,7 +604,10 @@ class MainWP_Child_File_Deployment {
 
     /** Normalize and constrain one relative destination. */
     private function normalize_destination( $destination_class, $relative_destination ) {
-        if ( ! $this->destination_class( $destination_class ) || ! is_string( $relative_destination ) || '' === $relative_destination || 1024 < strlen( $relative_destination ) || 1 === preg_match( '/[\x00-\x1F\x7F\\%:]/', $relative_destination ) || '/' === $relative_destination[0] || 32 < substr_count( $relative_destination, '/' ) + 1 ) {
+        // The backslash is checked outside the character class on purpose: every segment rule below
+        // splits on '/' alone, so on Windows, where '\' is also a separator, a segment like
+        // '..\..\..\wp-config.php' would read as one innocent name and walk out of the destination.
+        if ( ! $this->destination_class( $destination_class ) || ! is_string( $relative_destination ) || '' === $relative_destination || 1024 < strlen( $relative_destination ) || 1 === preg_match( '/[\x00-\x1F\x7F%:]/', $relative_destination ) || false !== strpos( $relative_destination, '\\' ) || '/' === $relative_destination[0] || 32 < substr_count( $relative_destination, '/' ) + 1 ) {
             return false;
         }
         if ( class_exists( '\Normalizer' ) && \Normalizer::normalize( $relative_destination, \Normalizer::FORM_C ) !== $relative_destination ) {

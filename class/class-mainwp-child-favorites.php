@@ -493,7 +493,10 @@ class MainWP_Child_Favorites {
         require_once ABSPATH . 'wp-admin/includes/plugin.php'; // NOSONAR - Exact activation/readback API.
         $skin      = new \Automatic_Upgrader_Skin();
         $installer = new \WP_Upgrader( $skin );
-        $result    = $installer->run(
+        // run() does not do this itself: init() is what fills the string table the upgrader reports
+        // errors from and hands the skin its upgrader back-reference.
+        $installer->init();
+        $result = $installer->run(
             array(
                 'package'           => $path,
                 'destination'       => 'plugin' === $payload['type'] ? WP_PLUGIN_DIR : WP_CONTENT_DIR . '/themes',

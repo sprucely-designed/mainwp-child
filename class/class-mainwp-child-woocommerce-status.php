@@ -655,7 +655,7 @@ class MainWP_Child_WooCommerce_Status {
             )
         );
         foreach ( array( $processing, $on_hold, $out ) as $counted ) {
-            if ( ! is_object( $counted ) || ! isset( $counted->total ) || ! is_int( $counted->total ) || 0 > $counted->total || 10000 < $counted->total ) {
+            if ( ! is_object( $counted ) || ! isset( $counted->total ) || ! is_int( $counted->total ) || 0 > $counted->total || 100000 < $counted->total ) {
                 return false;
             }
         }
@@ -703,7 +703,9 @@ class MainWP_Child_WooCommerce_Status {
             )
         );
 
-        return null === $counted || 10000 < (int) $counted ? false : (int) $counted;
+        // Same ceiling the page validator enforces on these counts: a tighter one here would make
+        // every status request on a store between the two bounds fail instead of report.
+        return null === $counted || 100000 < (int) $counted ? false : (int) $counted;
     }
 
     /**

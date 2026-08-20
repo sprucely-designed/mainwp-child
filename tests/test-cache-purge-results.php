@@ -243,6 +243,27 @@ class Test_Cache_Purge_Results extends WP_UnitTestCase {
 	}
 
 	/**
+	 * Third-party purge code throws whatever it likes. Anything that is not a MainWP exception
+	 * used to escape auto_purge_cache() and take the caller down mid-update.
+	 */
+	public function test_foreign_provider_throwable_is_shaped_attempt_failure() {
+		$purger = new class() extends MainWP_Child_Cache_Purge {
+			public function breeze_auto_purge_cache() {
+				throw new RuntimeException( 'secret provider detail' );
+			}
+		};
+
+		update_option( 'mainwp_child_auto_purge_cache', 1 );
+		update_option( 'mainwp_cache_control_cache_solution', 'Breeze' );
+		$purger->auto_purge_cache();
+		$result = $this->recorded_result();
+
+		$this->assertSame( 'ERROR', $result['action'] );
+		$this->assert_basis( $result, 'attempt_failed' );
+		$this->assertStringNotContainsString( 'secret provider detail', wp_json_encode( $result ) );
+	}
+
+	/**
 	 * Missing Cloudflare credentials fail before HTTP.
 	 */
 	public function test_cloudflare_missing_credentials_is_preflight_failure_without_http() {

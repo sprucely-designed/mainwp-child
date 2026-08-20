@@ -261,6 +261,32 @@ class Test_Post_Plus_Child_V2 extends WP_UnitTestCase {
 	}
 
 	/**
+	 * One entry nothing can read any more must cost that entry, not the whole ledger. Failing the
+	 * store instead makes every later mutation on the site answer storage_unavailable for good.
+	 */
+	public function test_one_unreadable_ledger_entry_does_not_brick_the_store() {
+		$applied  = array_slice( $this->aged_ledger( 'applied' ), 0, 3, true );
+		$reserved = array_slice( $this->aged_ledger( 'reserved' ), 3, 1, true );
+		$ledger   = $applied + $reserved;
+		$ledger['123e4567-e89b-42d3-a456-426699999999'] = array( 'operation_ref' => 'not a record' );
+		update_option( 'mainwp_child_post_plus_operations_v2', $ledger, false );
+
+		$payload = $this->delivery_payload( '123e4567-e89b-42d3-a456-426614174625', 'Salvaged ledger' );
+		$result  = $this->request( 'post_plus_newpost_v2', $payload );
+
+		$this->assertTrue( $result['ok'] );
+		$this->assertSame( 'applied', $result['state'] );
+
+		$records = get_option( 'mainwp_child_post_plus_operations_v2' );
+		$this->assertArrayNotHasKey( '123e4567-e89b-42d3-a456-426699999999', $records );
+		$this->assertArrayHasKey( $payload['operation_ref'], $records );
+		foreach ( array_keys( $applied + $reserved ) as $kept ) {
+			$this->assertArrayHasKey( $kept, $records );
+		}
+		$this->assertSame( 'reserved', $records[ array_key_first( $reserved ) ]['state'] );
+	}
+
+	/**
 	 * Build a ledger at the cap whose receipts are older than any replayable request.
 	 */
 	private function aged_ledger( $state ) {

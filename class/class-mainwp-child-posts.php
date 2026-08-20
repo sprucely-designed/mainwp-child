@@ -1212,22 +1212,30 @@ class MainWP_Child_Posts { //phpcs:ignore -- NOSONAR - multi methods.
     }
 
     /**
-     * Load and strictly validate one bounded private operation ledger.
+     * Load one bounded private operation ledger, keeping only the entries it can still read.
+     *
+     * The option is untrusted input, and an entry that no longer validates carries no replay
+     * protection anyway - it cannot be matched to a request or projected into a result. Failing
+     * the whole ledger over one such entry would instead cost every later mutation on this site,
+     * so the unreadable entries are dropped and the next write persists the ledger without them.
+     * Reserved receipts that still validate are untouched: losing one is what would let a retry
+     * duplicate content.
      *
      * @param string $protocol Closed protocol name.
      * @return array|false Valid ledger or false.
      */
     private function content_v2_records( $protocol ) {
         $records = get_option( $this->content_v2_option( $protocol ), array() );
-        if ( ! is_array( $records ) || self::CONTENT_V2_MAX_RECORDS < count( $records ) ) {
+        if ( ! is_array( $records ) ) {
             return false;
         }
+        $valid = array();
         foreach ( $records as $operation_ref => $record ) {
-            if ( ! is_string( $operation_ref ) || ! $this->content_v2_record( $record ) || ! hash_equals( $operation_ref, $record['operation_ref'] ) ) {
-                return false;
+            if ( is_string( $operation_ref ) && $this->content_v2_record( $record ) && hash_equals( $operation_ref, $record['operation_ref'] ) ) {
+                $valid[ $operation_ref ] = $record;
             }
         }
-        return $records;
+        return self::CONTENT_V2_MAX_RECORDS < count( $valid ) ? false : $valid;
     }
 
     /**

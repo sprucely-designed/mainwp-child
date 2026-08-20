@@ -262,6 +262,43 @@ class Test_MainWP_Child_Favorites_V2 extends WP_UnitTestCase {
 		$this->assertSame( 'favorites_install_verified_v2', $callables['favorites_install_verified_v2'] );
 	}
 
+	/**
+	 * WP_Upgrader::run() does not initialise the instance for you. Without init() the string table
+	 * it reports errors from is empty and the skin has no upgrader to read it through, so this runs
+	 * the real upgrader far enough to look at it and halts before any download or unpack.
+	 */
+	public function test_real_upgrader_is_initialised_before_run() {
+		$captured = null;
+		$halt     = static function ( $reply, $package, $upgrader ) use ( &$captured ) {
+			unset( $reply, $package );
+			$captured = $upgrader;
+			return new \WP_Error( 'mainwp_favorites_test_halt', 'Halted before download.' );
+		};
+		add_filter( 'upgrader_pre_download', $halt, 10, 3 );
+
+		$package = wp_tempnam( 'mainwp-favorites-upgrader.zip' );
+		$level   = ob_get_level();
+		ob_start();
+		try {
+			( new Upgrader_Probe_MainWP_Child_Favorites_V2() )->run_dispatch_install(
+				$package,
+				array( 'type' => 'plugin', 'slug' => 'forms/forms.php', 'overwrite' => false, 'activate' => false )
+			);
+		} finally {
+			while ( ob_get_level() > $level ) {
+				ob_end_clean();
+			}
+			remove_filter( 'upgrader_pre_download', $halt, 10 );
+			unlink( $package );
+		}
+
+		if ( ! $captured instanceof \WP_Upgrader ) {
+			$this->markTestSkipped( 'WP_Filesystem did not connect, so run() never reached the download stage.' );
+		}
+		$this->assertNotEmpty( $captured->strings );
+		$this->assertSame( $captured, $captured->skin->upgrader );
+	}
+
 	private function installed_subject() {
 		$subject = new Testable_MainWP_Child_Favorites_V2(
 			array( 'forms/forms.php' => array( 'Version' => '2.1.0' ) ),
@@ -517,5 +554,13 @@ class Production_MainWP_Child_Favorites_Package_Probe extends MainWP_Child_Favor
 
 	public function inspect( $path, $type, $slug, $version ) {
 		return $this->inspect_package( $path, $type, $slug, $version );
+	}
+}
+
+/** Exposes the production WordPress installer dispatch with no stubbed seams. */
+class Upgrader_Probe_MainWP_Child_Favorites_V2 extends MainWP_Child_Favorites {
+
+	public function run_dispatch_install( $path, $payload ) {
+		return $this->dispatch_install( $path, $payload );
 	}
 }

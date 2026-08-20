@@ -215,6 +215,129 @@ class Test_MainWP_Child_Early_Access_Release_V2 extends WP_UnitTestCase {
 		unlink( $hostile );
 	}
 
+	/**
+	 * Nothing else prunes these receipt options, so a settled result past retention has to stop
+	 * being served and stop occupying its reference. The production reader is the layer that has
+	 * to do it - every fixture in this file replaces the receipt store.
+	 */
+	public function test_settled_receipt_past_retention_reads_as_absent_and_is_reclaimed() {
+		$subject = new MainWP_Child_Early_Access_Release();
+
+		$live = '123e4567-e89b-42d3-a456-426614174701';
+		add_option( $this->receipt_option( $live ), $this->settled_receipt( $live, time() + 600 ), '', false );
+		$served = $subject->release_v2( $this->request( 'status', array( 'request_ref' => $live ) ) );
+		$this->assertTrue( $served['ok'] );
+		$this->assertSame( 'applied', $served['status'] );
+
+		$aged = '123e4567-e89b-42d3-a456-426614174702';
+		add_option( $this->receipt_option( $aged ), $this->settled_receipt( $aged, time() - 1 ), '', false );
+		$result = $subject->release_v2( $this->request( 'status', array( 'request_ref' => $aged ) ) );
+
+		$this->assertFalse( $result['ok'] );
+		$this->assertSame( 'not_found', $result['code'] );
+		$this->assertNull( get_option( $this->receipt_option( $aged ), null ) );
+
+		delete_option( $this->receipt_option( $live ) );
+	}
+
+	/**
+	 * An aged dispatch marker is the one thing retention may not drop: its effect was never
+	 * resolved, so forgetting it would let the next request run the transition a second time.
+	 */
+	public function test_aged_dispatch_marker_still_answers_unknown_and_is_kept() {
+		$subject     = new MainWP_Child_Early_Access_Release();
+		$request_ref = '123e4567-e89b-42d3-a456-426614174703';
+		$marker      = $this->settled_receipt( $request_ref, time() - 1 );
+		$marker['state']  = 'dispatching';
+		$marker['result'] = null;
+		add_option( $this->receipt_option( $request_ref ), $marker, '', false );
+
+		$result = $subject->release_v2( $this->request( 'status', array( 'request_ref' => $request_ref ) ) );
+
+		$this->assertSame( 'unknown', $result['status'] );
+		$this->assertSame( 'outcome_unknown', $result['code'] );
+		$this->assertIsArray( get_option( $this->receipt_option( $request_ref ), null ) );
+
+		delete_option( $this->receipt_option( $request_ref ) );
+	}
+
+	/**
+	 * A cleanup walk that meets an unreadable directory must report failure, not throw out of a
+	 * transition that already succeeded.
+	 */
+	public function test_unreadable_backup_tree_does_not_throw_out_of_a_successful_apply() {
+		$root                     = $this->private_root();
+		$subject                  = new Testable_MainWP_Child_Early_Access_Release();
+		$subject->test_root       = $root;
+		$subject->unreadable_backup = true;
+
+		$result = $subject->release_v2( $this->apply_request() );
+		$sealed = $root . '/' . $subject->last_backup_ref . '/sealed';
+		$this->assertDirectoryExists( $sealed );
+		if ( is_readable( $sealed ) ) {
+			chmod( $sealed, 0700 );
+			$this->remove_root( $root );
+			$this->markTestSkipped( 'This user can read a 0000 directory, so the failing walk cannot be staged.' );
+		}
+
+		chmod( $sealed, 0700 );
+		$this->remove_root( $root );
+
+		$this->assertTrue( $result['ok'] );
+		$this->assertSame( 'applied', $result['status'] );
+	}
+
+	private function receipt_option( $request_ref ) {
+		return 'mainwp_child_early_access_v2_' . hash( 'sha256', $request_ref );
+	}
+
+	/**
+	 * One stored settled receipt the production validator accepts, expiring at the given moment.
+	 */
+	private function settled_receipt( $request_ref, $expires_at ) {
+		return array(
+			'effect_hash'      => hash( 'sha256', 'effect-' . $request_ref ),
+			'request_ref'      => $request_ref,
+			'action'           => 'upgrade',
+			'target_version'   => '6.0.0-beta.2',
+			'expected_sha256'  => str_repeat( 'a', 64 ),
+			'previous_version' => '5.4.1',
+			'previous_active'  => true,
+			'state'            => 'settled',
+			'result'           => array(
+				'protocol'          => '2',
+				'operation'         => 'apply',
+				'ok'                => true,
+				'request_ref'       => $request_ref,
+				'status'            => 'applied',
+				'action'            => 'upgrade',
+				'previous_version'  => '5.4.1',
+				'installed_version' => '6.0.0-beta.2',
+				'active'            => true,
+				'persistence'       => 'installed',
+				'retry_safe'        => false,
+				'code'              => null,
+			),
+			'updated_at'       => $expires_at - 86400,
+			'expires_at'       => $expires_at,
+		);
+	}
+
+	private function remove_root( $root ) {
+		$walk = new \RecursiveIteratorIterator(
+			new \RecursiveDirectoryIterator( $root, \FilesystemIterator::SKIP_DOTS ),
+			\RecursiveIteratorIterator::CHILD_FIRST
+		);
+		foreach ( $walk as $item ) {
+			if ( $item->isDir() ) {
+				rmdir( $item->getPathname() );
+			} else {
+				unlink( $item->getPathname() );
+			}
+		}
+		rmdir( $root );
+	}
+
 	public function test_callable_map_exposes_only_the_authenticated_protocol_entry() {
 		$reflection = new ReflectionClass( MainWP_Child_Callable::class );
 		$property   = $reflection->getProperty( 'callableFunctions' );
@@ -270,6 +393,9 @@ class Testable_MainWP_Child_Early_Access_Release extends MainWP_Child_Early_Acce
 	public $test_root = '';
 	public $last_backup_ref = '';
 
+	/** Stage the superseded tree with a directory the cleanup walk cannot descend into. */
+	public $unreadable_backup = false;
+
 	/** Version reported by the post-download state re-read, or false for a tree that no longer parses. */
 	public $recheck_state = null;
 
@@ -323,6 +449,10 @@ class Testable_MainWP_Child_Early_Access_Release extends MainWP_Child_Early_Acce
 		$path                  = $this->test_root . '/' . $this->last_backup_ref;
 		mkdir( $path, 0700, true );
 		file_put_contents( $path . '/mainwp-child.php', "<?php\n/*\nPlugin Name: MainWP Child\nVersion: 5.4.1\n*/\n" );
+		if ( $this->unreadable_backup ) {
+			mkdir( $path . '/sealed', 0700, true );
+			chmod( $path . '/sealed', 0000 );
+		}
 		return $this->last_backup_ref;
 	}
 

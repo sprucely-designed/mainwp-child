@@ -649,6 +649,57 @@ class Test_MainWP_Child_WooCommerce_Status_V2 extends WP_UnitTestCase {
 		$this->assertSame( 2, $method->invoke( $reflection->newInstanceWithoutConstructor() ) );
 	}
 
+	/**
+	 * The inventory counters and the page validator have to agree on how large a store may be.
+	 * A count between the two bounds used to make the counter fail, and the whole status request
+	 * with it, on a store the validator would have accepted.
+	 */
+	public function test_inventory_count_between_the_old_and_the_validator_bound_is_reported() {
+		$rewrite = static function ( $query ) {
+			return false !== strpos( $query, "meta_key = '_stock'" ) ? 'SELECT 50000' : $query;
+		};
+		add_filter( 'query', $rewrite );
+
+		try {
+			$reflection = new ReflectionClass( MainWP_Child_WooCommerce_Status::class );
+			$method     = $reflection->getMethod( 'abilities_v2_low_stock_count' );
+			$method->setAccessible( true );
+
+			$this->assertSame( 50000, $method->invoke( $reflection->newInstanceWithoutConstructor() ) );
+		} finally {
+			remove_filter( 'query', $rewrite );
+		}
+
+		$validator = $reflection->getMethod( 'abilities_v2_valid_page_data' );
+		$validator->setAccessible( true );
+		$page = $this->page_data( 50000 );
+		$this->assertTrue( $validator->invoke( $reflection->newInstanceWithoutConstructor(), $page, array( 'page_size' => 50, 'top_limit' => 5 ) ) );
+	}
+
+	/**
+	 * One internal page carrying the given inventory counts.
+	 */
+	private function page_data( $count ) {
+		return array(
+			'next_cursor'           => null,
+			'complete'              => true,
+			'page_size'             => 50,
+			'order_count'           => 0,
+			'total_orders'          => 0,
+			'currency_totals'       => array(),
+			'top_sellers'           => array(),
+			'processing_orders'     => $count,
+			'on_hold_orders'        => $count,
+			'low_stock'             => $count,
+			'out_of_stock'          => $count,
+			'inventory_observed_at' => '2026-08-10T12:00:00Z',
+			'generated_at'          => '2026-08-10T12:00:00Z',
+			'source'                => 'woocommerce_crud',
+			'storage_mode'          => 'legacy',
+			'accounting_profile'    => 'net-order-total-v1',
+		);
+	}
+
 	private function product( $post_type, $stock, $managed ) {
 		$post_id = self::factory()->post->create( array( 'post_type' => $post_type, 'post_status' => 'publish' ) );
 		update_post_meta( $post_id, '_stock', $stock );

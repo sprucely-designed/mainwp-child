@@ -1094,6 +1094,11 @@ class MainWP_Child_Posts { //phpcs:ignore -- NOSONAR - multi methods.
      * persistent cache keeps serving the mutated row and meta after the database has
      * discarded them - while the Dashboard is told the mutation failed.
      *
+     * The term writers do the same to the taxonomy side: wp_set_object_terms() moves term counts
+     * and anything reading a term while the transaction is open caches the in-transaction row, so
+     * the terms the mutation attached are collected before the ROLLBACK and forgotten after it.
+     * Categories and tags are the whole taxonomy surface this writer touches.
+     *
      * @param int|null $post_id    Post touched inside the transaction, when one exists.
      * @param array    $normalized Valid normalized mutation.
      * @return void
@@ -1101,12 +1106,32 @@ class MainWP_Child_Posts { //phpcs:ignore -- NOSONAR - multi methods.
     private function content_v2_rollback( $post_id, $normalized ) {
         global $wpdb;
 
-        $wpdb->query( 'ROLLBACK' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
-        $touched = array( $post_id, 'update' === $normalized['mode'] ? $normalized['target_post_id'] : null );
-        foreach ( array_unique( array_filter( $touched, 'is_int' ) ) as $id ) {
-            if ( 0 < $id ) {
-                clean_post_cache( $id );
+        $touched = array_values(
+            array_unique(
+                array_filter(
+                    array( $post_id, 'update' === $normalized['mode'] ? $normalized['target_post_id'] : null ),
+                    static function ( $id ) {
+                        return is_int( $id ) && 0 < $id;
+                    }
+                )
+            )
+        );
+
+        $term_ids = array();
+        foreach ( array( 'category', 'post_tag' ) as $taxonomy ) {
+            $ids = array() === $touched ? array() : wp_get_object_terms( $touched, $taxonomy, array( 'fields' => 'ids' ) );
+            if ( is_array( $ids ) && array() !== $ids ) {
+                $term_ids[ $taxonomy ] = $ids;
             }
+        }
+
+        $wpdb->query( 'ROLLBACK' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+
+        foreach ( $touched as $id ) {
+            clean_post_cache( $id );
+        }
+        foreach ( $term_ids as $taxonomy => $ids ) {
+            clean_term_cache( $ids, $taxonomy );
         }
     }
 

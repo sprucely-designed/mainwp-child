@@ -1336,22 +1336,61 @@ class MainWP_Child_Back_WP_Up { //phpcs:ignore -- NOSONAR - multi methods.
             $chunk = $this->abilities_v2_read_log_chunk( $log_file, max( 0, $size - 256 ), 256 );
             return is_array( $chunk ) && false !== stripos( $chunk['content'], '</html>' );
         }
-        // A compressed log has no cheap end offset, so stream it in bounded windows and keep
-        // only the trailing bytes.
-        $offset = 0;
-        $tail   = '';
-        for ( $window = 0; $window < 256; $window++ ) {
-            $chunk = $this->abilities_v2_read_log_chunk( $log_file, $offset, 65536 );
-            if ( ! is_array( $chunk ) || $chunk['next_offset'] === $offset ) {
-                return false;
+        $tail = $this->abilities_v2_compressed_tail( $log_file, 256 );
+        return is_string( $tail ) && false !== stripos( $tail, '</html>' );
+    }
+
+    /**
+     * Read the trailing bytes of a compressed log in one forward pass.
+     *
+     * A compressed log has no cheap end offset, so the tail can only be reached by decompressing
+     * everything before it. Reading it as successive seeked windows made zlib and bzip2 redo that
+     * work from byte zero on every window: reaching the old 256-window ceiling cost over two
+     * gigabytes of decompression, driven by an archive on disk the Child has no reason to trust.
+     * One handle streams forward once instead, keeps only the trailing bytes, and gives up past
+     * 16 MB - the same amount 256 windows of 64 KB already allowed.
+     *
+     * @param string $file      Gzip or bzip2 log file.
+     * @param int    $tail_size Trailing bytes to keep.
+     * @return string|null Null when the log cannot be read or outgrows the budget.
+     */
+    private function abilities_v2_compressed_tail( $file, $tail_size ) {
+        $gzip = '.gz' === substr( $file, -3 );
+        if ( $gzip ) {
+            $handle = gzopen( $file, 'rb' );
+            if ( false === $handle ) {
+                return null;
             }
-            $tail   = substr( $tail . $chunk['content'], -256 );
-            $offset = $chunk['next_offset'];
-            if ( ! $chunk['truncated'] ) {
-                return false !== stripos( $tail, '</html>' );
+        } elseif ( ! function_exists( 'bzopen' ) ) {
+            return null;
+        } else {
+            $handle = bzopen( $file, 'r' );
+            if ( ! is_resource( $handle ) ) {
+                return null;
             }
         }
-        return false;
+        $limit = 16777216;
+        $tail  = '';
+        $read  = 0;
+        $ended = false;
+        while ( $read <= $limit ) {
+            $part = $gzip ? gzread( $handle, 65536 ) : bzread( $handle, 65536 );
+            if ( ! is_string( $part ) ) {
+                break;
+            }
+            if ( '' === $part ) {
+                $ended = true;
+                break;
+            }
+            $read += strlen( $part );
+            $tail  = substr( $tail . $part, -$tail_size );
+        }
+        if ( $gzip ) {
+            gzclose( $handle );
+        } else {
+            bzclose( $handle );
+        }
+        return $ended ? $tail : null;
     }
 
     /**
@@ -2448,7 +2487,11 @@ class MainWP_Child_Back_WP_Up { //phpcs:ignore -- NOSONAR - multi methods.
             $log_items          = array();
             $can_advance_cursor = true;
             foreach ( $logfiles as $mtime => $logfile ) {
-                $log_path   = false !== strpos( $logfile, '/' ) ? $logfile : $log_folder . '/' . $logfile;
+                // RecursiveDirectoryIterator hands back native separators, so on Windows an
+                // absolute nested log path carries no '/' and used to be prefixed with the log
+                // folder, producing a path filemtime() rejects and silently dropping the log.
+                $normalized = wp_normalize_path( (string) $logfile );
+                $log_path   = false !== strpos( $normalized, '/' ) ? $normalized : $log_folder . '/' . $normalized;
                 $file_mtime = filemtime( $log_path );
                 if ( false === $file_mtime || $file_mtime < $scan_from || $file_mtime > $scan_until ) {
                     continue;

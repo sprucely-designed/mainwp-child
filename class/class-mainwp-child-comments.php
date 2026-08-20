@@ -22,6 +22,13 @@ if ( ! defined( 'ABSPATH' ) ) {
 class MainWP_Child_Comments {
 
     /**
+     * Private holding value a v2 mutation swaps a comment into to claim it.
+     *
+     * @var string
+     */
+    private const CLAIM_STATUS = 'mainwp-claim';
+
+    /**
      * Public static variable to hold the single instance of the class.
      *
      * @var mixed Default null
@@ -362,15 +369,26 @@ class MainWP_Child_Comments {
                 continue;
             }
 
-            $changed       = $this->apply_v2_moderation( $request['action'], $item['comment_id'] );
-            $after_comment = get_comment( $item['comment_id'] );
-            $after         = $after_comment ? $this->canonical_comment_status( wp_get_comment_status( $after_comment ) ) : null;
+            $claimed = $this->claim_v2_comment( $comment );
+            if ( null === $claimed ) {
+                $results[] = $this->moderation_result( $item['comment_id'], 'failed', $before, null, 'status_unavailable', 'The comment status could not be verified.' );
+                continue;
+            }
+            if ( false === $claimed ) {
+                $current   = $this->current_v2_status( $item['comment_id'] );
+                $results[] = $this->moderation_result( $item['comment_id'], 'conflict', $current, $current, 'status_conflict', 'The comment status changed before moderation.' );
+                continue;
+            }
+
+            $changed = $this->apply_v2_moderation( $request['action'], $comment );
+            $after   = $this->current_v2_status( $item['comment_id'] );
             if ( true === $changed && $this->moderation_post_state_matches( $request['action'], $after ) ) {
                 ++$applied;
                 $results[] = $this->moderation_result( $item['comment_id'], 'applied', $before, $after );
-            } else {
-                $results[] = $this->moderation_result( $item['comment_id'], 'failed', $before, false === $after ? null : $after, 'mutation_failed', 'The moderation result could not be verified.' );
+                continue;
             }
+            $this->release_v2_claim( $comment );
+            $results[] = $this->moderation_result( $item['comment_id'], 'failed', $before, $this->current_v2_status( $item['comment_id'] ), 'mutation_failed', 'The moderation result could not be verified.' );
         }
 
         return array(
@@ -415,20 +433,33 @@ class MainWP_Child_Comments {
                 continue;
             }
 
-            ++$eligible;
             if ( $request['dry_run'] ) {
+                ++$eligible;
                 $results[] = $this->deletion_result( $item['comment_id'], 'would_delete', $before, true );
                 continue;
             }
 
-            $removed      = wp_delete_comment( $item['comment_id'], true );
+            $claimed = $this->claim_v2_comment( $comment );
+            if ( null === $claimed ) {
+                $results[] = $this->deletion_result( $item['comment_id'], 'failed', $before, true, 'delete_failed', 'Permanent deletion could not be verified.' );
+                continue;
+            }
+            if ( false === $claimed ) {
+                $current   = $this->current_v2_status( $item['comment_id'] );
+                $results[] = $this->deletion_result( $item['comment_id'], 'conflict', $current, (bool) get_comment( $item['comment_id'] ), 'status_conflict', 'The comment is not in trash.' );
+                continue;
+            }
+
+            ++$eligible;
+            $removed      = wp_delete_comment( $comment, true );
             $exists_after = (bool) get_comment( $item['comment_id'] );
             if ( true === $removed && ! $exists_after ) {
                 ++$deleted;
                 $results[] = $this->deletion_result( $item['comment_id'], 'deleted', $before, false );
-            } else {
-                $results[] = $this->deletion_result( $item['comment_id'], 'failed', $before, $exists_after, 'delete_failed', 'Permanent deletion could not be verified.' );
+                continue;
             }
+            $this->release_v2_claim( $comment );
+            $results[] = $this->deletion_result( $item['comment_id'], 'failed', $before, (bool) get_comment( $item['comment_id'] ), 'delete_failed', 'Permanent deletion could not be verified.' );
         }
 
         return array(
@@ -610,29 +641,101 @@ class MainWP_Child_Comments {
     }
 
     /**
-     * Run one moderation action against a comment.
+     * Claim a comment for mutation, but only while it still holds the observed status.
      *
-     * @param string $action     Moderation action name.
-     * @param int    $comment_id Comment ID.
+     * WordPress has no conditional comment update, so the precondition is enforced by swapping the
+     * row out of its observed status in a single guarded statement. Whoever wins the swap owns the
+     * transition; every other actor now sees a status that no longer matches what it read. The
+     * WordPress call that follows is handed the pre-claim comment, so core still performs the real
+     * transition, its trash metadata and its hooks with the correct prior status.
+     *
+     * @param \WP_Comment $comment Comment read during the precondition check.
+     * @return bool|null True when claimed, false when the status already moved, null when the write could not be run.
+     */
+    private function claim_v2_comment( $comment ) {
+        global $wpdb;
+        if ( ! is_object( $wpdb ) || ! is_callable( array( $wpdb, 'update' ) ) ) {
+            return null;
+        }
+        $claimed = $wpdb->update( // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Compare-and-swap on the comment row is the precondition; no comment API exposes it.
+            $wpdb->comments,
+            array( 'comment_approved' => self::CLAIM_STATUS ),
+            array(
+                'comment_ID'       => (int) $comment->comment_ID,
+                'comment_approved' => (string) $comment->comment_approved,
+            ),
+            array( '%s' ),
+            array( '%d', '%s' )
+        );
+        if ( false === $claimed ) {
+            return null;
+        }
+        return 1 === (int) $claimed;
+    }
+
+    /**
+     * Put a claimed comment back the way it was found after the mutation did not happen.
+     *
+     * @param \WP_Comment $comment Comment read during the precondition check.
+     * @return void
+     */
+    private function release_v2_claim( $comment ) {
+        global $wpdb;
+        if ( is_object( $wpdb ) && is_callable( array( $wpdb, 'update' ) ) ) {
+            $wpdb->update( // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Releases the compare-and-swap made by claim_v2_comment().
+                $wpdb->comments,
+                array( 'comment_approved' => (string) $comment->comment_approved ),
+                array(
+                    'comment_ID'       => (int) $comment->comment_ID,
+                    'comment_approved' => self::CLAIM_STATUS,
+                ),
+                array( '%s' ),
+                array( '%d', '%s' )
+            );
+        }
+        clean_comment_cache( (int) $comment->comment_ID );
+    }
+
+    /**
+     * Read a comment's current status straight from storage, past any cached copy.
+     *
+     * @param int $comment_id Comment ID.
+     * @return string|null
+     */
+    private function current_v2_status( $comment_id ) {
+        clean_comment_cache( $comment_id );
+        $comment = get_comment( $comment_id );
+        if ( ! $comment ) {
+            return null;
+        }
+        $status = $this->canonical_comment_status( wp_get_comment_status( $comment ) );
+        return false === $status ? null : $status;
+    }
+
+    /**
+     * Run one moderation action against a claimed comment.
+     *
+     * @param string      $action  Moderation action name.
+     * @param \WP_Comment $comment Comment as it was read before the claim.
      * @return bool
      */
-    private function apply_v2_moderation( $action, $comment_id ) {
+    private function apply_v2_moderation( $action, $comment ) {
         if ( 'approve' === $action ) {
-            return true === wp_set_comment_status( $comment_id, 'approve' );
+            return true === wp_set_comment_status( $comment, 'approve' );
         }
         if ( 'unapprove' === $action ) {
-            return true === wp_set_comment_status( $comment_id, 'hold' );
+            return true === wp_set_comment_status( $comment, 'hold' );
         }
         if ( 'spam' === $action ) {
-            return true === wp_spam_comment( $comment_id );
+            return true === wp_spam_comment( $comment );
         }
         if ( 'unspam' === $action ) {
-            return true === wp_unspam_comment( $comment_id );
+            return true === wp_unspam_comment( $comment );
         }
         if ( 'trash' === $action ) {
-            return true === wp_trash_comment( $comment_id );
+            return true === wp_trash_comment( $comment );
         }
-        return true === wp_untrash_comment( $comment_id );
+        return true === wp_untrash_comment( $comment );
     }
 
     /**

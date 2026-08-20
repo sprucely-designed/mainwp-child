@@ -559,8 +559,12 @@ class MainWP_WordPress_SEO {
      * @return bool
      */
     protected function abilities_v2_write_option( $name, $value ) {
-        // Yoast owns these options' autoload flag; the null default leaves it as stored,
-        // so an apply and its rollback cannot silently move them off autoload.
+        // Yoast owns these options' autoload flag. Omitting update_option()'s autoload argument
+        // keeps the flag an existing option already stores, so an apply and its rollback cannot
+        // silently move it off autoload. That only holds for options that exist: update_option()
+        // falls through to add_option() for a missing one and creates it autoloaded. Nothing
+        // reaches here with one missing, because abilities_v2_normalize_settings() refuses a
+        // runtime whose wpseo_titles or wpseo option is absent or not an array.
         return update_option( $name, $value ) || get_option( $name, null ) === $value;
     }
 

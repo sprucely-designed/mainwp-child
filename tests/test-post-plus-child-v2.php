@@ -200,6 +200,40 @@ class Test_Post_Plus_Child_V2 extends WP_UnitTestCase {
 		$this->assertSame( '', get_post_meta( $captured, '_mainwp_child_content_operation_v2', true ) );
 	}
 
+	public function test_rolled_back_mutation_is_purged_from_the_term_cache() {
+		$existing = term_exists( 'rollback-term-cache', 'category' );
+		if ( is_array( $existing ) ) {
+			$category_id = (int) $existing['term_id'];
+		} else {
+			$created = wp_insert_term( 'Rollback Term Cache', 'category', array( 'slug' => 'rollback-term-cache' ) );
+			$this->assertIsArray( $created );
+			$category_id = (int) $created['term_id'];
+		}
+		$this->assertSame( 0, (int) get_term( $category_id )->count );
+
+		$payload                                     = $this->delivery_payload( '123e4567-e89b-42d3-a456-426614174625', 'Rollback terms' );
+		$payload['post']['categories']               = array( 'rollback-term-cache' );
+		$payload['post']['tags']                     = array( 'rollback-term-fixture-tag' );
+		$payload['randomization']['random_category'] = false;
+		$payload['content_digest']                   = hash( 'sha256', wp_json_encode( array( $payload['post'], $payload['randomization'] ) ) );
+
+		// The category is attached first, which moves its count inside the transaction. Reading it
+		// there is what a concurrent request does on a persistent object cache; refusing the tag
+		// that follows is what makes the transaction roll the count back.
+		$refuse = static function () use ( $category_id ) {
+			get_term( $category_id );
+			return new \WP_Error( 'fixture_term_refused', 'Term creation refused.' );
+		};
+		add_filter( 'pre_insert_term', $refuse );
+		$result = $this->request( 'post_plus_newpost_v2', $payload );
+		remove_filter( 'pre_insert_term', $refuse );
+
+		$this->assertSame( 'mutation_failed', $result['code'] );
+		$term = get_term( $category_id );
+		$this->assertInstanceOf( \WP_Term::class, $term );
+		$this->assertSame( 0, (int) $term->count, 'A rolled-back term count must not keep being served from cache.' );
+	}
+
 	public function test_full_ledger_evicts_only_the_receipts_that_can_no_longer_be_replayed() {
 		update_option( 'mainwp_child_post_plus_operations_v2', $this->aged_ledger( 'applied' ), false );
 		$payload = $this->delivery_payload( '123e4567-e89b-42d3-a456-426614174623', 'Ledger eviction' );

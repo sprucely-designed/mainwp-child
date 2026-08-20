@@ -332,6 +332,8 @@ class Test_MainWP_Child_BackupBuddy_V2_Provider_Boundary extends WP_UnitTestCase
 		$this->remove_tree( $this->root );
 		Test_MainWP_BackupBuddy_Provider_Stub::$options = null;
 		unset( $GLOBALS['mainwp_test_bb_core_loaded'], $GLOBALS['mainwp_test_bb_v1_core_path'] );
+		// The legacy-action test throws out of action(), so its request state can only be cleared here.
+		unset( $_POST['mwp_action'] );
 		delete_option( 'mainwp_backupbuddy_ability_operations_v1' );
 		delete_option( 'mainwp_backupbuddy_ability_effect_lock_v1' );
 		parent::tear_down();

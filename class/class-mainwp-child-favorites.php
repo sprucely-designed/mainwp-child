@@ -132,7 +132,13 @@ class MainWP_Child_Favorites {
         // Only this mutation path evicts: the read paths must never write.
         if ( is_array( $existing ) && $this->install_receipt_expired( $existing ) ) {
             $this->delete_install_receipt( $payload['request_ref'] );
-            $existing = null;
+            // An eviction that did not take leaves the replay defense standing, and reading the
+            // receipt back is what separates "the receipt is gone" from "the store could not drop
+            // it". Assuming the delete worked is how a resent request installs the package twice.
+            $existing = $this->load_install_receipt( $payload['request_ref'] );
+            if ( false === $existing ) {
+                return $this->error( $operation, 'storage_unavailable' );
+            }
         }
         $effect_hash = $this->install_effect_hash( $payload );
         if ( is_array( $existing ) ) {

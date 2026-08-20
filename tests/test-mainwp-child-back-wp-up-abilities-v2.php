@@ -729,6 +729,44 @@ class Test_MainWP_Child_Back_WP_Up_Abilities_V2 extends WP_UnitTestCase {
 	}
 
 	/**
+	 * A compressed log is decompressed once, forward, so a finished run that ends exactly on the
+	 * reader's 64 KB window boundary is still recognised. gzeof() reports end of stream only after
+	 * a read that returns nothing, so the seeked-window reader asked for a second gzip window at
+	 * that offset, read zero bytes, and reported the completed run as unknown. The bzip2 case
+	 * covers the same rewritten path; its reader probed a byte ahead and never had the miss.
+	 */
+	public function test_backup_progress_reads_a_compressed_log_in_one_forward_pass() {
+		$directory = $this->make_log_directory();
+		$closing   = '</body>' . PHP_EOL . '</html>';
+		$header    = '<html><head>' . PHP_EOL .
+			'<meta name="backwpup_errors" content="0" />' . PHP_EOL .
+			'</head>' . PHP_EOL . '<body>' . PHP_EOL;
+		$body      = $header . str_repeat( 'x', 65536 - strlen( $header ) - strlen( $closing ) ) . $closing;
+		$this->assertSame( 65536, strlen( $body ), 'The log must decompress to exactly one read window.' );
+
+		$archives = array(
+			'backwpup_log_boundary_gz.html.gz'  => gzencode( $body ),
+			'backwpup_log_boundary_bz.html.bz2' => bzcompress( $body ),
+		);
+		foreach ( $archives as $name => $bytes ) {
+			$this->assertIsString( $bytes );
+			file_put_contents( trailingslashit( $directory ) . $name, $bytes ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_file_put_contents -- Disposable fixture.
+		}
+		$subject = $this->progress_fixture( $directory );
+
+		foreach ( array( 'backwpup_log_boundary_gz.html', 'backwpup_log_boundary_bz.html' ) as $logfile ) {
+			$result = $this->invoke_provider( $subject, 'abilities_v2_provider_backup_progress', array( array( 'job_id' => 7, 'logfile' => $logfile ), 0 ) );
+			$this->assertSame( 'completed', $result['state'], $logfile . ' records a finished run.' );
+			$this->assertSame( 100, $result['progress_percent'] );
+		}
+
+		foreach ( array_keys( $archives ) as $name ) {
+			wp_delete_file( trailingslashit( $directory ) . $name );
+		}
+		$this->assertTrue( rmdir( $directory ) );
+	}
+
+	/**
 	 * The reported position is the observed one, so the caller can see forward progress
 	 * instead of the position it asked for.
 	 */

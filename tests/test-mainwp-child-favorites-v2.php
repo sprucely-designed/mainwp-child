@@ -187,6 +187,33 @@ class Test_MainWP_Child_Favorites_V2 extends WP_UnitTestCase {
 		delete_option( 'mainwp_child_favorites_receipt_' . hash( 'sha256', $ref ) );
 	}
 
+	public function test_an_expired_receipt_that_did_not_clear_keeps_defending_the_replay() {
+		$request = $this->install_request();
+		$ref     = $request['payload']['request_ref'];
+		$option  = 'mainwp_child_favorites_receipt_' . hash( 'sha256', $ref );
+
+		$stuck                      = $this->installed_subject();
+		$stuck->receipt_delete_mode = 'no_op';
+		$receipt                    = $this->settled_expired_receipt( $ref, $stuck->effect_hash_for_test( $request['payload'] ) );
+		$this->assertTrue( $stuck->seed_durable_receipt( $ref, $receipt ) );
+
+		$replayed = $stuck->install_verified_v2( $request );
+		$this->assertTrue( $replayed['ok'] );
+		$this->assertSame( 'completed', $replayed['status'] );
+		$this->assertSame( 0, $stuck->download_count );
+		$this->assertSame( 0, $stuck->install_count );
+		$this->assertSame( $receipt, get_option( $option, false ) );
+
+		$broken                      = $this->installed_subject();
+		$broken->receipt_delete_mode = 'corrupt';
+		$unreadable                  = $broken->install_verified_v2( $request );
+		$this->assertFalse( $unreadable['ok'] );
+		$this->assertSame( 'storage_unavailable', $unreadable['code'] );
+		$this->assertSame( 0, $broken->install_count );
+
+		delete_option( $option );
+	}
+
 	public function test_single_file_plugin_archive_must_stay_at_the_archive_root() {
 		if ( ! class_exists( '\ZipArchive' ) ) {
 			$this->markTestSkipped( 'ZipArchive is unavailable.' );
@@ -233,6 +260,46 @@ class Test_MainWP_Child_Favorites_V2 extends WP_UnitTestCase {
 		$callables = $property->getValue( MainWP_Child_Callable::get_instance() );
 		$this->assertSame( 'favorites_package_state_v2', $callables['favorites_package_state_v2'] );
 		$this->assertSame( 'favorites_install_verified_v2', $callables['favorites_install_verified_v2'] );
+	}
+
+	private function installed_subject() {
+		$subject = new Testable_MainWP_Child_Favorites_V2(
+			array( 'forms/forms.php' => array( 'Version' => '2.1.0' ) ),
+			array( 'forms/forms.php' ),
+			array()
+		);
+		$subject->durable_receipts = true;
+		return $subject;
+	}
+
+	private function settled_expired_receipt( $ref, $effect_hash ) {
+		return array(
+			'effect_hash'      => $effect_hash,
+			'state'            => 'settled',
+			'request_ref'      => $ref,
+			'type'             => 'plugin',
+			'slug'             => 'forms/forms.php',
+			'expected_version' => '2.1.0',
+			'activate'         => true,
+			'installed'        => false,
+			'previous_version' => null,
+			'previous_active'  => null,
+			'result'           => array(
+				'protocol'    => '2',
+				'operation'   => 'install',
+				'ok'          => true,
+				'request_ref' => $ref,
+				'status'      => 'completed',
+				'installed'   => true,
+				'type'        => 'plugin',
+				'slug'        => 'forms/forms.php',
+				'version'     => '2.1.0',
+				'active'      => true,
+				'code'        => null,
+			),
+			'updated_at'       => time() - 8 * DAY_IN_SECONDS,
+			'expires_at'       => time() - DAY_IN_SECONDS,
+		);
 	}
 
 	private function expired_receipt( $ref ) {
@@ -316,6 +383,9 @@ class Testable_MainWP_Child_Favorites_V2 extends MainWP_Child_Favorites {
 
 	public $durable_receipts = false;
 
+	/** One of 'normal', 'no_op' (delete silently fails) or 'corrupt' (delete leaves an unreadable receipt). */
+	public $receipt_delete_mode = 'normal';
+
 	public function __construct( $plugins, $active_plugins, $themes ) {
 		$this->test_plugins        = $plugins;
 		$this->test_active_plugins = $active_plugins;
@@ -397,6 +467,13 @@ class Testable_MainWP_Child_Favorites_V2 extends MainWP_Child_Favorites {
 	}
 
 	protected function delete_install_receipt( $request_ref ) {
+		if ( 'no_op' === $this->receipt_delete_mode ) {
+			return false;
+		}
+		if ( 'corrupt' === $this->receipt_delete_mode ) {
+			update_option( 'mainwp_child_favorites_receipt_' . hash( 'sha256', $request_ref ), array( 'effect_hash' => 'unreadable' ), false );
+			return false;
+		}
 		if ( $this->durable_receipts ) {
 			return parent::delete_install_receipt( $request_ref );
 		}

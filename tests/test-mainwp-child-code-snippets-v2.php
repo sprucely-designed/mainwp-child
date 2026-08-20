@@ -146,7 +146,12 @@ class Test_MainWP_Child_Code_Snippets_V2 extends WP_UnitTestCase {
 		}
 		if ( is_string( $this->config_dir ) && is_dir( $this->config_dir ) ) {
 			chmod( $this->config_dir, 0755 );
-			foreach ( (array) glob( $this->config_dir . '/{,.}*', GLOB_BRACE ) as $leftover ) {
+			// GLOB_BRACE is not defined on every libc, and an undefined constant is a fatal in PHP 8.
+			$leftovers = array_merge(
+				(array) glob( $this->config_dir . '/*' ),
+				(array) glob( $this->config_dir . '/.*' )
+			);
+			foreach ( $leftovers as $leftover ) {
 				if ( is_file( $leftover ) ) {
 					unlink( $leftover );
 				}

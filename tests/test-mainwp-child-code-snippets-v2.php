@@ -261,6 +261,16 @@ class Test_MainWP_Child_Code_Snippets_V2 extends WP_UnitTestCase {
 		$this->assertFalse( $result['output_truncated'], 'Nothing was printed, so nothing was withheld.' );
 	}
 
+	/** A snippet that leaves its own buffer open must not leak text past the encoded reply. */
+	public function test_a_snippet_that_leaves_a_buffer_open_still_reports_all_of_its_output() {
+		$entry  = ob_get_level();
+		$result = $this->fixture->snippet_v2( 'run_snippet_v2', $this->request( 'R', "echo 'outer'; ob_start(); echo 'inner';" ) );
+
+		$this->assertSame( 'succeeded', $result['status'] );
+		$this->assertSame( 'outerinner', $result['output'], 'Text held in a buffer the snippet never closed is still its output.' );
+		$this->assertSame( $entry, ob_get_level(), 'A run must hand back the buffer nesting it was given.' );
+	}
+
 	/** Truncating multibyte output keeps the text it produced instead of blanking the reply. */
 	public function test_truncated_multibyte_output_survives_the_byte_cap() {
 		$full   = str_repeat( 'é', 40000 );

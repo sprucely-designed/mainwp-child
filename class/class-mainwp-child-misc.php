@@ -932,22 +932,21 @@ class MainWP_Child_Misc {
         ob_start();
         try {
             eval( $code ); // phpcs:ignore Squiz.PHP.Eval, Generic.PHP.ForbiddenFunctions.Found -- Executes an already authorized stored Code Snippets definition under the authenticated Child callable.
-            $produced = (string) ob_get_clean();
-            $output   = $produced;
-            $status   = 'succeeded';
+            $status = 'succeeded';
         } catch ( \Throwable $exception ) {
-            // Buffered output from a run that threw can carry internals, so none of it ships. It is
-            // still recorded here: output_truncated is the only field that can say the Dashboard is
-            // not getting what the run printed, and a discard is exactly that. Buffers the snippet
-            // opened and never closed hold the earliest text in the outermost one, so each level
-            // read on the way out belongs in front of what was collected already.
-            $produced = '';
-            while ( ob_get_level() > $level ) {
-                $produced = (string) ob_get_clean() . $produced;
-            }
-            $output = '';
             $status = 'failed';
         }
+        // A snippet may leave buffers of its own open, so unwinding to the entry level is what stops
+        // its text escaping past the encoded response later in the request. The outermost level holds
+        // the earliest text, so each one read on the way out belongs in front of what came before.
+        $produced = '';
+        while ( ob_get_level() > $level ) {
+            $produced = (string) ob_get_clean() . $produced;
+        }
+        // Buffered output from a run that threw can carry internals, so none of it ships. It is still
+        // recorded above: output_truncated is the only field that can say the Dashboard is not getting
+        // what the run printed, and a discard is exactly that.
+        $output = 'succeeded' === $status ? $produced : '';
         // JSON cannot carry invalid UTF-8 at all, and without stripping wp_check_invalid_utf8()
         // answers one bad byte by discarding the whole string, so a run would report empty output
         // next to 'succeeded'. Returning the valid text is the truthful half of that choice.

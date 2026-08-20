@@ -241,6 +241,56 @@ class Test_MainWP_Child_Early_Access_Release_V2 extends WP_UnitTestCase {
 	}
 
 	/**
+	 * A settled receipt is only free to forget once its result said what happened. One settled as
+	 * unknown never did, so retention may not hand its reference back - the next apply under it
+	 * would run the transition a second time on a tree nobody has read.
+	 */
+	public function test_aged_unresolved_result_is_kept_and_still_refuses_a_second_transition() {
+		$subject     = new Retained_MainWP_Child_Early_Access_Release();
+		$request_ref = '123e4567-e89b-42d3-a456-426614174704';
+		$request     = $this->apply_request( $request_ref );
+		add_option( $this->receipt_option( $request_ref ), $this->unresolved_receipt( $request_ref, $this->effect_hash( $subject, $request['payload'] ), time() - 1 ), '', false );
+
+		$result = $subject->release_v2( $request );
+
+		$this->assertSame( 0, $subject->downloads, 'An unresolved settled result past retention must not free its reference for a second transition.' );
+		$this->assertSame( 0, $subject->applies );
+		$this->assertSame( 'unknown', $result['status'] );
+		$this->assertSame( 'outcome_unknown', $result['code'] );
+		$this->assertFalse( $result['retry_safe'] );
+		$this->assertIsArray( get_option( $this->receipt_option( $request_ref ), null ) );
+
+		delete_option( $this->receipt_option( $request_ref ) );
+	}
+
+	/**
+	 * A row that is still readable but refuses to delete has not become absent. Reporting
+	 * not_found there hides a receipt that later applies cannot replace either.
+	 */
+	public function test_a_receipt_that_cannot_be_reclaimed_reads_as_storage_not_absence() {
+		global $wpdb;
+
+		$subject     = new MainWP_Child_Early_Access_Release();
+		$request_ref = '123e4567-e89b-42d3-a456-426614174705';
+		$option      = $this->receipt_option( $request_ref );
+		add_option( $option, $this->settled_receipt( $request_ref, time() - 1 ), '', false );
+
+		// Send the reclaiming DELETE at a row that is not there, which is what an options-table
+		// write failure looks like from delete_option(): it returns false and the receipt stays.
+		$refuse = static function ( $query ) use ( $option, $wpdb ) {
+			return false !== strpos( $query, 'DELETE' ) && false !== strpos( $query, $option ) ? "DELETE FROM {$wpdb->options} WHERE option_name = 'mainwp-child-no-such-receipt'" : $query;
+		};
+		add_filter( 'query', $refuse );
+		$result = $subject->release_v2( $this->request( 'status', array( 'request_ref' => $request_ref ) ) );
+		remove_filter( 'query', $refuse );
+
+		$this->assertSame( 'storage_unavailable', $result['code'] );
+		$this->assertNotNull( $wpdb->get_var( $wpdb->prepare( "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s", $option ) ) );
+
+		delete_option( $option );
+	}
+
+	/**
 	 * An aged dispatch marker is the one thing retention may not drop: its effect was never
 	 * resolved, so forgetting it would let the next request run the transition a second time.
 	 */
@@ -274,21 +324,99 @@ class Test_MainWP_Child_Early_Access_Release_V2 extends WP_UnitTestCase {
 		$result = $subject->release_v2( $this->apply_request() );
 		$sealed = $root . '/' . $subject->last_backup_ref . '/sealed';
 		$this->assertDirectoryExists( $sealed );
-		if ( is_readable( $sealed ) ) {
-			chmod( $sealed, 0700 );
-			$this->remove_root( $root );
-			$this->markTestSkipped( 'This user can read a 0000 directory, so the failing walk cannot be staged.' );
-		}
+		$sealed_holds = ! is_readable( $sealed );
 
 		chmod( $sealed, 0700 );
 		$this->remove_root( $root );
+		$this->require_sealed_directory( $sealed_holds, $sealed );
 
 		$this->assertTrue( $result['ok'] );
 		$this->assertSame( 'applied', $result['status'] );
 	}
 
+	/**
+	 * The staged tree is inspected before anything replaces installed code, and a directory the
+	 * walk cannot read leaves part of it uninspected. That has to read as unsafe rather than
+	 * throw out of the apply.
+	 *
+	 * The check runs on a tree the production apply has just extracted itself, and ZIP extraction
+	 * does not carry stored directory modes through, so the unreadable directory cannot be staged
+	 * from outside apply_package(). The private walk is driven directly instead.
+	 */
+	public function test_unreadable_staged_directory_reads_as_unsafe_to_publish() {
+		$root   = $this->private_root();
+		$staged = $root . '/mainwp-child';
+		$sealed = $staged . '/sealed';
+		$this->assertTrue( mkdir( $sealed, 0700, true ) );
+		file_put_contents( $staged . '/mainwp-child.php', "<?php\n/*\nPlugin Name: MainWP Child\nVersion: 6.0.0-beta.2\n*/\n" );
+		chmod( $sealed, 0000 );
+		$sealed_holds = ! is_readable( $sealed );
+
+		$walk = new \ReflectionMethod( MainWP_Child_Early_Access_Release::class, 'tree_is_safe' );
+		$walk->setAccessible( true );
+		try {
+			$safe = $walk->invoke( new MainWP_Child_Early_Access_Release(), $staged );
+		} finally {
+			chmod( $sealed, 0700 );
+			$this->remove_root( $root );
+		}
+		$this->require_sealed_directory( $sealed_holds, $sealed );
+
+		$this->assertFalse( $safe );
+	}
+
+	/**
+	 * Refuse to pass an unreadable-directory fixture that was never unreadable.
+	 *
+	 * A process running as root reads a mode-0000 directory anyway, and the walk these tests
+	 * cover never fails there - so that case is skipped, out loud and by name. Anything else
+	 * reading that directory means the fixture is broken, and a broken fixture must fail rather
+	 * than report a guard it never touched as covered.
+	 */
+	private function require_sealed_directory( $sealed_holds, $path ) {
+		if ( $sealed_holds ) {
+			return;
+		}
+		if ( function_exists( 'posix_geteuid' ) && 0 === posix_geteuid() ) {
+			$this->markTestSkipped( 'Running as root, where a mode-0000 directory stays readable and a failing directory walk cannot be staged.' );
+		}
+		$this->fail( sprintf( 'The fixture directory %s stayed readable at mode 0000, so this test would pass without exercising the walk it covers.', $path ) );
+	}
+
 	private function receipt_option( $request_ref ) {
 		return 'mainwp_child_early_access_v2_' . hash( 'sha256', $request_ref );
+	}
+
+	/**
+	 * Read the request digest from the shipped builder so the seeded receipt replays exactly.
+	 */
+	private function effect_hash( $subject, $payload ) {
+		$method = new \ReflectionMethod( MainWP_Child_Early_Access_Release::class, 'effect_hash' );
+		$method->setAccessible( true );
+		return $method->invoke( $subject, $payload );
+	}
+
+	/**
+	 * One stored receipt settled without ever resolving what the transition did.
+	 */
+	private function unresolved_receipt( $request_ref, $effect_hash, $expires_at ) {
+		$receipt                = $this->settled_receipt( $request_ref, $expires_at );
+		$receipt['effect_hash'] = $effect_hash;
+		$receipt['result']      = array(
+			'protocol'          => '2',
+			'operation'         => 'apply',
+			'ok'                => false,
+			'request_ref'       => $request_ref,
+			'status'            => 'unknown',
+			'action'            => 'upgrade',
+			'previous_version'  => '5.4.1',
+			'installed_version' => '',
+			'active'            => true,
+			'persistence'       => 'unknown',
+			'retry_safe'        => false,
+			'code'              => 'outcome_unknown',
+		);
+		return $receipt;
 	}
 
 	/**
@@ -355,11 +483,11 @@ class Test_MainWP_Child_Early_Access_Release_V2 extends WP_UnitTestCase {
 		return $root;
 	}
 
-	private function apply_request() {
+	private function apply_request( $request_ref = '123e4567-e89b-42d3-a456-426614174000' ) {
 		return $this->request(
 			'apply',
 			array(
-				'request_ref'     => '123e4567-e89b-42d3-a456-426614174000',
+				'request_ref'     => $request_ref,
 				'action'          => 'upgrade',
 				'gateway_url'     => 'https://dashboard.example/wp-json/mainwp-early-access/v1/artifacts/fixture',
 				'gateway_token'   => 'one-use-private-token',
@@ -492,6 +620,53 @@ class Testable_MainWP_Child_Early_Access_Release extends MainWP_Child_Early_Acce
 
 	public function seed_dispatching( $request ) {
 		$this->receipts[ $request['payload']['request_ref'] ] = $this->dispatching_receipt_for_test( $request );
+	}
+}
+
+/** Fixture that keeps the production receipt store while counting the effect the receipt guards. */
+class Retained_MainWP_Child_Early_Access_Release extends MainWP_Child_Early_Access_Release {
+
+	public $version = '5.4.1';
+	public $downloads = 0;
+	public $applies = 0;
+
+	protected function current_state() {
+		return array( 'installed' => true, 'version' => $this->version, 'active' => true );
+	}
+
+	protected function gateway_allowed( $url ) {
+		return 'https://dashboard.example/wp-json/mainwp-early-access/v1/artifacts/fixture' === $url;
+	}
+
+	protected function download_package( $url, $token, $expected_bytes ) {
+		unset( $url, $token, $expected_bytes );
+		++$this->downloads;
+		return array( 'path' => '/private/fixture.zip', 'bytes' => 1024, 'sha256' => str_repeat( 'a', 64 ) );
+	}
+
+	protected function validate_package( $package, $target_version ) {
+		unset( $package, $target_version );
+		return true;
+	}
+
+	protected function apply_package( $package, $before, $target_version ) {
+		unset( $package, $before );
+		++$this->applies;
+		$this->version = $target_version;
+		return array( 'status' => 'applied', 'backup_ref' => null );
+	}
+
+	protected function cleanup_package( $package ) {
+		unset( $package );
+		return true;
+	}
+
+	protected function acquire_transition_lock() {
+		return true;
+	}
+
+	protected function release_transition_lock( $lock ) {
+		unset( $lock );
 	}
 }
 

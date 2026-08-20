@@ -653,6 +653,12 @@ class Test_MainWP_Child_WooCommerce_Status_V2 extends WP_UnitTestCase {
 	 * The inventory counters and the page validator have to agree on how large a store may be.
 	 * A count between the two bounds used to make the counter fail, and the whole status request
 	 * with it, on a store the validator would have accepted.
+	 *
+	 * Two counters carry that bound: the low-stock query, driven here, and the loop over the
+	 * order and product query objects. The second cannot be driven from the suite - WooCommerce
+	 * is absent, so wc_get_products() does not exist and the whole read returns before reaching
+	 * the loop, and a global stub cannot be declared from this namespaced file. Its bound is read
+	 * out of the shipped source instead and held to the one the page validator enforces.
 	 */
 	public function test_inventory_count_between_the_old_and_the_validator_bound_is_reported() {
 		$rewrite = static function ( $query ) {
@@ -674,6 +680,25 @@ class Test_MainWP_Child_WooCommerce_Status_V2 extends WP_UnitTestCase {
 		$validator->setAccessible( true );
 		$page = $this->page_data( 50000 );
 		$this->assertTrue( $validator->invoke( $reflection->newInstanceWithoutConstructor(), $page, array( 'page_size' => 50, 'top_limit' => 5 ) ) );
+
+		$accepted = $this->enforced_bound( 'abilities_v2_valid_page_data', '/([0-9]+)\s*<\s*\$page\[\s*\$field\s*\]/' );
+		$this->assertSame( $accepted, $this->enforced_bound( 'abilities_v2_inventory_counts', '/([0-9]+)\s*<\s*\$counted->total/' ), 'The inventory objects and the page validator must accept the same store size.' );
+		$this->assertGreaterThanOrEqual( 50000, $accepted );
+	}
+
+	/**
+	 * Read one numeric bound out of the shipped method that enforces it.
+	 *
+	 * Nothing in the suite can reach the guard behind an absent WooCommerce, and a copy of the
+	 * number here would keep passing after the guard changed. The assertion is tied to the
+	 * source of the method it is about instead.
+	 */
+	private function enforced_bound( $method, $pattern ) {
+		$reflection = new \ReflectionMethod( MainWP_Child_WooCommerce_Status::class, $method );
+		$lines      = file( $reflection->getFileName() );
+		$source     = implode( '', array_slice( $lines, $reflection->getStartLine() - 1, $reflection->getEndLine() - $reflection->getStartLine() + 1 ) );
+		$this->assertSame( 1, preg_match( $pattern, $source, $bound ), sprintf( 'No bound matching %s was found in %s().', $pattern, $method ) );
+		return (int) $bound[1];
 	}
 
 	/**

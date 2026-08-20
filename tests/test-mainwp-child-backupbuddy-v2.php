@@ -45,6 +45,18 @@ class Test_MainWP_Child_BackupBuddy_V2_Fixture extends MainWP_Child_Back_Up_Budd
 	/** @var bool */
 	public $release_result = true;
 
+	/** @var int */
+	public $archive_scans = 0;
+
+	/**
+	 * Scan number at which the fixture drops every profile, so a test can put a provider state
+	 * change inside one request the way the real archive scan can: it calls into BackupBuddy, and
+	 * BackupBuddy reloads pb_backupbuddy::$options from the database while it is there.
+	 *
+	 * @var int
+	 */
+	public $forget_profiles_at_scan = 0;
+
 	/** Avoid product hooks in the isolated fixture. */
 	public function __construct() {
 		$this->is_backupbuddy_installed = true;
@@ -71,6 +83,10 @@ class Test_MainWP_Child_BackupBuddy_V2_Fixture extends MainWP_Child_Back_Up_Budd
 
 	/** @return array */
 	protected function abilities_v2_archive_candidates() {
+		++$this->archive_scans;
+		if ( 0 < $this->forget_profiles_at_scan && $this->archive_scans >= $this->forget_profiles_at_scan ) {
+			$this->options['profiles'] = array();
+		}
 		return $this->archives;
 	}
 
@@ -1182,6 +1198,53 @@ class Test_MainWP_Child_BackupBuddy_Abilities_V2 extends WP_UnitTestCase {
 		);
 		$this->assertSame( 'cancel_requested', $cancel['operation']['state'] );
 		$this->assertSame( 'cancel_not_immediate', $cancel['operation']['warning_codes'][0] );
+	}
+
+	/**
+	 * The preview token verifies against a profile that is gone by the time the start path resolves
+	 * it again, because the archive scan behind the token runs BackupBuddy's own code and that can
+	 * reload the options. Reading a profile out of the unresolved target dispatches a backup with no
+	 * profile at all and reports it as queued.
+	 */
+	public function test_a_target_that_vanishes_after_its_preview_is_refused_instead_of_dispatched() {
+		$fixture     = $this->fixture();
+		$profiles    = $this->dispatch(
+			$fixture,
+			array(
+				'operation' => 'list_profiles',
+				'page'      => 1,
+				'per_page'  => 25,
+			)
+		);
+		$profile_ref = $this->full_profile_ref( $profiles );
+		$preview     = $this->dispatch(
+			$fixture,
+			array(
+				'operation'   => 'preview_run',
+				'target_kind' => 'profile',
+				'target_ref'  => $profile_ref,
+			)
+		);
+		$this->assertStringStartsWith( 'pre.v1.', $preview['preview_token'] );
+
+		// The token is verified on the second scan, which is where the profiles go, so the token
+		// still matches the snapshot it was issued for and the start path resolves an empty store.
+		$fixture->forget_profiles_at_scan = 2;
+		$started                          = $this->dispatch(
+			$fixture,
+			array(
+				'operation'     => 'start_backup',
+				'profile_ref'   => $profile_ref,
+				'preview_token' => $preview['preview_token'],
+				'request_ref'   => $this->request_ref,
+			)
+		);
+
+		$this->assertSame( array(), $fixture->effects, 'A backup must not be dispatched for a target that no longer resolves.' );
+		$this->assertSame( 'not_found', $started['code'] );
+		$this->assertFalse( $started['ok'] );
+		$this->assertSame( 0, $fixture->writes );
+		$this->assertSame( array(), $fixture->records );
 	}
 
 	/** Same request reference with a different effect is a stable conflict. */

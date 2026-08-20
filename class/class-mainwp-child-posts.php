@@ -1212,14 +1212,15 @@ class MainWP_Child_Posts { //phpcs:ignore -- NOSONAR - multi methods.
     }
 
     /**
-     * Load one bounded private operation ledger, keeping only the entries it can still read.
+     * Load one bounded private operation ledger, keeping every entry that still means something.
      *
-     * The option is untrusted input, and an entry that no longer validates carries no replay
-     * protection anyway - it cannot be matched to a request or projected into a result. Failing
-     * the whole ledger over one such entry would instead cost every later mutation on this site,
-     * so the unreadable entries are dropped and the next write persists the ledger without them.
-     * Reserved receipts that still validate are untouched: losing one is what would let a retry
-     * duplicate content.
+     * The option is untrusted input, and failing the whole ledger over one damaged entry would
+     * cost every later mutation on this site. Dropping the entry is not free either: an entry
+     * filed under a real operation reference is the evidence that this operation already ran
+     * here, and without it the still-live original request reserves again and commits a second
+     * post. So a damaged entry under a valid reference is quarantined rather than deleted, and
+     * only an entry whose key is not an operation reference - which no request can ever replay
+     * against - is dropped. Reserved receipts that still validate are untouched.
      *
      * @param string $protocol Closed protocol name.
      * @return array|false Valid ledger or false.
@@ -1233,9 +1234,54 @@ class MainWP_Child_Posts { //phpcs:ignore -- NOSONAR - multi methods.
         foreach ( $records as $operation_ref => $record ) {
             if ( is_string( $operation_ref ) && $this->content_v2_record( $record ) && hash_equals( $operation_ref, $record['operation_ref'] ) ) {
                 $valid[ $operation_ref ] = $record;
+            } elseif ( $this->content_v2_uuid( $operation_ref ) ) {
+                $valid[ $operation_ref ] = $this->content_v2_quarantine_record( $operation_ref, $record );
             }
         }
         return self::CONTENT_V2_MAX_RECORDS < count( $valid ) ? false : $valid;
+    }
+
+    /**
+     * Rebuild one damaged entry as a quarantined unknown outcome under the same reference.
+     *
+     * The reference is what a retry is matched against, so keeping it is what stops the retry
+     * from reserving a second time. What the damaged entry no longer proves is the outcome, so
+     * everything it could have claimed about the effect is reset to the unknown, non-retryable
+     * reading: no post id, no revision, no remote reference, and no route back into the apply.
+     * The identity fields are kept where they still read, so a genuine retry is answered with
+     * that unknown state instead of a conflict it cannot act on.
+     *
+     * @param string $operation_ref Valid operation reference taken from the ledger key.
+     * @param mixed  $record        Damaged entry.
+     * @return array Valid quarantined record.
+     */
+    private function content_v2_quarantine_record( $operation_ref, $record ) {
+        $source      = is_array( $record ) ? $record : array();
+        $unknown     = str_repeat( '0', 64 );
+        $now         = time();
+        $accepted_at = isset( $source['accepted_at'] ) && is_int( $source['accepted_at'] ) && 1 <= $source['accepted_at'] && $now >= $source['accepted_at'] ? $source['accepted_at'] : $now;
+        $updated_at  = isset( $source['updated_at'] ) && is_int( $source['updated_at'] ) && $accepted_at <= $source['updated_at'] && $now >= $source['updated_at'] ? $source['updated_at'] : $now;
+        return array(
+            'dashboard_ref'     => isset( $source['dashboard_ref'] ) && $this->content_v2_hash( $source['dashboard_ref'] ) ? $source['dashboard_ref'] : $unknown,
+            'operation_ref'     => $operation_ref,
+            'effect_hash'       => isset( $source['effect_hash'] ) && $this->content_v2_hash( $source['effect_hash'] ) ? $source['effect_hash'] : $unknown,
+            'content_digest'    => isset( $source['content_digest'] ) && $this->content_v2_hash( $source['content_digest'] ) ? $source['content_digest'] : $unknown,
+            'mode'              => 'create',
+            'target_post_id'    => null,
+            'expected_revision' => null,
+            'post_id'           => null,
+            'state'             => 'unknown',
+            'post_revision'     => null,
+            'remote_post_ref'   => null,
+            'retryable'         => false,
+            'choices'           => array(
+                'author_id'     => 1,
+                'category_id'   => null,
+                'post_date_gmt' => null,
+            ),
+            'accepted_at'       => $accepted_at,
+            'updated_at'        => $updated_at,
+        );
     }
 
     /**

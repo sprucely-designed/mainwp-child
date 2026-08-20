@@ -257,8 +257,9 @@ class MainWP_Child_Early_Access_Release {
             return false;
         }
         if ( $this->receipt_expired( $value ) ) {
-            delete_option( $this->receipt_key( $request_ref ) );
-            return null;
+            // A row that is still readable but will not delete has not become absent, and saying
+            // not_found would leave the reference occupied by a receipt nobody can replace.
+            return delete_option( $this->receipt_key( $request_ref ) ) ? null : false;
         }
         return $value;
     }
@@ -267,12 +268,19 @@ class MainWP_Child_Early_Access_Release {
      * Report whether one settled result has passed retention.
      *
      * Nothing else prunes these options, so the read that finds one past retention is what
-     * reclaims it, and the reference becomes free for a new request. A dispatch marker is
-     * exempt: its effect was never resolved, so the only truthful answer stays outcome_unknown
-     * however old the marker is, and dropping it would let a retry run the transition twice.
+     * reclaims it, and the reference becomes free for a new request. Only an outcome that
+     * established what the installed tree went through may be forgotten that way: applied,
+     * restored and failed each name a known ending, so a later request under the same
+     * reference either converges on the same verified tree or starts from a state that was
+     * read back and proven. A dispatch marker and a settled unknown are both exempt - neither
+     * ever resolved the effect, so the only truthful answer stays outcome_unknown however old
+     * the receipt is, and dropping one would let a retry run the transition twice.
      */
     private function receipt_expired( $receipt ) {
-        return 'settled' === $receipt['state'] && $receipt['expires_at'] <= time();
+        if ( 'settled' !== $receipt['state'] || $receipt['expires_at'] > time() ) {
+            return false;
+        }
+        return in_array( $receipt['result']['status'], array( 'applied', 'restored', 'failed' ), true );
     }
 
     /** Reserve one request. */

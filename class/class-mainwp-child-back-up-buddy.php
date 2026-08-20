@@ -1345,10 +1345,18 @@ class MainWP_Child_Back_Up_Buddy { //phpcs:ignore -- NOSONAR - multi methods.
                 $result = $replay;
             } else {
                 $preview = $this->abilities_v2_verify_preview( $kind, $request[ $target_key ], $request['preview_token'] );
+                // Verifying the token resolves the target once, but BackupBuddy's own code runs in
+                // between - the archive scan behind the token calls into it, and it reloads
+                // pb_backupbuddy::$options from the database - so the profile or schedule can be
+                // gone by the time this resolve runs. An unresolved target is null, and reading a
+                // profile out of it would hand a null profile to the backup effect and report the
+                // dispatch as queued.
+                $target = $this->abilities_v2_resolve_target( $kind, $request[ $target_key ] );
                 if ( ! is_array( $preview ) || $this->abilities_v2_is_error( $preview ) ) {
                     $result = $this->abilities_v2_error( 'preview_stale' );
+                } elseif ( ! is_array( $target ) ) {
+                    $result = $this->abilities_v2_error( 'not_found' );
                 } else {
-                    $target  = $this->abilities_v2_resolve_target( $kind, $request[ $target_key ] );
                     $profile = 'profile' === $kind ? $target : $target['profile'];
                     $steps   = 'schedule' === $kind ? array( 'remote_destinations' => $target['remote_ids'], 'delete_after' => false ) : array();
                     $record  = $this->abilities_v2_new_operation( $request['request_ref'], $this->abilities_v2_request_hash( $request ), 'profile' === $kind ? 'backup' : 'scheduled_backup', null, null );

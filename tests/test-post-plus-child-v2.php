@@ -263,12 +263,14 @@ class Test_Post_Plus_Child_V2 extends WP_UnitTestCase {
 	/**
 	 * One entry nothing can read any more must cost that entry, not the whole ledger. Failing the
 	 * store instead makes every later mutation on the site answer storage_unavailable for good.
+	 * The key here is not an operation reference, so no request can ever replay against it and
+	 * dropping it cannot cost a replay defense.
 	 */
 	public function test_one_unreadable_ledger_entry_does_not_brick_the_store() {
 		$applied  = array_slice( $this->aged_ledger( 'applied' ), 0, 3, true );
 		$reserved = array_slice( $this->aged_ledger( 'reserved' ), 3, 1, true );
 		$ledger   = $applied + $reserved;
-		$ledger['123e4567-e89b-42d3-a456-426699999999'] = array( 'operation_ref' => 'not a record' );
+		$ledger['not-an-operation-reference'] = array( 'operation_ref' => 'not a record' );
 		update_option( 'mainwp_child_post_plus_operations_v2', $ledger, false );
 
 		$payload = $this->delivery_payload( '123e4567-e89b-42d3-a456-426614174625', 'Salvaged ledger' );
@@ -278,12 +280,36 @@ class Test_Post_Plus_Child_V2 extends WP_UnitTestCase {
 		$this->assertSame( 'applied', $result['state'] );
 
 		$records = get_option( 'mainwp_child_post_plus_operations_v2' );
-		$this->assertArrayNotHasKey( '123e4567-e89b-42d3-a456-426699999999', $records );
+		$this->assertArrayNotHasKey( 'not-an-operation-reference', $records );
 		$this->assertArrayHasKey( $payload['operation_ref'], $records );
 		foreach ( array_keys( $applied + $reserved ) as $kept ) {
 			$this->assertArrayHasKey( $kept, $records );
 		}
 		$this->assertSame( 'reserved', $records[ array_key_first( $reserved ) ]['state'] );
+	}
+
+	/**
+	 * A damaged entry filed under a real operation reference is still the evidence that the
+	 * operation ran. Drop it and the original request - still live, still retrying - reserves
+	 * again and commits a second post carrying the same operation metadata.
+	 */
+	public function test_a_damaged_entry_for_a_committed_post_still_refuses_a_second_insert() {
+		$payload = $this->delivery_payload( '123e4567-e89b-42d3-a456-426614174626', 'Damaged receipt' );
+		$created = $this->request( 'post_plus_newpost_v2', $payload );
+		$this->assertSame( 'applied', $created['state'] );
+		$this->assertCount( 1, $this->operation_posts( $payload['operation_ref'] ) );
+
+		$records = get_option( 'mainwp_child_post_plus_operations_v2' );
+		$records[ $payload['operation_ref'] ]['post_revision'] = substr( $records[ $payload['operation_ref'] ]['post_revision'], 0, 32 );
+		update_option( 'mainwp_child_post_plus_operations_v2', $records, false );
+
+		$retry = $this->request( 'post_plus_newpost_v2', $payload );
+
+		$this->assertCount( 1, $this->operation_posts( $payload['operation_ref'] ), 'A damaged entry must not let the original request commit the post a second time.' );
+		$this->assertTrue( $retry['ok'] );
+		$this->assertSame( 'unknown', $retry['state'] );
+		$this->assertFalse( $retry['retryable'] );
+		$this->assertNull( $retry['post_revision'] );
 	}
 
 	/**

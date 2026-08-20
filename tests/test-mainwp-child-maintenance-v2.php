@@ -447,6 +447,39 @@ class Test_MainWP_Child_Maintenance_V2 extends WP_UnitTestCase {
 	}
 
 	/**
+	 * A store filled with runs that all finished this week is out of the seven-day prune's reach,
+	 * so without eviction the cap refuses every execute until the oldest record ages out. The
+	 * oldest record here is a run that is still going and is still writing to its record: dropping
+	 * that one to make room loses the handle to a live run, and the record a day past any retry is
+	 * the one that can go.
+	 */
+	public function test_a_full_operation_store_evicts_a_settled_run_and_keeps_the_running_one() {
+		$in_flight               = $this->running_record( 1, 6 * DAY_IN_SECONDS );
+		$in_flight['updated_at'] = time() - 30;
+		$evictable               = $this->settled_record( 2, 2 * DAY_IN_SECONDS );
+		$records                 = array(
+			$in_flight['operation_ref'] => $in_flight,
+			$evictable['operation_ref'] => $evictable,
+		);
+		for ( $index = 3; $index <= 100; $index++ ) {
+			$settled                              = $this->settled_record( $index, 60 );
+			$records[ $settled['operation_ref'] ] = $settled;
+		}
+		update_option( MainWP_Child_Maintenance::ABILITIES_V2_OPERATIONS_OPTION, $records, false );
+
+		list( , $result ) = $this->real_execute( $this->real_subject(), array( 'autodraft' ), 5, '123e4567-e89b-42d3-a456-426614174520' );
+
+		$this->assertTrue( $result['ok'] );
+		$this->assertSame( 'succeeded', $result['status'] );
+		$stored = get_option( MainWP_Child_Maintenance::ABILITIES_V2_OPERATIONS_OPTION, array() );
+		$this->assertCount( 100, $stored );
+		$this->assertArrayHasKey( '123e4567-e89b-42d3-a456-426614174520', $stored );
+		$this->assertArrayHasKey( $in_flight['operation_ref'], $stored, 'The oldest record is a live run and is not what eviction may take.' );
+		$this->assertSame( 'running', $stored[ $in_flight['operation_ref'] ]['status'] );
+		$this->assertArrayNotHasKey( $evictable['operation_ref'], $stored );
+	}
+
+	/**
 	 * A timeout row whose value option is already gone is a transient that is deleted, not one the
 	 * Child was refused. The run clears the leftover row and counts it, instead of reporting a
 	 * failure for work nothing is left to do.
@@ -784,6 +817,24 @@ class Test_MainWP_Child_Maintenance_V2 extends WP_UnitTestCase {
 			'report_emitted'     => false,
 			'updated_at'         => $at,
 		);
+	}
+
+	/** Build one durable record whose run finished $age seconds ago. */
+	private function settled_record( $index, $age ) {
+		$record                   = $this->running_record( $index, $age + 5 );
+		$record['status']         = 'succeeded';
+		$record['outcomes']       = array(
+			array(
+				'action'     => 'autodraft',
+				'status'     => 'succeeded',
+				'affected'   => 1,
+				'error_code' => null,
+			),
+		);
+		$record['finished_at']    = time() - $age;
+		$record['report_emitted'] = true;
+		$record['updated_at']     = time() - $age;
+		return $record;
 	}
 
 	private function clear_transients() {

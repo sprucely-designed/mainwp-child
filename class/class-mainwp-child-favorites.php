@@ -279,9 +279,12 @@ class MainWP_Child_Favorites {
             return true;
         }
         $held = $this->read_install_lock();
-        // Nothing to read means the insert lost to something this request cannot see, so report busy
-        // and leave the decision to the next request, which will have a row to decide against.
-        if ( ! is_string( $held ) || '' === $held ) {
+        // No row at all is nothing to take over: the insert lost and the row is already gone, so
+        // report busy and leave the decision to the next request, which will have a row to decide
+        // against. That cannot wedge, because a wedge needs a row that persists. An empty row is a
+        // different case entirely - it exists, it just asserts nothing - so it falls through to the
+        // takeover below rather than refusing on behalf of a row nobody knows to look for.
+        if ( null === $held ) {
             return false;
         }
         $lock = $this->install_lock_value( $held );
@@ -330,11 +333,20 @@ class MainWP_Child_Favorites {
         return 1 === (int) $inserted;
     }
 
-    /** Read the lane row itself rather than a per-process cache of it. */
+    /**
+     * Read the lane row itself rather than a per-process cache of it.
+     *
+     * Not get_var(): it reports an empty column as null, which would make a row holding '' read
+     * exactly like no row and send it to the refusal arm instead of the takeover. Core reads options
+     * through get_row() for the same reason.
+     *
+     * @return string|null The exact stored value, or null when no row is visible.
+     */
     private function read_install_lock() {
         global $wpdb;
         // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- A lane decision has to ask the row that other requests are competing for.
-        return $wpdb->get_var( $wpdb->prepare( "SELECT option_value FROM $wpdb->options WHERE option_name = %s LIMIT 1", self::INSTALL_LOCK_OPTION ) );
+        $row = $wpdb->get_row( $wpdb->prepare( "SELECT option_value FROM $wpdb->options WHERE option_name = %s LIMIT 1", self::INSTALL_LOCK_OPTION ), ARRAY_A );
+        return is_array( $row ) && isset( $row['option_value'] ) && is_string( $row['option_value'] ) ? $row['option_value'] : null;
     }
 
     /** Delete one exact lane row, leaving any other holder's row where it is. */
@@ -364,9 +376,20 @@ class MainWP_Child_Favorites {
      * Reads answer "no such option" straight out of the notoptions bucket, so a lane row inserted
      * behind the options API stays invisible to every later get_option() in the request unless
      * that bucket is corrected. Core's upgrader lock inherits that staleness; this one does not.
+     *
+     * alloptions is consulted before either of the others and is only ever populated for a row this
+     * class did not write, since claims are stored with autoload off. That is the takeover path: a
+     * foreign autoloaded row keeps answering reads from the bucket after the matched delete, so the
+     * replacement lane is shadowed by the value it replaced. Only this key is dropped, the way core
+     * corrects the bucket, because flushing it would cost every option the request has loaded.
      */
     private function forget_install_lock_cache() {
         wp_cache_delete( self::INSTALL_LOCK_OPTION, 'options' );
+        $alloptions = wp_cache_get( 'alloptions', 'options' );
+        if ( is_array( $alloptions ) && isset( $alloptions[ self::INSTALL_LOCK_OPTION ] ) ) {
+            unset( $alloptions[ self::INSTALL_LOCK_OPTION ] );
+            wp_cache_set( 'alloptions', $alloptions, 'options' );
+        }
         $notoptions = wp_cache_get( 'notoptions', 'options' );
         if ( is_array( $notoptions ) && isset( $notoptions[ self::INSTALL_LOCK_OPTION ] ) ) {
             unset( $notoptions[ self::INSTALL_LOCK_OPTION ] );

@@ -243,6 +243,24 @@ class Test_MainWP_Child_Code_Snippets_V2 extends WP_UnitTestCase {
 		$this->assertSame( 65535, strlen( $result['output'] ) );
 	}
 
+	/**
+	 * A run that printed and then threw has its output withheld, not lost: the reply must not claim
+	 * an empty output is the complete one. A run that threw before printing anything has nothing
+	 * withheld, so the same field stays false.
+	 */
+	public function test_output_withheld_from_a_failed_run_is_reported_as_truncated() {
+		$result = $this->fixture->snippet_v2( 'run_snippet_v2', $this->request( 'R', "echo 'emitted-before-failure'; throw new Exception('PRIVATE-DETAIL');" ) );
+		$this->assertSame( 'failed', $result['status'] );
+		$this->assertSame( '', $result['output'], 'A thrown run still ships no output.' );
+		$this->assertTrue( $result['output_truncated'], 'Output was produced and dropped; saying otherwise is the dishonest answer.' );
+		$this->assertStringNotContainsString( 'PRIVATE-DETAIL', wp_json_encode( $result ) );
+
+		$result = $this->fixture->snippet_v2( 'run_snippet_v2', $this->request( 'R', "throw new Exception('PRIVATE-DETAIL');" ) );
+		$this->assertSame( 'failed', $result['status'] );
+		$this->assertSame( '', $result['output'] );
+		$this->assertFalse( $result['output_truncated'], 'Nothing was printed, so nothing was withheld.' );
+	}
+
 	/** Truncating multibyte output keeps the text it produced instead of blanking the reply. */
 	public function test_truncated_multibyte_output_survives_the_byte_cap() {
 		$full   = str_repeat( 'é', 40000 );

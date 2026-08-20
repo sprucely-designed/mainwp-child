@@ -932,11 +932,18 @@ class MainWP_Child_Misc {
         ob_start();
         try {
             eval( $code ); // phpcs:ignore Squiz.PHP.Eval, Generic.PHP.ForbiddenFunctions.Found -- Executes an already authorized stored Code Snippets definition under the authenticated Child callable.
-            $output = (string) ob_get_clean();
-            $status = 'succeeded';
+            $produced = (string) ob_get_clean();
+            $output   = $produced;
+            $status   = 'succeeded';
         } catch ( \Throwable $exception ) {
+            // Buffered output from a run that threw can carry internals, so none of it ships. It is
+            // still recorded here: output_truncated is the only field that can say the Dashboard is
+            // not getting what the run printed, and a discard is exactly that. Buffers the snippet
+            // opened and never closed hold the earliest text in the outermost one, so each level
+            // read on the way out belongs in front of what was collected already.
+            $produced = '';
             while ( ob_get_level() > $level ) {
-                ob_end_clean();
+                $produced = (string) ob_get_clean() . $produced;
             }
             $output = '';
             $status = 'failed';
@@ -946,11 +953,11 @@ class MainWP_Child_Misc {
         // next to 'succeeded'. Returning the valid text is the truthful half of that choice.
         // Stripping runs before the cap because it can change the byte length, and the cap has to
         // describe what actually ships.
-        $produced = $output;
-        $output   = wp_check_invalid_utf8( $output, true );
+        $output = wp_check_invalid_utf8( $output, true );
         // output_truncated is the only field saying the shipped text is not what the run produced,
-        // so it covers bytes the strip removed as well as bytes the cap cut. It does not mean
-        // "cut at the end"; a scrubbed run can lose bytes from the middle and stay under the cap.
+        // so it covers output a failed run discarded, bytes the strip removed, and bytes the cap
+        // cut. It does not mean "cut at the end"; a scrubbed run can lose bytes from the middle and
+        // stay under the cap.
         $truncated = $output !== $produced;
         if ( 65535 < strlen( $output ) ) {
             $output    = $this->snippet_v2_cut_utf8( $output, 65535 );

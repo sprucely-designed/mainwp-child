@@ -280,6 +280,29 @@ class Test_MainWP_Child_Favorites_V2 extends WP_UnitTestCase {
 		$this->assertFalse( get_option( 'mainwp_child_favorites_install_lock', false ) );
 	}
 
+	/**
+	 * An empty lane row exists, it just asserts nothing, and get_var() reports it as null exactly
+	 * like an absent row. An acquirer deciding from that read refuses forever against a row no
+	 * operator knows to look for. Seeded autoloaded because that is how a row this code did not
+	 * write reaches the alloptions bucket, where the value it held would go on shadowing the
+	 * replacement lane after the matched delete.
+	 */
+	public function test_an_empty_lane_row_is_taken_over_instead_of_refusing_forever() {
+		$this->assertTrue( add_option( 'mainwp_child_favorites_install_lock', '', '', true ) );
+
+		$subject = new Testable_MainWP_Child_Favorites_V2( array(), array(), array() );
+		$result  = $subject->install_verified_v2( $this->install_request() );
+
+		$this->assertTrue( $result['ok'] );
+		$this->assertSame( 'completed', $result['status'] );
+		$this->assertSame( 1, $subject->install_count );
+		// Taken over, not ignored: this request's own well-formed row stood in the empty one's place
+		// while the package was fetched, and reads saw it rather than the stale autoloaded value.
+		$this->assertIsArray( $subject->lock_during_download );
+		$this->assertArrayHasKey( 'owner', $subject->lock_during_download );
+		$this->assertFalse( get_option( 'mainwp_child_favorites_install_lock', false ) );
+	}
+
 	public function test_a_failed_install_releases_the_lane_for_the_next_request() {
 		$subject                            = new Testable_MainWP_Child_Favorites_V2( array(), array(), array() );
 		$subject->downloaded_package_digest = str_repeat( 'b', 64 );

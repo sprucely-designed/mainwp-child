@@ -1008,12 +1008,19 @@ class MainWP_Child_Maintenance {
                 if ( ! is_numeric( $parent ) ) {
                     return $this->abilities_v2_failed_outcome( 'mutation_failed', $affected );
                 }
-                $removed = $this->abilities_v2_delete_parent_revisions( (int) $parent, $revision_retention );
-                if ( false === $removed ) {
+                $removed        = $this->abilities_v2_delete_parent_revisions( (int) $parent, $revision_retention );
+                $affected      += $removed['deleted'];
+                $page_affected += $removed['deleted'];
+                if ( 'lock_lost' === $removed['status'] ) {
+                    return array(
+                        'status'     => 'unknown',
+                        'affected'   => $affected,
+                        'error_code' => 'outcome_unknown',
+                    );
+                }
+                if ( 'completed' !== $removed['status'] ) {
                     return $this->abilities_v2_failed_outcome( 'mutation_failed', $affected );
                 }
-                $affected      += $removed;
-                $page_affected += $removed;
             }
             if ( 0 === $page_affected ) {
                 // Parents still report surplus revisions that no delete removed: stop instead of spinning.
@@ -1027,7 +1034,7 @@ class MainWP_Child_Maintenance {
      *
      * @param int $parent_id          Parent post ID.
      * @param int $revision_retention Revisions retained for this parent.
-     * @return int|false Deleted rows, or false when a statement failed.
+     * @return array<string,int|string> Rows deleted, and whether this parent completed, hit a failed statement, or lost the lock.
      */
     private function abilities_v2_delete_parent_revisions( $parent_id, $revision_retention ) {
         global $wpdb;
@@ -1039,14 +1046,23 @@ class MainWP_Child_Maintenance {
             // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Bounded batch of surplus revision IDs.
             $ids = $wpdb->get_col( $wpdb->prepare( "SELECT ID FROM $wpdb->posts WHERE post_type = 'revision' AND post_parent = %d ORDER BY post_modified DESC, ID DESC LIMIT %d OFFSET %d", $parent_id, self::ABILITIES_V2_REVISION_DELETE_BATCH, $revision_retention ) );
             if ( '' !== $wpdb->last_error || ! is_array( $ids ) ) {
-                return false;
+                return array(
+                    'deleted' => $deleted,
+                    'status'  => 'failed',
+                );
             }
             if ( empty( $ids ) ) {
-                return $deleted;
+                return array(
+                    'deleted' => $deleted,
+                    'status'  => 'completed',
+                );
             }
             foreach ( $ids as $id ) {
                 if ( ! is_numeric( $id ) ) {
-                    return false;
+                    return array(
+                        'deleted' => $deleted,
+                        'status'  => 'failed',
+                    );
                 }
             }
             $ids              = array_map( 'intval', $ids );
@@ -1055,9 +1071,22 @@ class MainWP_Child_Maintenance {
             // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare -- Placeholder list is built from the row count and prepared with the IDs.
             $removed = $wpdb->query( $wpdb->prepare( "DELETE FROM $wpdb->posts WHERE post_type = 'revision' AND ID IN ($placeholders)", $ids ) );
             if ( '' !== $wpdb->last_error || ! is_int( $removed ) || count( $ids ) !== $removed ) {
-                return false;
+                return array(
+                    'deleted' => $deleted,
+                    'status'  => 'failed',
+                );
             }
             $deleted += $removed;
+            // One parent can hold enough surplus to page past the 300s lock TTL on its own, so ownership is
+            // renewed and re-verified between batches and not only between pages: no batch is ever more than
+            // one batch of work away from a lock this run could prove it held. The rows already destroyed
+            // travel back with the failure, because stopping does not put them back.
+            if ( ! $this->abilities_v2_renew_mutation() ) {
+                return array(
+                    'deleted' => $deleted,
+                    'status'  => 'lock_lost',
+                );
+            }
         }
     }
 

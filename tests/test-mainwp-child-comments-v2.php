@@ -254,6 +254,85 @@ class Test_MainWP_Child_Comments_V2 extends WP_UnitTestCase {
 	}
 
 	/**
+	 * A claim stranded by a fatal is put back, but not while its owner could still be running.
+	 *
+	 * The claim swaps the comment out of its real status, so a request that dies between the claim and
+	 * the WordPress transition leaves the row holding a value wp-admin does not list: the comment is
+	 * gone from the site owner's view. A later request has to put it back where it was.
+	 */
+	public function test_a_claim_stranded_by_a_fatal_is_recovered_to_its_prior_status() {
+		$comment_id = $this->create_comment( '0' );
+		$fatal      = $this->die_at_the_transition();
+
+		try {
+			$this->moderate( 'approve', $comment_id, 'pending' );
+			$this->fail( 'The simulated fatal never reached the transition.' );
+		} catch ( MainWP_Comments_V2_Simulated_Fatal $stopped ) {
+			$this->assertSame( 'fatal-at-the-transition', $stopped->getMessage() );
+		} finally {
+			remove_filter( 'query', $fatal );
+		}
+
+		// The claim writes past the comment cache, so the next request reads the row, not the copy the
+		// dead one left behind.
+		clean_comment_cache( $comment_id );
+		$this->assertSame( 'mainwp-claim', $this->raw_status( $comment_id ) );
+
+		$live = $this->moderate( 'approve', $comment_id, 'pending' );
+		$this->assertSame( 0, $live['applied'], 'A claim young enough to still be running must not be taken away.' );
+		$this->assertSame( 'failed', $live['results'][0]['outcome'] );
+		$this->assertSame( 'mainwp-claim', $this->raw_status( $comment_id ) );
+
+		$this->age_claim( $comment_id, 301 );
+		$recovered = $this->moderate( 'approve', $comment_id, 'pending' );
+
+		$this->assertSame( 1, $recovered['applied'] );
+		$this->assertSame( 'pending', $recovered['results'][0]['status_before'] );
+		$this->assertSame( 'approved', $recovered['results'][0]['status_after'] );
+		$this->assertSame( '1', $this->raw_status( $comment_id ) );
+		$this->assertSame( '', get_comment_meta( $comment_id, '_mainwp_v2_claim', true ) );
+	}
+
+	/**
+	 * End the request the way a fatal would: after the claim is taken, before the transition lands.
+	 *
+	 * The claim's compare-and-swap is the first UPDATE against the comments table; the second is the
+	 * WordPress transition the claim was taken for, and that is the statement that never runs.
+	 *
+	 * @return callable
+	 */
+	private function die_at_the_transition() {
+		global $wpdb;
+		$writes    = 0;
+		$interrupt = static function ( $query ) use ( &$writes, $wpdb ) {
+			if ( 1 !== preg_match( '/^\s*UPDATE\s+\S*' . preg_quote( $wpdb->comments, '/' ) . '\b/i', $query ) ) {
+				return $query;
+			}
+			++$writes;
+			if ( 2 === $writes ) {
+				throw new MainWP_Comments_V2_Simulated_Fatal( 'fatal-at-the-transition' );
+			}
+			return $query;
+		};
+		add_filter( 'query', $interrupt );
+		return $interrupt;
+	}
+
+	/** Move a stored claim back in time, leaving whatever else it records alone. */
+	private function age_claim( $comment_id, $seconds ) {
+		$marker = get_comment_meta( $comment_id, '_mainwp_v2_claim', true );
+		if ( is_string( $marker ) && 1 === preg_match( '/^(.+)\|([0-9]+)$/D', $marker, $parts ) ) {
+			update_comment_meta( $comment_id, '_mainwp_v2_claim', $parts[1] . '|' . ( (int) $parts[2] - $seconds ) );
+		}
+	}
+
+	/** @return string|null */
+	private function raw_status( $comment_id ) {
+		global $wpdb;
+		return $wpdb->get_var( $wpdb->prepare( "SELECT comment_approved FROM {$wpdb->comments} WHERE comment_ID = %d", $comment_id ) );
+	}
+
+	/**
 	 * Act as a competing moderator that lands the moment the protocol reaches its write boundary.
 	 *
 	 * The first statement that writes to the comment tables is the boundary in both the guarded and
@@ -313,3 +392,6 @@ class Test_MainWP_Child_Comments_V2 extends WP_UnitTestCase {
 		);
 	}
 }
+
+/** Stand-in for a fatal that ends the request in the middle of a claimed mutation. */
+class MainWP_Comments_V2_Simulated_Fatal extends Exception {}

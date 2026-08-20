@@ -29,6 +29,20 @@ class MainWP_Child_Comments {
     private const CLAIM_STATUS = 'mainwp-claim';
 
     /**
+     * Comment meta key holding the status a live claim swapped out, and when it did.
+     *
+     * @var string
+     */
+    private const CLAIM_META = '_mainwp_v2_claim';
+
+    /**
+     * Seconds a claim is left alone before it counts as abandoned rather than in progress.
+     *
+     * @var int
+     */
+    private const CLAIM_GRACE = 300;
+
+    /**
      * Public static variable to hold the single instance of the class.
      *
      * @var mixed Default null
@@ -304,7 +318,7 @@ class MainWP_Child_Comments {
         if ( false === $comment_id ) {
             return $this->v2_error( 'get_comment' );
         }
-        $comment = get_comment( $comment_id );
+        $comment = $this->load_v2_comment( $comment_id );
         if ( ! $comment ) {
             return array(
                 'contract_version' => 2,
@@ -354,7 +368,7 @@ class MainWP_Child_Comments {
         $results = array();
         $applied = 0;
         foreach ( $items as $item ) {
-            $comment = get_comment( $item['comment_id'] );
+            $comment = $this->load_v2_comment( $item['comment_id'] );
             if ( ! $comment ) {
                 $results[] = $this->moderation_result( $item['comment_id'], 'not_found', null, null, 'comment_not_found', 'The comment was not found.' );
                 continue;
@@ -383,6 +397,7 @@ class MainWP_Child_Comments {
             $changed = $this->apply_v2_moderation( $request['action'], $comment );
             $after   = $this->current_v2_status( $item['comment_id'] );
             if ( true === $changed && $this->moderation_post_state_matches( $request['action'], $after ) ) {
+                delete_comment_meta( $item['comment_id'], self::CLAIM_META );
                 ++$applied;
                 $results[] = $this->moderation_result( $item['comment_id'], 'applied', $before, $after );
                 continue;
@@ -422,7 +437,7 @@ class MainWP_Child_Comments {
         $eligible = 0;
         $deleted  = 0;
         foreach ( $items as $item ) {
-            $comment = get_comment( $item['comment_id'] );
+            $comment = $this->load_v2_comment( $item['comment_id'] );
             if ( ! $comment ) {
                 $results[] = $this->deletion_result( $item['comment_id'], 'not_found', null, false, 'comment_not_found', 'The comment was not found.' );
                 continue;
@@ -670,7 +685,72 @@ class MainWP_Child_Comments {
         if ( false === $claimed ) {
             return null;
         }
-        return 1 === (int) $claimed;
+        if ( 1 !== (int) $claimed ) {
+            return false;
+        }
+        // The swap overwrote the only copy of the status it replaced, so the claim leaves recover_v2_claim()
+        // one, along with the moment it was taken. A fatal between the swap and this write still strands the
+        // row, but that gap is one statement wide against the whole WordPress transition that follows it.
+        update_comment_meta( (int) $comment->comment_ID, self::CLAIM_META, (string) $comment->comment_approved . '|' . time() );
+        return true;
+    }
+
+    /**
+     * Put a comment back where a claim left it when the request holding that claim never returned.
+     *
+     * A fatal between the claim and the transition leaves the row at CLAIM_STATUS, which is not a status
+     * wp-admin lists, so the comment drops out of the site owner's view with nothing left to put it back.
+     * Recovery is gated on the claim being older than any request could still be running, so a claim that
+     * is still being worked is never taken from its owner, and the restore is itself a compare-and-swap on
+     * CLAIM_STATUS, so a mutation that did complete can never be undone by it.
+     *
+     * @param int $comment_id Comment holding the stranded claim.
+     * @return bool Whether the comment was restored.
+     */
+    private function recover_v2_claim( $comment_id ) {
+        global $wpdb;
+        $marker = get_comment_meta( $comment_id, self::CLAIM_META, true );
+        if ( ! is_string( $marker ) || 1 !== preg_match( '/^([^|]+)\|([1-9][0-9]*)$/D', $marker, $parts ) ) {
+            return false;
+        }
+        // Only the raw values a claim can ever have swapped out are restorable; anything else is not
+        // something this class wrote, and guessing a status is worse than leaving the row alone.
+        if ( ! in_array( $parts[1], array( '0', '1', 'spam', 'trash' ), true ) || time() - (int) $parts[2] < self::CLAIM_GRACE ) {
+            return false;
+        }
+        if ( ! is_object( $wpdb ) || ! is_callable( array( $wpdb, 'update' ) ) ) {
+            return false;
+        }
+        $restored = $wpdb->update( // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Compare-and-swap back out of the holding value written by claim_v2_comment().
+            $wpdb->comments,
+            array( 'comment_approved' => $parts[1] ),
+            array(
+                'comment_ID'       => $comment_id,
+                'comment_approved' => self::CLAIM_STATUS,
+            ),
+            array( '%s' ),
+            array( '%d', '%s' )
+        );
+        if ( false === $restored ) {
+            return false;
+        }
+        delete_comment_meta( $comment_id, self::CLAIM_META );
+        clean_comment_cache( $comment_id );
+        return 1 === (int) $restored;
+    }
+
+    /**
+     * Read a comment for a v2 operation, recovering an abandoned claim before anything reads its status.
+     *
+     * @param int $comment_id Comment ID.
+     * @return \WP_Comment|null
+     */
+    private function load_v2_comment( $comment_id ) {
+        $comment = get_comment( $comment_id );
+        if ( $comment && self::CLAIM_STATUS === (string) $comment->comment_approved && $this->recover_v2_claim( $comment_id ) ) {
+            $comment = get_comment( $comment_id );
+        }
+        return $comment;
     }
 
     /**
@@ -693,6 +773,7 @@ class MainWP_Child_Comments {
                 array( '%d', '%s' )
             );
         }
+        delete_comment_meta( (int) $comment->comment_ID, self::CLAIM_META );
         clean_comment_cache( (int) $comment->comment_ID );
     }
 

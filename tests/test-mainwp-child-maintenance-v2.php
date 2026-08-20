@@ -633,6 +633,75 @@ class Test_MainWP_Child_Maintenance_V2 extends WP_UnitTestCase {
 		);
 	}
 
+	/**
+	 * One parent can hold enough surplus to outlive the 300s lock on its own, so the lock is renewed
+	 * between its batches too. Once it cannot be renewed the sweep stops mid-parent, and still reports
+	 * every row it destroyed before it stopped.
+	 */
+	public function test_revision_sweep_stops_between_the_batches_of_one_parent_when_the_lock_is_lost() {
+		global $wpdb;
+		$parent_id = self::factory()->post->create();
+		$this->insert_revisions( $parent_id, 503 );
+
+		$subject = new Renewal_Limited_MainWP_Child_Maintenance();
+		// The execute loop renews once before the action and the parent page renews once more, which
+		// leaves this parent's first batch as the last one that runs under a lock it can prove it holds.
+		$subject->renewals_before_failure = 2;
+
+		list( , $result ) = $this->real_execute( $subject, array( 'revisions' ), 2, '123e4567-e89b-42d3-a456-426614174519' );
+
+		$this->assertTrue( $result['ok'] );
+		$this->assertSame( 'unknown', $result['status'] );
+		$this->assertSame(
+			array(
+				'action'     => 'revisions',
+				'status'     => 'unknown',
+				'affected'   => MainWP_Child_Maintenance::ABILITIES_V2_REVISION_DELETE_BATCH,
+				'error_code' => 'outcome_unknown',
+			),
+			$result['outcomes'][0]
+		);
+		$this->assertSame(
+			'3',
+			$wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM $wpdb->posts WHERE post_type = 'revision' AND post_parent = %d", $parent_id ) ),
+			'The sweep must stop at the batch it lost the lock on instead of running this parent to the end.'
+		);
+	}
+
+	/** Fill one parent with revisions cheaply; the sweep only ever reads them through SQL. */
+	private function insert_revisions( $parent_id, $count ) {
+		global $wpdb;
+		for ( $index = 0; $index < $count; $index++ ) {
+			$when = gmdate( 'Y-m-d H:i:s', time() - ( 60 * ( $count - $index ) ) );
+			$wpdb->insert(
+				$wpdb->posts,
+				array(
+					'post_author'           => 1,
+					'post_date'             => $when,
+					'post_date_gmt'         => $when,
+					'post_content'          => 'batch revision',
+					'post_title'            => 'batch-revision-' . $index,
+					'post_excerpt'          => '',
+					'post_status'           => 'inherit',
+					'comment_status'        => 'closed',
+					'ping_status'           => 'closed',
+					'post_password'         => '',
+					'post_name'             => $parent_id . '-batch-revision-' . $index,
+					'to_ping'               => '',
+					'pinged'                => '',
+					'post_modified'         => $when,
+					'post_modified_gmt'     => $when,
+					'post_content_filtered' => '',
+					'post_parent'           => $parent_id,
+					'guid'                  => '',
+					'menu_order'            => 0,
+					'post_type'             => 'revision',
+					'post_mime_type'        => '',
+				)
+			);
+		}
+	}
+
 	private function invoke_private( $subject, $method ) {
 		$reflection = new \ReflectionMethod( MainWP_Child_Maintenance::class, $method );
 		$reflection->setAccessible( true );

@@ -257,6 +257,18 @@ class Test_MainWP_BackupBuddy_Core_Stub {
 }
 
 /**
+ * A BackupBuddy core that predates getLogDirectory(). The legacy path asserts that method through
+ * check_methods() precisely because a build without it exists, so the v2 paths have to survive it.
+ */
+class Test_MainWP_BackupBuddy_Core_Without_Log_Directory {
+
+	/** @return string */
+	public static function getBackupDirectory() { // phpcs:ignore WordPress.NamingConventions.ValidFunctionName.MethodNameInvalid -- Mirrors the BackupBuddy method name.
+		return Test_MainWP_BackupBuddy_Core_Stub::$backup_directory;
+	}
+}
+
+/**
  * Stand-in for the fileoptions reader the operation probe uses. BackupBuddy stores these as
  * serialized PHP behind a lock; the probe only ever asks is_ok() and reads ->options, so the
  * stub keeps the same surface over a format the test can write by hand.
@@ -801,6 +813,104 @@ class Test_MainWP_Child_BackupBuddy_V2_Provider_Boundary extends WP_UnitTestCase
 		$this->assertArrayNotHasKey( $corrupt_ledger['operation_ref'], $stored['operations'], 'A hundred records carrying future timestamps would otherwise refuse every new operation forever.' );
 		$this->assertArrayHasKey( $skewed['operation_ref'], $stored['operations'], 'A backup BackupBuddy is really stepping must still survive the age-out.' );
 		$this->assertSame( 'running', $stored['operations'][ $skewed['operation_ref'] ]['state'] );
+	}
+
+	/**
+	 * A BackupBuddy build without getLogDirectory() cannot be probed at all, and the probe used to
+	 * call it behind a class_exists() check alone. On such a build the status read - and every
+	 * mutation, which probes through the ledger age-out pass - died with a PHP fatal instead of
+	 * answering the protocol. A record the Child cannot probe comes back exactly as stored: no new
+	 * evidence, not a clean bill of health.
+	 */
+	public function test_an_unprobeable_provider_leaves_the_record_as_stored() {
+		$now    = time();
+		$record = $this->long_running_operation_record( 11, $now - HOUR_IN_SECONDS );
+		update_option(
+			'mainwp_backupbuddy_ability_operations_v1',
+			array(
+				'operations' => array( $record['operation_ref'] => $record ),
+				'receipts'   => array(),
+			)
+		);
+		// A finished run sitting on disk, so a probe that ran anyway would visibly rewrite the record.
+		$archive = Test_MainWP_BackupBuddy_Core_Stub::$backup_directory . 'backup-example_com-full-serial21.zip';
+		file_put_contents( $archive, str_repeat( 'z', 32 ) );
+		file_put_contents(
+			Test_MainWP_BackupBuddy_Core_Stub::$log_directory . 'fileoptions/' . $record['serial'] . '.txt',
+			wp_json_encode( array( 'updated_time' => $now - 10, 'finish_time' => $now - 5, 'archive_file' => $archive ) )
+		);
+
+		$fixture                         = new Test_MainWP_Child_BackupBuddy_V2_Effect_Fixture();
+		$fixture->backupbuddy_core_class = 'Test_MainWP_BackupBuddy_Core_Without_Log_Directory';
+		$status                          = $fixture->abilities_v2(
+			array(
+				'operation'     => 'get_operation',
+				'operation_ref' => $record['operation_ref'],
+			)
+		);
+
+		$this->assertSame( 'running', $status['operation']['state'], 'A record the Child cannot probe keeps the state it was stored with.' );
+		$this->assertNull( $status['operation']['archive_ref'], 'An unreadable provider record cannot name a finished archive.' );
+		$this->assertSame( $now - HOUR_IN_SECONDS, $status['operation']['updated_at'], 'A probe that could not run is not an observation.' );
+	}
+
+	/**
+	 * Dispatching a backup on an installation whose classes/backup.php is gone answers effect_failed.
+	 * The starter used to require_once that constructed path unconditionally, and a require_once that
+	 * misses is an uncatchable compile error: it took the request down past the caller's failure
+	 * handling and past the finally that releases the effect lock, leaving the record it had just
+	 * written stranded in 'queued' and every later v2 effect answering lock_busy for the lock's TTL.
+	 */
+	public function test_start_backup_fails_closed_when_the_provider_backup_class_file_is_missing() {
+		$this->assertFalse( class_exists( 'pb_backupbuddy_backup', false ), 'The starter must reach the require path for this to be observed.' );
+		$this->assertFileDoesNotExist( Test_MainWP_BackupBuddy_Provider_Stub::$path . '/classes/backup.php' );
+
+		$fixture     = new Test_MainWP_Child_BackupBuddy_V2_Effect_Fixture();
+		$profile_ref = $this->full_profile_ref( $fixture );
+		$preview     = $fixture->abilities_v2(
+			array(
+				'operation'   => 'preview_run',
+				'target_kind' => 'profile',
+				'target_ref'  => $profile_ref,
+			)
+		);
+		$this->assertArrayHasKey( 'preview_token', $preview );
+
+		$started = $fixture->abilities_v2(
+			array(
+				'operation'     => 'start_backup',
+				'profile_ref'   => $profile_ref,
+				'preview_token' => $preview['preview_token'],
+				'request_ref'   => $this->request_ref,
+			)
+		);
+
+		$this->assertFalse( $started['ok'] );
+		$this->assertSame( 'effect_failed', $started['code'] );
+		$stored = get_option( 'mainwp_backupbuddy_ability_operations_v1' );
+		$this->assertCount( 1, $stored['operations'] );
+		$this->assertSame( 'failed', array_values( $stored['operations'] )[0]['state'], 'A dispatch that never happened must not stay recorded as queued.' );
+		$this->assertFalse( get_option( 'mainwp_backupbuddy_ability_effect_lock_v1', false ), 'The effect lock is released rather than left to expire on its 120s TTL.' );
+	}
+
+	/**
+	 * @param Test_MainWP_Child_BackupBuddy_V2_Effect_Fixture $fixture Fixture.
+	 * @return string
+	 */
+	private function full_profile_ref( $fixture ) {
+		$profiles = $fixture->abilities_v2(
+			array(
+				'operation' => 'list_profiles',
+				'page'      => 1,
+				'per_page'  => 25,
+			)
+		);
+		foreach ( $profiles['profiles'] as $profile ) {
+			if ( 'full' === $profile['type'] ) {
+				return $profile['profile_ref'];
+			}
+		}
+		$this->fail( 'The provider stub did not expose a full profile.' );
 	}
 
 	/**

@@ -37,7 +37,34 @@ class Wordfence_V2_Protocol_Fixture extends MainWP_Child_Wordfence {
 	}
 }
 
+/** Stand-in for the Wordfence issue store the file-deletion paths construct directly. */
+class Wordfence_Issue_Store_Stub {
+
+	/** @var array */
+	public static $issues = array();
+
+	public function getIssueByID( $id ) {
+		return isset( self::$issues[ $id ] ) ? self::$issues[ $id ] : false;
+	}
+
+	public function updateIssue( $id, $operation ) {
+		unset( $id, $operation );
+	}
+}
+
+// Wordfence is not installed in the harness, so the global name the Child constructs is aliased
+// rather than declared - this file cannot open a global namespace block without being rewritten.
+if ( ! class_exists( '\wfIssues', false ) ) {
+	class_alias( Wordfence_Issue_Store_Stub::class, 'wfIssues' );
+}
+
 class Test_MainWP_Child_Wordfence_V2 extends WP_UnitTestCase {
+
+	/** Web-root file the deletion paths are pointed at and must leave alone. */
+	const VICTIM = 'mainwp-wordfence-delete-probe.php';
+
+	/** Substring that only the earlier, unrelated warning can contribute to a message. */
+	const STALE_MARKER = 'mainwp-unrelated-earlier-warning';
 
 	/** @var MainWP_Child_Wordfence */
 	private $subject;
@@ -187,6 +214,43 @@ class Test_MainWP_Child_Wordfence_V2 extends WP_UnitTestCase {
 		$this->assertSame( 0, $dispatched_calls );
 		$this->assertSame( array(), get_option( 'mainwp_wordfence_abilities_v2_receipts', array() ) );
 		$this->assertSame( 'provider_unavailable', $read['code'] );
+	}
+
+	public function test_a_failed_deletion_reports_its_own_error_and_not_an_earlier_warning() {
+		$victim = ABSPATH . self::VICTIM;
+		file_put_contents( $victim, 'survives' );
+		Wordfence_Issue_Store_Stub::$issues = array( 'issue-1' => array( 'data' => array( 'file' => self::VICTIM ) ) );
+		// An empty path makes wp_delete_file() skip unlink() altogether, so the file survives and
+		// nothing at all is raised for this deletion - exactly when a stale error gets borrowed.
+		add_filter( 'wp_delete_file', '__return_empty_string' );
+
+		$_POST['issueID'] = 'issue-1';
+		$_POST['op']      = 'del';
+		$_POST['ids']     = array( 'issue-1' );
+		try {
+			$this->raise_unrelated_warning();
+			$single = $this->subject->delete_file();
+			$this->raise_unrelated_warning();
+			$bulk = $this->subject->bulk_operation();
+		} finally {
+			unset( $_POST['issueID'], $_POST['op'], $_POST['ids'] );
+			if ( file_exists( $victim ) ) {
+				unlink( $victim );
+			}
+		}
+
+		$this->assertStringNotContainsString( self::STALE_MARKER, $single['errorMsg'] );
+		$this->assertStringContainsString( 'unknown', $single['errorMsg'] );
+		$this->assertStringNotContainsString( self::STALE_MARKER, $bulk['bulkBody'] );
+		$this->assertStringContainsString( 'unknown', $bulk['bulkBody'] );
+	}
+
+	/** Leave a warning of the kind any other plugin can raise earlier in the same request. */
+	private function raise_unrelated_warning() {
+		@file_get_contents( ABSPATH . self::STALE_MARKER );
+		$last = error_get_last();
+		$this->assertIsArray( $last );
+		$this->assertStringContainsString( self::STALE_MARKER, $last['message'] );
 	}
 
 	private function blocks_fixture() {

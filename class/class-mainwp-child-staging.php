@@ -210,7 +210,18 @@ class MainWP_Child_Staging { //phpcs:ignore -- NOSONAR - multi methods.
      * @uses \MainWP\Child\MainWP_Child_Staging::MainWP_Helper::write()
      */
     public function action() { // phpcs:ignore -- NOSONAR - ignore complex method notice.
+        $mwp_action = MainWP_System::instance()->validate_params( 'mwp_action' );
+
+        // A protocol-2 request has to come back in protocol 2 even when WP Staging is missing or
+        // fails to load. The legacy error blobs below end the request, and the Dashboard cannot
+        // tell them apart from an old Child or a broken transport; the v2 envelope reports an
+        // absent provider by dropping the operations it cannot back.
+        $is_abilities_v2 = 'abilities_v2' === $mwp_action;
+
         if ( ! $this->is_plugin_installed ) {
+            if ( $is_abilities_v2 ) {
+                MainWP_Helper::write( $this->abilities_v2_action() );
+            }
             MainWP_Helper::write( array( 'error' => esc_html__( 'Please install WP Staging plugin on child website', 'mainwp-child' ) ) );
         }
 
@@ -234,6 +245,9 @@ class MainWP_Child_Staging { //phpcs:ignore -- NOSONAR - multi methods.
         }
 
         if ( false === $loaded_success || ! defined( 'WPSTG_PLUGIN_DIR' ) ) {
+            if ( $is_abilities_v2 ) {
+                MainWP_Helper::write( $this->abilities_v2_action() );
+            }
             MainWP_Helper::instance()->error( esc_html__( 'WP Staging failed to load correctly on the child website.', 'mainwp-child' ), 'STAG_ERROR_NOT_LOADED' );
         }
 
@@ -259,7 +273,6 @@ class MainWP_Child_Staging { //phpcs:ignore -- NOSONAR - multi methods.
             MainWP_Helper::update_option( 'mainwp_wp_staging_ext_enabled', 'Y', 'yes' );
         }
 
-        $mwp_action = MainWP_System::instance()->validate_params( 'mwp_action' );
         if ( ! empty( $mwp_action ) ) {
             switch ( $mwp_action ) {
                 case 'set_showhide':
@@ -518,9 +531,10 @@ class MainWP_Child_Staging { //phpcs:ignore -- NOSONAR - multi methods.
     /**
      * List the operations this Child can actually carry out.
      *
-     * Settings replacement is an option write the Child performs and verifies by readback itself, so
-     * it needs WP Staging on the site rather than the durable step adapter; without the plugin there
-     * is no provider state to replace and creating `wpstg_settings` would invent some. Clone jobs need
+     * Reading and replacing settings both answer for `wpstg_settings`, an option only WP Staging
+     * creates. Without the plugin there is nothing to replace and creating the option would invent
+     * provider state, and the read is worse still: it would clamp an absent option into a full set
+     * of defaults and hand the Dashboard a revision for settings no site ever had. Clone jobs need
      * that adapter, so they are neither advertised nor dispatched until a build wires it. Reading a
      * job's status needs it just as much: the adapter owns the step records, so without it there is
      * no operation to report on and every read would answer provider_unavailable. Preview needs a
@@ -534,7 +548,7 @@ class MainWP_Child_Staging { //phpcs:ignore -- NOSONAR - multi methods.
         $jobs_ready = $this->abilities_v2_provider_supports_mutation();
         $supported  = array();
         foreach ( array( 'inventory', 'settings', 'preview', 'replace_settings', 'create_clone', 'update_clone', 'delete_clone', 'operation_status', 'cancel_operation', 'reconcile_operation' ) as $operation ) {
-            if ( 'replace_settings' === $operation && ! $this->is_plugin_installed ) {
+            if ( in_array( $operation, array( 'settings', 'replace_settings' ), true ) && ! $this->is_plugin_installed ) {
                 continue;
             }
             if ( 'preview' === $operation && ! $this->abilities_v2_provider_supports_preview() ) {

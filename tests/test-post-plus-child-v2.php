@@ -107,6 +107,46 @@ class Test_Post_Plus_Child_V2 extends WP_UnitTestCase {
 		$this->assertSame( 'invalid_request', $this->request( 'post_plus_readback_v2', $payload )['code'] );
 	}
 
+	/**
+	 * A source can trip several blockers at once and the response carries only one of them, hashed
+	 * into source_revision. Reporting whichever meta row happened to be read last both mis-describes
+	 * the post and makes an unrelated custom field look to the Dashboard like the source changed.
+	 */
+	public function test_compatibility_reports_the_strongest_blocker_not_the_last_meta_key() {
+		$post_id = self::factory()->post->create(
+			array(
+				'post_type'    => 'post',
+				'post_status'  => 'publish',
+				'post_title'   => 'Ranked blockers',
+				'post_content' => 'Bounded source content.',
+			)
+		);
+		add_post_meta( $post_id, '_thumbnail_id', self::factory()->post->create( array( 'post_type' => 'attachment' ) ) );
+		add_post_meta( $post_id, 'fixture_ordinary_meta', 'plain value' );
+
+		// get_post_meta() hands back meta_id order, so the ranking is only exercised when the
+		// ordinary key is read after the featured image.
+		$keys = array_keys( get_post_meta( $post_id ) );
+		$this->assertGreaterThan( array_search( '_thumbnail_id', $keys, true ), array_search( 'fixture_ordinary_meta', $keys, true ) );
+		$this->assertSame( 'unsupported_media', $this->source_compatibility( $post_id ) );
+
+		add_post_meta( $post_id, '_elementor_data', '[]' );
+		$this->assertSame( 'unsupported_builder', $this->source_compatibility( $post_id ) );
+	}
+
+	private function source_compatibility( $post_id ) {
+		$result = $this->request(
+			'post_plus_readback_v2',
+			array(
+				'dashboard_ref'  => hash( 'sha256', 'https://dashboard.example.test' ),
+				'source_post_id' => $post_id,
+				'source_type'    => 'post',
+			)
+		);
+		$this->assertTrue( $result['complete'] );
+		return $result['compatibility'];
+	}
+
 	public function test_update_and_conflict_paths_do_not_duplicate_content() {
 		$create = $this->delivery_payload( '123e4567-e89b-42d3-a456-426614174613', 'Before Plus update' );
 		$first  = $this->request( 'post_plus_newpost_v2', $create );
@@ -234,6 +274,62 @@ class Test_Post_Plus_Child_V2 extends WP_UnitTestCase {
 		$this->assertSame( 0, (int) $term->count, 'A rolled-back term count must not keep being served from cache.' );
 	}
 
+	/**
+	 * A site plugin listening on this hook may issue DDL, and DDL makes MySQL commit whatever
+	 * transaction is open. Fired inside the mutation's transaction that turns every ROLLBACK below
+	 * it into a no-op while the Dashboard is still told the mutation failed. A write the listener
+	 * makes surviving the rollback is the observable for "no transaction was open when it ran".
+	 */
+	public function test_the_before_update_hook_fires_before_the_transaction_opens() {
+		global $wpdb;
+
+		$payload                   = $this->delivery_payload( '123e4567-e89b-42d3-a456-426614174631', 'Hook ordering' );
+		$payload['post']['tags']   = array( 'hook-ordering-fixture-tag' );
+		$payload['content_digest'] = hash( 'sha256', wp_json_encode( array( $payload['post'], $payload['randomization'] ) ) );
+		$this->assertEmpty( term_exists( 'hook-ordering-fixture-tag', 'post_tag' ) );
+
+		// The mutation's own START TRANSACTION discards the suite's transaction, so this row can
+		// outlive the test. A fresh token per run keeps a leftover row from ever satisfying the
+		// assertion, and REPLACE keeps one from breaking the write.
+		$token    = hash( 'sha256', uniqid( 'before-post-update', true ) );
+		$written  = null;
+		$listener = static function () use ( $wpdb, $token, &$written ) {
+			$written = $wpdb->replace(
+				$wpdb->options,
+				array(
+					'option_name'  => 'mainwp_fixture_before_post_update_marker',
+					'option_value' => $token,
+					'autoload'     => 'no',
+				)
+			);
+		};
+		$captured = 0;
+		$capture  = static function ( $post_id ) use ( &$captured ) {
+			if ( 0 === $captured ) {
+				$captured = (int) $post_id;
+			}
+		};
+		$refuse = static function () {
+			return new \WP_Error( 'fixture_term_refused', 'Term creation refused.' );
+		};
+		add_action( 'mainwp_before_post_update', $listener );
+		add_action( 'wp_insert_post', $capture );
+		add_filter( 'pre_insert_term', $refuse );
+		$result = $this->request( 'post_plus_newpost_v2', $payload );
+		remove_filter( 'pre_insert_term', $refuse );
+		remove_action( 'wp_insert_post', $capture );
+		remove_action( 'mainwp_before_post_update', $listener );
+
+		$marker = $wpdb->get_var( $wpdb->prepare( "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s", 'mainwp_fixture_before_post_update_marker' ) );
+		$wpdb->delete( $wpdb->options, array( 'option_name' => 'mainwp_fixture_before_post_update_marker' ) );
+
+		$this->assertSame( 'mutation_failed', $result['code'] );
+		$this->assertGreaterThan( 0, $written, 'The listener has to write something or the marker proves nothing.' );
+		$this->assertGreaterThan( 0, $captured );
+		$this->assertNull( get_post( $captured ), 'The rollback has to be real or every listener write would survive it.' );
+		$this->assertSame( $token, $marker, 'A listener write the mutation can roll back means the hook ran inside the transaction.' );
+	}
+
 	public function test_full_ledger_evicts_only_the_receipts_that_can_no_longer_be_replayed() {
 		update_option( 'mainwp_child_post_plus_operations_v2', $this->aged_ledger( 'applied' ), false );
 		$payload = $this->delivery_payload( '123e4567-e89b-42d3-a456-426614174623', 'Ledger eviction' );
@@ -313,6 +409,90 @@ class Test_Post_Plus_Child_V2 extends WP_UnitTestCase {
 	}
 
 	/**
+	 * A ledger nothing can read is quarantined on every load, and a quarantine carries the time it
+	 * was observed. Left in memory that time is rewritten on every request, so the entries stay
+	 * permanently younger than the eviction horizon and the site refuses every mutation from then
+	 * on. Persisting the repair is what freezes those timestamps so the ledger can age out.
+	 */
+	public function test_a_ledger_of_unreadable_entries_is_repaired_once_instead_of_restamped() {
+		update_option( 'mainwp_child_post_plus_operations_v2', $this->damaged_ledger(), false );
+		$payload = $this->delivery_payload( '123e4567-e89b-42d3-a456-426614174627', 'Damaged ledger' );
+
+		$first = $this->request( 'post_plus_newpost_v2', $payload );
+
+		$this->assertSame( 'storage_unavailable', $first['code'] );
+		$persisted = get_option( 'mainwp_child_post_plus_operations_v2' );
+		$this->assertCount( 500, $persisted );
+		$entry = $persisted['123e4567-e89b-42d3-a456-426500000000'];
+		$this->assertIsArray( $entry, 'Observed damage must be persisted, not rebuilt on every request.' );
+		$this->assertSame( 'unknown', $entry['state'] );
+		$this->assertFalse( $entry['retryable'] );
+
+		$second = $this->request( 'post_plus_newpost_v2', $payload );
+
+		$this->assertSame( 'storage_unavailable', $second['code'] );
+		$stored = get_option( 'mainwp_child_post_plus_operations_v2' );
+		$this->assertSame( $entry['accepted_at'], $stored['123e4567-e89b-42d3-a456-426500000000']['accepted_at'], 'A quarantine must keep the timestamp it was first given.' );
+		$this->assertSame( $entry['updated_at'], $stored['123e4567-e89b-42d3-a456-426500000000']['updated_at'] );
+		$this->assertSame( $persisted, $stored );
+		$this->assertCount( 0, $this->operation_posts( $payload['operation_ref'] ) );
+	}
+
+	/**
+	 * Refusing the mutation is correct while the quarantined entries can still be replayed against,
+	 * but it has to stop being correct eventually: once the persisted quarantine is older than any
+	 * request the site would still accept, the slot may be freed and mutations work again.
+	 */
+	public function test_a_persisted_quarantine_ages_out_and_the_store_accepts_mutations_again() {
+		update_option( 'mainwp_child_post_plus_operations_v2', $this->damaged_ledger(), false );
+		$refused = $this->request( 'post_plus_newpost_v2', $this->delivery_payload( '123e4567-e89b-42d3-a456-426614174628', 'Quarantine aged' ) );
+		$this->assertSame( 'storage_unavailable', $refused['code'] );
+
+		$records = get_option( 'mainwp_child_post_plus_operations_v2' );
+		foreach ( $records as $operation_ref => $record ) {
+			$this->assertIsArray( $record, 'The quarantine must be stored before it can age at all.' );
+			$record['accepted_at']    -= 2 * DAY_IN_SECONDS;
+			$record['updated_at']     -= 2 * DAY_IN_SECONDS;
+			$records[ $operation_ref ] = $record;
+		}
+		update_option( 'mainwp_child_post_plus_operations_v2', $records, false );
+
+		$payload = $this->delivery_payload( '123e4567-e89b-42d3-a456-426614174629', 'Recovered ledger' );
+		$result  = $this->request( 'post_plus_newpost_v2', $payload );
+
+		$this->assertTrue( $result['ok'] );
+		$this->assertSame( 'applied', $result['state'] );
+		$stored = get_option( 'mainwp_child_post_plus_operations_v2' );
+		$this->assertCount( 500, $stored );
+		$this->assertArrayHasKey( $payload['operation_ref'], $stored );
+	}
+
+	/**
+	 * An unpersisted repair is what puts the store back on the re-stamping loop, so a refused repair
+	 * write has to end the request rather than let it reserve on top of a ledger that never changed.
+	 */
+	public function test_a_refused_repair_write_fails_the_request_instead_of_reserving_on_top_of_it() {
+		$damaged = array_slice( $this->damaged_ledger(), 0, 3, true );
+		update_option( 'mainwp_child_post_plus_operations_v2', $damaged, false );
+		$attempts = array();
+		$refuse   = static function ( $value, $old_value ) use ( &$attempts ) {
+			$attempts[] = $value;
+			return $old_value;
+		};
+		add_filter( 'pre_update_option_mainwp_child_post_plus_operations_v2', $refuse, 10, 2 );
+		$payload = $this->delivery_payload( '123e4567-e89b-42d3-a456-426614174630', 'Refused repair' );
+		$result  = $this->request( 'post_plus_newpost_v2', $payload );
+		remove_filter( 'pre_update_option_mainwp_child_post_plus_operations_v2', $refuse, 10 );
+
+		$this->assertSame( 'storage_unavailable', $result['code'] );
+		$this->assertSame( $damaged, get_option( 'mainwp_child_post_plus_operations_v2' ) );
+		$this->assertNotEmpty( $attempts );
+		$this->assertArrayNotHasKey( $payload['operation_ref'], $attempts[0], 'The repair must be persisted before the request may reserve.' );
+		$this->assertSame( 'unknown', $attempts[0]['123e4567-e89b-42d3-a456-426500000000']['state'] );
+		$this->assertCount( 0, $this->operation_posts( $payload['operation_ref'] ) );
+	}
+
+	/**
 	 * Build a ledger at the cap whose receipts are older than any replayable request.
 	 */
 	private function aged_ledger( $state ) {
@@ -342,6 +522,18 @@ class Test_Post_Plus_Child_V2 extends WP_UnitTestCase {
 				'accepted_at'       => $accepted + $index,
 				'updated_at'        => $accepted + $index,
 			);
+		}
+		return $records;
+	}
+
+	/**
+	 * Build a ledger at the cap whose entries are filed under real operation references but hold
+	 * nothing readable, the shape a truncated or externally restored option leaves behind.
+	 */
+	private function damaged_ledger() {
+		$records = array();
+		for ( $index = 0; $index < 500; $index++ ) {
+			$records[ sprintf( '123e4567-e89b-42d3-a456-4265%08d', $index ) ] = 'damaged-' . $index;
 		}
 		return $records;
 	}

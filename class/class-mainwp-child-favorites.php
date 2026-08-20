@@ -20,6 +20,20 @@ if ( ! defined( 'ABSPATH' ) ) {
 class MainWP_Child_Favorites {
 
     /**
+     * Option holding the single install lane.
+     *
+     * @var string
+     */
+    const INSTALL_LOCK_OPTION = 'mainwp_child_favorites_install_lock';
+
+    /**
+     * Lane owner token of the request currently installing.
+     *
+     * @var string
+     */
+    private $install_lock_owner = '';
+
+    /**
      * Handle the package-state callable.
      */
     public function handle_package_state() {
@@ -124,63 +138,36 @@ class MainWP_Child_Favorites {
             return $this->error( $operation, 'invalid_request' );
         }
 
-        $payload  = $request['payload'];
-        $existing = $this->load_install_receipt( $payload['request_ref'] );
-        if ( false === $existing ) {
-            return $this->error( $operation, 'storage_unavailable' );
+        $payload = $request['payload'];
+        // WP_Upgrader unpacks every package through one shared working directory and can clear the
+        // destination it unpacks into, so two installs in flight corrupt each other whatever they
+        // carry. The lane is the install operation, not the package: keying it by type and slug
+        // would leave installs of different packages racing on the same directories.
+        if ( ! $this->begin_install_lock() ) {
+            return $this->error( $operation, 'lock_busy' );
         }
-        // Only this mutation path evicts: the read paths must never write.
-        if ( is_array( $existing ) && $this->install_receipt_expired( $existing ) ) {
-            $this->delete_install_receipt( $payload['request_ref'] );
-            // An eviction that did not take leaves the replay defense standing, and reading the
-            // receipt back is what separates "the receipt is gone" from "the store could not drop
-            // it". Assuming the delete worked is how a resent request installs the package twice.
+        try {
             $existing = $this->load_install_receipt( $payload['request_ref'] );
             if ( false === $existing ) {
                 return $this->error( $operation, 'storage_unavailable' );
             }
-        }
-        $effect_hash = $this->install_effect_hash( $payload );
-        if ( is_array( $existing ) ) {
-            return $this->replay_install_receipt( $existing, $effect_hash );
-        }
-
-        $before = $this->package_state_v2(
-            array(
-                'protocol'    => '2',
-                'operation'   => 'package_state',
-                'request_ref' => $payload['request_ref'],
-                'type'        => $payload['type'],
-                'slug'        => $payload['slug'],
-            )
-        );
-        if ( true !== $before['ok'] || ! hash_equals( $before['state_generation'], $payload['state_generation'] ) ) {
-            return $this->error( $operation, true !== $before['ok'] ? 'storage_unavailable' : 'state_changed' );
-        }
-
-        $dispatching = $this->dispatching_receipt( $payload, $effect_hash, $before );
-        if ( ! $this->create_install_receipt( $payload['request_ref'], $dispatching ) ) {
-            $existing = $this->load_install_receipt( $payload['request_ref'] );
-            return is_array( $existing ) ? $this->replay_install_receipt( $existing, $effect_hash ) : $this->error( $operation, 'storage_unavailable' );
-        }
-        if ( $before['installed'] && ! $payload['overwrite'] ) {
-            return $this->settle_install( $dispatching, $this->result_from_state( $before, 'failed', 'already_installed', $dispatching ) );
-        }
-
-        $path = $this->download_package( $payload['download_url'] );
-        if ( is_wp_error( $path ) || ! is_string( $path ) || '' === $path ) {
-            return $this->settle_install( $dispatching, $this->result_from_state( $before, 'failed', 'download_failed', $dispatching ) );
-        }
-
-        try {
-            $digest = $this->package_digest( $path );
-            if ( ! is_string( $digest ) || ! hash_equals( $payload['expected_sha256'], $digest ) ) {
-                return $this->settle_install( $dispatching, $this->result_from_state( $before, 'failed', 'digest_mismatch', $dispatching ) );
+            // Only this mutation path evicts: the read paths must never write.
+            if ( is_array( $existing ) && $this->install_receipt_expired( $existing ) ) {
+                $this->delete_install_receipt( $payload['request_ref'] );
+                // An eviction that did not take leaves the replay defense standing, and reading the
+                // receipt back is what separates "the receipt is gone" from "the store could not drop
+                // it". Assuming the delete worked is how a resent request installs the package twice.
+                $existing = $this->load_install_receipt( $payload['request_ref'] );
+                if ( false === $existing ) {
+                    return $this->error( $operation, 'storage_unavailable' );
+                }
             }
-            if ( true !== $this->inspect_package( $path, $payload['type'], $payload['slug'], $payload['expected_version'] ) ) {
-                return $this->settle_install( $dispatching, $this->result_from_state( $before, 'failed', 'package_mismatch', $dispatching ) );
+            $effect_hash = $this->install_effect_hash( $payload );
+            if ( is_array( $existing ) ) {
+                return $this->replay_install_receipt( $existing, $effect_hash );
             }
-            $fresh = $this->package_state_v2(
+
+            $before = $this->package_state_v2(
                 array(
                     'protocol'    => '2',
                     'operation'   => 'package_state',
@@ -189,29 +176,127 @@ class MainWP_Child_Favorites {
                     'slug'        => $payload['slug'],
                 )
             );
-            if ( true !== $fresh['ok'] || ! hash_equals( $before['state_generation'], $fresh['state_generation'] ) ) {
-                return $this->settle_install( $dispatching, $this->result_from_state( $fresh, 'failed', 'state_changed', $dispatching ) );
+            if ( true !== $before['ok'] || ! hash_equals( $before['state_generation'], $payload['state_generation'] ) ) {
+                return $this->error( $operation, true !== $before['ok'] ? 'storage_unavailable' : 'state_changed' );
             }
 
-            $dispatched = $this->dispatch_install( $path, $payload );
-            $this->refresh_package_cache( $payload['type'] );
-            $after = $this->package_state_v2(
-                array(
-                    'protocol'    => '2',
-                    'operation'   => 'package_state',
-                    'request_ref' => $payload['request_ref'],
-                    'type'        => $payload['type'],
-                    'slug'        => $payload['slug'],
-                )
-            );
-            if ( true === $after['ok'] && $after['installed'] && $payload['expected_version'] === $after['version'] && ( 'theme' === $payload['type'] || ! $payload['activate'] || true === $after['active'] ) ) {
-                return $this->settle_install( $dispatching, $this->result_from_state( $after, 'completed', null, $dispatching ) );
+            $dispatching = $this->dispatching_receipt( $payload, $effect_hash, $before );
+            if ( ! $this->create_install_receipt( $payload['request_ref'], $dispatching ) ) {
+                $existing = $this->load_install_receipt( $payload['request_ref'] );
+                return is_array( $existing ) ? $this->replay_install_receipt( $existing, $effect_hash ) : $this->error( $operation, 'storage_unavailable' );
             }
-            $code = is_wp_error( $dispatched ) || false === $dispatched ? 'install_outcome_unknown' : 'readback_mismatch';
-            return $this->settle_install( $dispatching, $this->result_from_state( $after, 'unknown', $code, $dispatching ) );
+            if ( $before['installed'] && ! $payload['overwrite'] ) {
+                return $this->settle_install( $dispatching, $this->result_from_state( $before, 'failed', 'already_installed', $dispatching ) );
+            }
+
+            $path = $this->download_package( $payload['download_url'] );
+            if ( is_wp_error( $path ) || ! is_string( $path ) || '' === $path ) {
+                return $this->settle_install( $dispatching, $this->result_from_state( $before, 'failed', 'download_failed', $dispatching ) );
+            }
+
+            try {
+                $digest = $this->package_digest( $path );
+                if ( ! is_string( $digest ) || ! hash_equals( $payload['expected_sha256'], $digest ) ) {
+                    return $this->settle_install( $dispatching, $this->result_from_state( $before, 'failed', 'digest_mismatch', $dispatching ) );
+                }
+                if ( true !== $this->inspect_package( $path, $payload['type'], $payload['slug'], $payload['expected_version'] ) ) {
+                    return $this->settle_install( $dispatching, $this->result_from_state( $before, 'failed', 'package_mismatch', $dispatching ) );
+                }
+                $fresh = $this->package_state_v2(
+                    array(
+                        'protocol'    => '2',
+                        'operation'   => 'package_state',
+                        'request_ref' => $payload['request_ref'],
+                        'type'        => $payload['type'],
+                        'slug'        => $payload['slug'],
+                    )
+                );
+                if ( true !== $fresh['ok'] || ! hash_equals( $before['state_generation'], $fresh['state_generation'] ) ) {
+                    return $this->settle_install( $dispatching, $this->result_from_state( $fresh, 'failed', 'state_changed', $dispatching ) );
+                }
+
+                $dispatched = $this->dispatch_install( $path, $payload );
+                $this->refresh_package_cache( $payload['type'] );
+                $after = $this->package_state_v2(
+                    array(
+                        'protocol'    => '2',
+                        'operation'   => 'package_state',
+                        'request_ref' => $payload['request_ref'],
+                        'type'        => $payload['type'],
+                        'slug'        => $payload['slug'],
+                    )
+                );
+                if ( true === $after['ok'] && $after['installed'] && $payload['expected_version'] === $after['version'] && ( 'theme' === $payload['type'] || ! $payload['activate'] || true === $after['active'] ) ) {
+                    return $this->settle_install( $dispatching, $this->result_from_state( $after, 'completed', null, $dispatching ) );
+                }
+                $code = is_wp_error( $dispatched ) || false === $dispatched ? 'install_outcome_unknown' : 'readback_mismatch';
+                return $this->settle_install( $dispatching, $this->result_from_state( $after, 'unknown', $code, $dispatching ) );
+            } finally {
+                $this->cleanup_package( $path );
+            }
         } finally {
-            $this->cleanup_package( $path );
+            // Deliberately not folded into the response: by here the receipt is settled, so the
+            // stored result is the truthful answer even when the release is not acknowledged. A
+            // release that failed is a lane problem, and the lane expiry is what resolves it.
+            $this->end_install_lock();
         }
+    }
+
+    /**
+     * Take the single install lane, or report it busy.
+     *
+     * @return bool Whether this request owns the lane.
+     */
+    protected function begin_install_lock() {
+        $now      = time();
+        $existing = get_site_option( self::INSTALL_LOCK_OPTION, null );
+        if ( is_array( $existing ) && isset( $existing['expires_at'] ) && is_int( $existing['expires_at'] ) && $existing['expires_at'] >= $now ) {
+            return false;
+        }
+        // An abandoned lane is only free once its row is actually gone: a delete that did not take
+        // leaves the previous holder's marker readable, and overwriting it would hand two requests
+        // the same lane.
+        if ( null !== $existing && ( ! delete_site_option( self::INSTALL_LOCK_OPTION ) || null !== get_site_option( self::INSTALL_LOCK_OPTION, null ) ) ) {
+            return false;
+        }
+        // The check above and the write below are not one operation, so two racers arriving within
+        // these few statements can both come away holding the lane: each read it free before either
+        // wrote, and the read-back below only catches whichever one got overwritten. Closing that
+        // needs an atomic insert, the way core's WP_Upgrader::create_lock uses INSERT IGNORE. This
+        // is a bounded known limit, not an oversight: the window two installs can collide in shrinks
+        // from the whole download-unpack-activate sequence to these few statements.
+        $owner = wp_generate_uuid4();
+        $lock  = array(
+            'owner'      => $owner,
+            // Long enough to cover a download, an unpack and an activation; short enough that a
+            // request killed mid-install frees the lane on its own instead of wedging it.
+            'expires_at' => $now + 15 * MINUTE_IN_SECONDS,
+        );
+        // add_site_option cannot fail closed on its own, so reading the owner back is what proves
+        // this request holds the lane rather than a racer that wrote over it.
+        if ( ! add_site_option( self::INSTALL_LOCK_OPTION, $lock ) || get_site_option( self::INSTALL_LOCK_OPTION, null ) !== $lock ) {
+            return false;
+        }
+        $this->install_lock_owner = $owner;
+        return true;
+    }
+
+    /**
+     * Release the install lane this request owns.
+     *
+     * @return bool Whether the release was verified.
+     */
+    protected function end_install_lock() {
+        $lock                     = get_site_option( self::INSTALL_LOCK_OPTION, null );
+        $owner                    = $this->install_lock_owner;
+        $this->install_lock_owner = '';
+        // Never drop a lane this request does not hold: after an expiry the marker belongs to
+        // whoever took it next.
+        if ( '' === $owner || ! is_array( $lock ) || ! isset( $lock['owner'] ) || ! is_string( $lock['owner'] ) || ! hash_equals( $owner, $lock['owner'] ) ) {
+            return false;
+        }
+        delete_site_option( self::INSTALL_LOCK_OPTION );
+        return null === get_site_option( self::INSTALL_LOCK_OPTION, null );
     }
 
     /** Return one stored install result without dispatching. */

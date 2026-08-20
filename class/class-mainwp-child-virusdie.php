@@ -130,7 +130,10 @@ class MainWP_Child_Virusdie {
         if ( false === $target || file_exists( $target ) || is_link( $target ) ) {
             return false;
         }
-        $temp = ABSPATH . '.mainwp-virusdie-' . wp_generate_password( 32, false, false );
+        // The staged copy sits in the web root, and a fatal before either unlink below leaves an
+        // orphan nothing ever cleans up. An extensionless file is served verbatim by common server
+        // configurations, while a .php one is executed and discloses nothing.
+        $temp = ABSPATH . '.mainwp-virusdie-' . wp_generate_password( 32, false, false ) . '.php';
         $file = @fopen( $temp, 'x+b' ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged -- Exclusive creation is mandatory.
         if ( false === $file ) {
             return false;

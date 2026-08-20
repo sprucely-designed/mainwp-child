@@ -1851,10 +1851,21 @@ class MainWP_Child_Back_Up_Buddy { //phpcs:ignore -- NOSONAR - multi methods.
      */
     protected function abilities_v2_start_backup_effect( $profile, $serial, $steps ) {
         if ( ! class_exists( '\\pb_backupbuddy_backup' ) ) {
-            require_once \pb_backupbuddy::plugin_path() . '/classes/backup.php'; // NOSONAR - WP compatible.
+            // require_once on a path that is not there is an uncatchable compile error, so it would
+            // take the request down past the caller's failure handling and past the finally that
+            // releases the effect lock: the record stays queued and every later effect answers
+            // lock_busy until the lock's 120s TTL runs out.
+            if ( ! method_exists( '\\pb_backupbuddy', 'plugin_path' ) ) {
+                return false;
+            }
+            $backup_class_file = \pb_backupbuddy::plugin_path() . '/classes/backup.php';
+            if ( ! file_exists( $backup_class_file ) ) {
+                return false;
+            }
+            require_once $backup_class_file; // NOSONAR - WP compatible.
         }
         $backup = new \pb_backupbuddy_backup();
-        return true === $backup->start_backup_process( $profile, 'manual', array(), $steps, '', $serial, array(), '', '' );
+        return method_exists( $backup, 'start_backup_process' ) && true === $backup->start_backup_process( $profile, 'manual', array(), $steps, '', $serial, array(), '', '' );
     }
 
     /**
@@ -1862,7 +1873,11 @@ class MainWP_Child_Back_Up_Buddy { //phpcs:ignore -- NOSONAR - multi methods.
      * @return array
      */
     protected function abilities_v2_probe_operation( $record ) {
-        if ( ! class_exists( $this->backupbuddy_core_class ) ) {
+        // Not every BackupBuddy build carries getLogDirectory(), which is why every other caller in
+        // this file tests for it first. Without it there is no record to read, so the record is
+        // returned as it stands: no new evidence rather than a clean bill of health. Nothing here
+        // moves updated_at, so abilities_v2_settle_stale_operation() still ages the record out.
+        if ( ! class_exists( $this->backupbuddy_core_class ) || ! method_exists( $this->backupbuddy_core_class, 'getLogDirectory' ) ) {
             return $record;
         }
         $prefix = 'transfer' === $record['kind'] ? 'send-mainwp-ability-' : '';

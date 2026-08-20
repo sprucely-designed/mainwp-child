@@ -216,11 +216,12 @@ class Test_MainWP_Child_Early_Access_Release_V2 extends WP_UnitTestCase {
 	}
 
 	/**
-	 * Nothing else prunes these receipt options, so a settled result past retention has to stop
-	 * being served and stop occupying its reference. The production reader is the layer that has
-	 * to do it - every fixture in this file replaces the receipt store.
+	 * A settled result past retention stops being served, but status holds no transition lane and
+	 * so may not delete the row. delete_option matches the option key alone, so a delete decided
+	 * from a value status read earlier would land on whatever a concurrent apply has since written
+	 * under that reference - taking out the dispatch marker of a transition already under way.
 	 */
-	public function test_settled_receipt_past_retention_reads_as_absent_and_is_reclaimed() {
+	public function test_settled_receipt_past_retention_reads_as_absent_and_is_left_for_the_lane() {
 		$subject = new MainWP_Child_Early_Access_Release();
 
 		$live = '123e4567-e89b-42d3-a456-426614174701';
@@ -229,15 +230,43 @@ class Test_MainWP_Child_Early_Access_Release_V2 extends WP_UnitTestCase {
 		$this->assertTrue( $served['ok'] );
 		$this->assertSame( 'applied', $served['status'] );
 
-		$aged = '123e4567-e89b-42d3-a456-426614174702';
-		add_option( $this->receipt_option( $aged ), $this->settled_receipt( $aged, time() - 1 ), '', false );
+		$aged   = '123e4567-e89b-42d3-a456-426614174702';
+		$stored = $this->settled_receipt( $aged, time() - 1 );
+		add_option( $this->receipt_option( $aged ), $stored, '', false );
 		$result = $subject->release_v2( $this->request( 'status', array( 'request_ref' => $aged ) ) );
 
 		$this->assertFalse( $result['ok'] );
 		$this->assertSame( 'not_found', $result['code'] );
-		$this->assertNull( get_option( $this->receipt_option( $aged ), null ) );
+		$this->assertSame( $stored, get_option( $this->receipt_option( $aged ), null ), 'A status read must answer from the receipt without writing to the store.' );
 
 		delete_option( $this->receipt_option( $live ) );
+		delete_option( $this->receipt_option( $aged ) );
+	}
+
+	/**
+	 * The transition lane is what reclaims a settled result past retention: apply deletes the row
+	 * it just read while holding the lane, then runs the fresh transition the reference is now free
+	 * for, instead of replaying a result retention has already retired.
+	 */
+	public function test_apply_reclaims_a_receipt_past_retention_and_runs_a_fresh_transition() {
+		$subject     = new Retained_MainWP_Child_Early_Access_Release();
+		$request_ref = '123e4567-e89b-42d3-a456-426614174706';
+		$request     = $this->apply_request( $request_ref );
+		add_option( $this->receipt_option( $request_ref ), $this->settled_receipt( $request_ref, time() - 1 ), '', false );
+
+		$result = $subject->release_v2( $request );
+
+		$this->assertSame( 1, $subject->downloads, 'A settled result past retention must free its reference for the next transition.' );
+		$this->assertSame( 1, $subject->applies );
+		$this->assertTrue( $result['ok'] );
+		$this->assertSame( 'applied', $result['status'] );
+
+		$stored = get_option( $this->receipt_option( $request_ref ), null );
+		$this->assertIsArray( $stored );
+		$this->assertSame( $this->effect_hash( $subject, $request['payload'] ), $stored['effect_hash'] );
+		$this->assertSame( $result, $stored['result'] );
+
+		delete_option( $this->receipt_option( $request_ref ) );
 	}
 
 	/**
@@ -264,13 +293,14 @@ class Test_MainWP_Child_Early_Access_Release_V2 extends WP_UnitTestCase {
 	}
 
 	/**
-	 * A row that is still readable but refuses to delete has not become absent. Reporting
-	 * not_found there hides a receipt that later applies cannot replace either.
+	 * A row that is still readable but refuses to delete has not become absent. The lane may not
+	 * start a transition under a reference it could not actually free - the receipt it would
+	 * overwrite on settling is still there and still belongs to the earlier request.
 	 */
-	public function test_a_receipt_that_cannot_be_reclaimed_reads_as_storage_not_absence() {
+	public function test_apply_refuses_when_a_receipt_past_retention_cannot_be_reclaimed() {
 		global $wpdb;
 
-		$subject     = new MainWP_Child_Early_Access_Release();
+		$subject     = new Retained_MainWP_Child_Early_Access_Release();
 		$request_ref = '123e4567-e89b-42d3-a456-426614174705';
 		$option      = $this->receipt_option( $request_ref );
 		add_option( $option, $this->settled_receipt( $request_ref, time() - 1 ), '', false );
@@ -281,10 +311,12 @@ class Test_MainWP_Child_Early_Access_Release_V2 extends WP_UnitTestCase {
 			return false !== strpos( $query, 'DELETE' ) && false !== strpos( $query, $option ) ? "DELETE FROM {$wpdb->options} WHERE option_name = 'mainwp-child-no-such-receipt'" : $query;
 		};
 		add_filter( 'query', $refuse );
-		$result = $subject->release_v2( $this->request( 'status', array( 'request_ref' => $request_ref ) ) );
+		$result = $subject->release_v2( $this->apply_request( $request_ref ) );
 		remove_filter( 'query', $refuse );
 
 		$this->assertSame( 'storage_unavailable', $result['code'] );
+		$this->assertSame( 0, $subject->downloads );
+		$this->assertSame( 0, $subject->applies );
 		$this->assertNotNull( $wpdb->get_var( $wpdb->prepare( "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s", $option ) ) );
 
 		delete_option( $option );

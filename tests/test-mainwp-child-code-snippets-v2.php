@@ -105,6 +105,29 @@ class Test_MainWP_Child_Code_Snippets_V2_Fixture extends MainWP_Child_Misc {
 	}
 }
 
+/** Marker for the wire fixture, distinct from anything PHPUnit itself throws. */
+class Test_MainWP_Child_Code_Snippets_V2_Wire_Probe extends Exception {}
+
+/** Captures what the wire guard handed the protocol. */
+class Test_MainWP_Child_Code_Snippets_V2_Wire_Fixture extends MainWP_Child_Misc {
+
+	/** @var mixed Request as the guard decoded it; null when the guard refused the body. */
+	public $seen = false;
+
+	/**
+	 * @param string $action  Protocol action.
+	 * @param mixed  $request Decoded request.
+	 * @return array<string,mixed>
+	 * @throws Test_MainWP_Child_Code_Snippets_V2_Wire_Probe Always, before the response is written.
+	 */
+	public function snippet_v2( $action, $request ) {
+		$this->seen = $request;
+		// code_snippet() hands this return value to MainWP_Helper::write(), which ends the request
+		// with die(). Throwing from the argument expression stops short of that.
+		throw new Test_MainWP_Child_Code_Snippets_V2_Wire_Probe( 'wire-guard' );
+	}
+}
+
 /** Code Snippets protocol-v2 contract tests. */
 class Test_MainWP_Child_Code_Snippets_V2 extends WP_UnitTestCase {
 
@@ -218,6 +241,70 @@ class Test_MainWP_Child_Code_Snippets_V2 extends WP_UnitTestCase {
 		$result = $this->fixture->snippet_v2( 'run_snippet_v2', $this->request( 'R', "echo str_repeat('x', 70000);" ) );
 		$this->assertTrue( $result['output_truncated'] );
 		$this->assertSame( 65535, strlen( $result['output'] ) );
+	}
+
+	/** Truncating multibyte output keeps the text it produced instead of blanking the reply. */
+	public function test_truncated_multibyte_output_survives_the_byte_cap() {
+		$full   = str_repeat( 'é', 40000 );
+		$result = $this->fixture->snippet_v2( 'run_snippet_v2', $this->request( 'R', "echo str_repeat('é', 40000);" ) );
+
+		$this->assertSame( 80000, strlen( $full ), 'The run must produce more than the byte cap.' );
+		$this->assertSame( 'succeeded', $result['status'] );
+		$this->assertTrue( $result['output_truncated'] );
+		$this->assertNotSame( '', $result['output'], 'A cap that lands mid-character must not cost the whole output.' );
+		$this->assertLessThanOrEqual( 65535, strlen( $result['output'] ) );
+		$this->assertGreaterThan( 65530, strlen( $result['output'] ), 'At most one character is given up to the character boundary.' );
+		$this->assertSame( 1, preg_match( '//u', $result['output'] ), 'Truncated output must still be valid UTF-8.' );
+		$this->assertStringStartsWith( $result['output'], $full );
+	}
+
+	/** Output carrying an invalid byte reports the text around it rather than nothing. */
+	public function test_invalid_bytes_in_output_do_not_discard_the_valid_text() {
+		$result = $this->fixture->snippet_v2( 'run_snippet_v2', $this->request( 'R', 'echo "before" . chr( 0xC3 ) . "after";' ) );
+
+		$this->assertSame( 'succeeded', $result['status'] );
+		$this->assertFalse( $result['output_truncated'] );
+		$this->assertStringContainsString( 'before', $result['output'] );
+		$this->assertStringContainsString( 'after', $result['output'] );
+		$this->assertSame( 1, preg_match( '//u', $result['output'] ), 'What is reported must be valid UTF-8.' );
+	}
+
+	/**
+	 * The Dashboard advertises a 60000-byte code field and encodes it with default JSON flags, so a
+	 * maximal non-ASCII snippet reaches the Child six bytes per source byte. The wire bound has to
+	 * admit a body the Dashboard is allowed to send.
+	 */
+	public function test_wire_bound_admits_a_maximal_non_ascii_snippet() {
+		$code = str_repeat( 'é', 30000 );
+		$this->assertSame( 60000, strlen( $code ), 'This is exactly the largest code the protocol accepts.' );
+
+		$body = wp_json_encode(
+			array(
+				'protocol_version' => 2,
+				'request_ref'      => $this->request_ref,
+				'slug'             => 'FixtureSlug1',
+				'type'             => 'S',
+				'code'             => $code,
+			)
+		);
+		$this->assertGreaterThan( 70000, strlen( $body ), 'Escaped non-ASCII is what the old bound refused.' );
+
+		$wire    = new Test_MainWP_Child_Code_Snippets_V2_Wire_Fixture();
+		$stopped = false;
+		try {
+			$_POST['action'] = 'apply_snippet_v2';
+			// WordPress hands $_POST to the request already slashed.
+			$_POST['request'] = wp_slash( $body );
+			$wire->code_snippet();
+		} catch ( Test_MainWP_Child_Code_Snippets_V2_Wire_Probe $probe ) {
+			$stopped = true;
+		} finally {
+			unset( $_POST['action'], $_POST['request'] );
+		}
+
+		$this->assertTrue( $stopped, 'The request must reach the protocol.' );
+		$this->assertIsArray( $wire->seen, 'A refused body arrives as null, which the protocol can only answer with invalid_request.' );
+		$this->assertSame( $code, $wire->seen['code'] );
 	}
 
 	/** Stored-option application and removal converge with exact readback. */

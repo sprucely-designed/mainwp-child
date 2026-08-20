@@ -253,24 +253,18 @@ class MainWP_Child_Early_Access_Release {
         if ( null === $value ) {
             return null;
         }
-        if ( ! $this->valid_receipt( $value ) ) {
-            return false;
-        }
-        if ( $this->receipt_expired( $value ) ) {
-            // A row that is still readable but will not delete has not become absent, and saying
-            // not_found would leave the reference occupied by a receipt nobody can replace.
-            return delete_option( $this->receipt_key( $request_ref ) ) ? null : false;
-        }
-        return $value;
+        return $this->valid_receipt( $value ) ? $value : false;
     }
 
     /**
      * Report whether one settled result has passed retention.
      *
-     * Nothing else prunes these options, so the read that finds one past retention is what
-     * reclaims it, and the reference becomes free for a new request. Only an outcome that
-     * established what the installed tree went through may be forgotten that way: applied,
-     * restored and failed each name a known ending, so a later request under the same
+     * Nothing else prunes these options, so the holder of the transition lane is what reclaims one
+     * past retention, and the reference becomes free for a new request. A reader outside the lane
+     * must not: delete_option matches the option key alone, so a delete decided from a value read
+     * earlier lands on whatever a concurrent transition has since written under the same reference.
+     * Only an outcome that established what the installed tree went through may be forgotten that
+     * way: applied, restored and failed each name a known ending, so a later request under the same
      * reference either converges on the same verified tree or starts from a state that was
      * read back and proven. A dispatch marker and a settled unknown are both exempt - neither
      * ever resolved the effect, so the only truthful answer stays outcome_unknown however old
@@ -340,6 +334,16 @@ class MainWP_Child_Early_Access_Release {
             if ( false === $existing ) {
                 return $this->error( 'apply', 'storage_unavailable' );
             }
+            if ( is_array( $existing ) && $this->receipt_expired( $existing ) ) {
+                // Retention is reclaimed here and not in the reader because delete_option matches
+                // the option key alone: only the lane holder knows nothing else has written under
+                // this reference since it was read. A row that will not delete has not become
+                // absent, so the reference is never treated as free unless it was actually freed.
+                if ( ! delete_option( $this->receipt_key( $payload['request_ref'] ) ) ) {
+                    return $this->error( 'apply', 'storage_unavailable' );
+                }
+                $existing = null;
+            }
             if ( is_array( $existing ) ) {
                 return $this->replay( $existing, $effect_hash );
             }
@@ -402,7 +406,9 @@ class MainWP_Child_Early_Access_Release {
         if ( false === $receipt ) {
             return $this->error( 'status', 'storage_unavailable' );
         }
-        if ( ! is_array( $receipt ) ) {
+        // A result past retention stops being served here, but the reclaim itself belongs to the
+        // transition lane, which a status read does not hold.
+        if ( ! is_array( $receipt ) || $this->receipt_expired( $receipt ) ) {
             return $this->error( 'status', 'not_found' );
         }
         return 'dispatching' === $receipt['state'] ? $this->unknown_result( $receipt ) : $receipt['result'];

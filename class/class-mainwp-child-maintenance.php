@@ -690,52 +690,17 @@ class MainWP_Child_Maintenance {
                 unset( $records[ $operation_ref ] );
             }
         }
+        // A record inside the retention window is the proof that makes a Dashboard retry safe: the
+        // execute payload carries no expiry, so every stored record is still replayable, and a retry
+        // that lands on a forgotten one re-runs the same destructive actions against rows the first
+        // run never saw. Refusing is loud, costs the caller a storage_unavailable, and clears itself
+        // once the settle above turns the oldest run terminal and the prune ages it out; freeing a
+        // slot by dropping a receipt is silent and costs data.
         if ( self::ABILITIES_V2_MAX_OPERATIONS < count( $records ) ) {
-            $records = $this->abilities_v2_operation_room( $records );
-            if ( false === $records ) {
-                return false;
-            }
+            return false;
         }
         update_option( self::ABILITIES_V2_OPERATIONS_OPTION, $records, false );
         return get_option( self::ABILITIES_V2_OPERATIONS_OPTION, null ) === $records;
-    }
-
-    /**
-     * Free the last ledger slots by dropping only runs nothing can still be waiting on.
-     *
-     * The seven-day prune above cannot reach a ledger filled with runs that all finished this
-     * week, so on its own the cap turns into a week-long outage: every later execute is refused
-     * storage_unavailable until the oldest record ages out. Making room by taking the oldest
-     * record is worse than the outage. A record is the replay proof for its operation_ref, so
-     * dropping one that a Dashboard retry can still land on turns that retry into a second run of
-     * the same destructive actions, and dropping a running record throws away the only handle to
-     * a run that is still going.
-     *
-     * Evictable therefore means finished, and finished more than a day ago, oldest first. A day is
-     * the horizon the settle pass already reads as proof that no process is behind a run, so past
-     * it nothing is still in flight against the record. A record dated in the future never becomes
-     * a candidate, so a hand-edited timestamp costs a refusal rather than a record. When nothing
-     * qualifies, the store stays full and the caller refuses the mutation.
-     *
-     * @param array $records Settled and age-pruned records.
-     * @return array|false Ledger within the cap, or false when no slot may be freed.
-     */
-    private function abilities_v2_operation_room( $records ) {
-        $horizon    = time() - DAY_IN_SECONDS;
-        $candidates = array();
-        foreach ( $records as $operation_ref => $record ) {
-            if ( null !== $record['finished_at'] && $record['finished_at'] < $horizon ) {
-                $candidates[ $operation_ref ] = $record['finished_at'];
-            }
-        }
-        asort( $candidates, SORT_NUMERIC );
-        foreach ( array_keys( $candidates ) as $operation_ref ) {
-            if ( self::ABILITIES_V2_MAX_OPERATIONS >= count( $records ) ) {
-                break;
-            }
-            unset( $records[ $operation_ref ] );
-        }
-        return self::ABILITIES_V2_MAX_OPERATIONS < count( $records ) ? false : $records;
     }
 
     /**

@@ -505,6 +505,11 @@ class MainWP_Child_Posts { //phpcs:ignore -- NOSONAR - multi methods.
         if ( ! is_array( $meta ) ) {
             return $this->post_plus_v2_error( $operation, 'storage_unavailable' );
         }
+        // One post can trip several blockers at once and only one of them is reported, so the
+        // ranking is builder, then media, then meta - never whichever meta row happened to be
+        // read last. Media outranks meta because an attached media object tells the operator to
+        // deal with the attachment, while arbitrary meta tells them to decide what that meta
+        // means; reporting the weaker one hides the actionable answer.
         foreach ( array_keys( $meta ) as $meta_key ) {
             if ( in_array( $meta_key, array( '_edit_last', '_edit_lock', '_encloseme', '_pingme', '_wp_page_template' ), true ) ) {
                 continue;
@@ -513,7 +518,11 @@ class MainWP_Child_Posts { //phpcs:ignore -- NOSONAR - multi methods.
                 $compatibility = 'unsupported_builder';
                 break;
             }
-            $compatibility = '_thumbnail_id' === $meta_key ? 'unsupported_media' : 'unsupported_meta';
+            if ( '_thumbnail_id' === $meta_key ) {
+                $compatibility = 'unsupported_media';
+            } elseif ( 'supported' === $compatibility ) {
+                $compatibility = 'unsupported_meta';
+            }
         }
         if ( 'supported' === $compatibility && ( false !== stripos( $source->post_content, '<img' ) || false !== stripos( $source->post_content, '[gallery' ) ) ) {
             $compatibility = 'unsupported_media';
@@ -565,11 +574,17 @@ class MainWP_Child_Posts { //phpcs:ignore -- NOSONAR - multi methods.
         }
 
         try {
-            $records = $this->content_v2_records( $protocol );
+            $repaired = false;
+            $records  = $this->content_v2_records( $protocol, $repaired );
             if ( false === $records ) {
                 return $this->content_v2_error( $protocol, $operation, 'storage_unavailable' );
             }
-            $records = $this->content_v2_prune_records( $protocol, $records );
+            // A quarantine is stamped at first observation, so an unpersisted repair is re-stamped on
+            // every request and can never grow old enough to be evicted or pruned - a ledger of damaged
+            // entries would refuse every mutation forever. Persisting it here freezes those timestamps
+            // and lets the entries age out normally, and a refused write must fail this request rather
+            // than put the request back on that loop.
+            $records = $this->content_v2_prune_records( $protocol, $records, $repaired );
             if ( false === $records ) {
                 return $this->content_v2_error( $protocol, $operation, 'storage_unavailable' );
             }
@@ -981,9 +996,6 @@ class MainWP_Child_Posts { //phpcs:ignore -- NOSONAR - multi methods.
         }
         $old_post   = 'update' === $normalized['mode'] ? get_post( $normalized['target_post_id'] ) : null;
         $old_status = $old_post instanceof \WP_Post ? $old_post->post_status : '';
-        if ( false === $wpdb->query( 'START TRANSACTION' ) ) { // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
-            return $this->content_v2_error( $protocol, $operation, 'storage_unavailable' );
-        }
 
         $postarr = array(
             'post_type'      => $normalized['post']['post_type'],
@@ -1008,6 +1020,10 @@ class MainWP_Child_Posts { //phpcs:ignore -- NOSONAR - multi methods.
             $postarr['ID'] = $normalized['target_post_id'];
         }
 
+        // Site plugins listen here, and a listener that issues DDL triggers MySQL's implicit
+        // commit. Inside the transaction that would silently turn every ROLLBACK below into a
+        // no-op: the post stays durable while the Dashboard is told the mutation failed. So the
+        // notification fires first and the transaction opens around the writes only.
         $hook_post = $postarr;
         unset( $hook_post['meta_input'] );
         do_action(
@@ -1018,6 +1034,10 @@ class MainWP_Child_Posts { //phpcs:ignore -- NOSONAR - multi methods.
             implode( ',', $normalized['post']['tags'] ),
             array()
         );
+
+        if ( false === $wpdb->query( 'START TRANSACTION' ) ) { // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+            return $this->content_v2_error( $protocol, $operation, 'storage_unavailable' );
+        }
 
         $post_id = wp_insert_post( wp_slash( $postarr ), true );
         if ( is_wp_error( $post_id ) || ! is_int( $post_id ) || 1 > $post_id ) {
@@ -1223,10 +1243,12 @@ class MainWP_Child_Posts { //phpcs:ignore -- NOSONAR - multi methods.
      * against - is dropped. Reserved receipts that still validate are untouched.
      *
      * @param string $protocol Closed protocol name.
+     * @param bool   $repaired Receives whether the stored ledger differs from the returned one.
      * @return array|false Valid ledger or false.
      */
-    private function content_v2_records( $protocol ) {
-        $records = get_option( $this->content_v2_option( $protocol ), array() );
+    private function content_v2_records( $protocol, &$repaired = null ) {
+        $repaired = false;
+        $records  = get_option( $this->content_v2_option( $protocol ), array() );
         if ( ! is_array( $records ) ) {
             return false;
         }
@@ -1236,6 +1258,9 @@ class MainWP_Child_Posts { //phpcs:ignore -- NOSONAR - multi methods.
                 $valid[ $operation_ref ] = $record;
             } elseif ( $this->content_v2_uuid( $operation_ref ) ) {
                 $valid[ $operation_ref ] = $this->content_v2_quarantine_record( $operation_ref, $record );
+                $repaired                = true;
+            } else {
+                $repaired = true;
             }
         }
         return self::CONTENT_V2_MAX_RECORDS < count( $valid ) ? false : $valid;
@@ -1287,13 +1312,14 @@ class MainWP_Child_Posts { //phpcs:ignore -- NOSONAR - multi methods.
     /**
      * Remove only receipts older than the required retry-retention window.
      *
-     * @param string $protocol Closed protocol name.
-     * @param array  $records  Valid durable ledger.
+     * @param string $protocol       Closed protocol name.
+     * @param array  $records        Valid durable ledger.
+     * @param bool   $persist_repair Whether the caller's load repaired the ledger and must store it.
      * @return array|false Pruned ledger or false.
      */
-    private function content_v2_prune_records( $protocol, $records ) {
+    private function content_v2_prune_records( $protocol, $records, $persist_repair = false ) {
         $minimum = time() - self::CONTENT_V2_RETENTION;
-        $changed = false;
+        $changed = $persist_repair;
         foreach ( $records as $operation_ref => $record ) {
             if ( $record['updated_at'] < $minimum ) {
                 unset( $records[ $operation_ref ] );

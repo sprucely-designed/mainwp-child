@@ -447,19 +447,18 @@ class Test_MainWP_Child_Maintenance_V2 extends WP_UnitTestCase {
 	}
 
 	/**
-	 * A store filled with runs that all finished this week is out of the seven-day prune's reach,
-	 * so without eviction the cap refuses every execute until the oldest record ages out. The
-	 * oldest record here is a run that is still going and is still writing to its record: dropping
-	 * that one to make room loses the handle to a live run, and the record a day past any retry is
-	 * the one that can go.
+	 * A store filled with runs that all finished this week is out of the seven-day prune's reach, so
+	 * at the cap there is no slot to free. Freeing one anyway means dropping a record a Dashboard
+	 * retry can still land on, and that retry then runs the same destructive actions a second time
+	 * against rows the first run never saw. The write refuses instead.
 	 */
-	public function test_a_full_operation_store_evicts_a_settled_run_and_keeps_the_running_one() {
+	public function test_a_full_operation_store_refuses_the_write_instead_of_forgetting_a_receipt() {
 		$in_flight               = $this->running_record( 1, 6 * DAY_IN_SECONDS );
 		$in_flight['updated_at'] = time() - 30;
-		$evictable               = $this->settled_record( 2, 2 * DAY_IN_SECONDS );
+		$replayable              = $this->settled_record( 2, 2 * DAY_IN_SECONDS );
 		$records                 = array(
-			$in_flight['operation_ref'] => $in_flight,
-			$evictable['operation_ref'] => $evictable,
+			$in_flight['operation_ref']  => $in_flight,
+			$replayable['operation_ref'] => $replayable,
 		);
 		for ( $index = 3; $index <= 100; $index++ ) {
 			$settled                              = $this->settled_record( $index, 60 );
@@ -469,14 +468,89 @@ class Test_MainWP_Child_Maintenance_V2 extends WP_UnitTestCase {
 
 		list( , $result ) = $this->real_execute( $this->real_subject(), array( 'autodraft' ), 5, '123e4567-e89b-42d3-a456-426614174520' );
 
-		$this->assertTrue( $result['ok'] );
-		$this->assertSame( 'succeeded', $result['status'] );
 		$stored = get_option( MainWP_Child_Maintenance::ABILITIES_V2_OPERATIONS_OPTION, array() );
-		$this->assertCount( 100, $stored );
-		$this->assertArrayHasKey( '123e4567-e89b-42d3-a456-426614174520', $stored );
-		$this->assertArrayHasKey( $in_flight['operation_ref'], $stored, 'The oldest record is a live run and is not what eviction may take.' );
+		$this->assertArrayHasKey( $replayable['operation_ref'], $stored, 'A record inside the retention window is what a retry replays instead of re-running.' );
+		$this->assertArrayHasKey( $in_flight['operation_ref'], $stored, 'The oldest record is a live run and is not a slot to free.' );
 		$this->assertSame( 'running', $stored[ $in_flight['operation_ref'] ]['status'] );
-		$this->assertArrayNotHasKey( $evictable['operation_ref'], $stored );
+		$this->assertCount( 100, $stored );
+		$this->assertArrayNotHasKey( '123e4567-e89b-42d3-a456-426614174520', $stored );
+		$this->assertFalse( $result['ok'] );
+		$this->assertSame( 'storage_unavailable', $result['code'] );
+	}
+
+	/**
+	 * The settle turns a day-old running record into a terminal one, and the same write then reads
+	 * every terminal record. A record that was running when the write started carries a finished_at
+	 * from before that write by definition, so anything that drops old terminal records to free a
+	 * slot takes it first, and the run it proves happened is left with no record at all.
+	 */
+	public function test_a_record_settled_during_a_write_survives_that_same_write() {
+		$stale   = $this->running_record( 1, 2 * DAY_IN_SECONDS );
+		$records = array( $stale['operation_ref'] => $stale );
+		for ( $index = 2; $index <= 100; $index++ ) {
+			$settled                              = $this->settled_record( $index, 60 );
+			$records[ $settled['operation_ref'] ] = $settled;
+		}
+		update_option( MainWP_Child_Maintenance::ABILITIES_V2_OPERATIONS_OPTION, $records, false );
+
+		list( , $result ) = $this->real_execute( $this->real_subject(), array( 'autodraft' ), 5, '123e4567-e89b-42d3-a456-426614174521' );
+
+		$stored = get_option( MainWP_Child_Maintenance::ABILITIES_V2_OPERATIONS_OPTION, array() );
+		$this->assertArrayHasKey( $stale['operation_ref'], $stored, 'A record that was running when the write started must still be there when it returns.' );
+		$this->assertCount( 100, $stored );
+		$this->assertFalse( $result['ok'] );
+		$this->assertSame( 'storage_unavailable', $result['code'] );
+	}
+
+	/**
+	 * The property the rest of the store rules exist to protect. The execute payload has no expiry,
+	 * so a retry can arrive long after the run it repeats, and the snapshot it carries matches again
+	 * as soon as the site is back at the same counts. The stored record is the only thing between
+	 * that retry and a second pass of the same destructive actions over rows the first run never saw.
+	 */
+	public function test_a_retry_of_a_settled_unknown_run_replays_instead_of_deleting_again() {
+		global $wpdb;
+		$subject = $this->real_subject();
+		self::factory()->post->create( array( 'post_status' => 'auto-draft' ) );
+		self::factory()->post->create( array( 'post_status' => 'auto-draft' ) );
+		$auto_drafts = "SELECT COUNT(*) FROM $wpdb->posts WHERE post_status = 'auto-draft'";
+		$before      = $wpdb->get_var( $auto_drafts );
+		$preview     = $this->real_request( $subject, 'ability_maintenance_preview_v2', array( 'actions' => array( 'autodraft' ), 'revision_retention' => 5 ) );
+		$this->assertTrue( $preview['ok'] );
+
+		$abandoned = $this->settled_unknown_record( 1, 3 * DAY_IN_SECONDS, $preview['snapshot_revision'] );
+		$spare     = $this->settled_record( 2, 2 * DAY_IN_SECONDS );
+		$records   = array(
+			$abandoned['operation_ref'] => $abandoned,
+			$spare['operation_ref']     => $spare,
+		);
+		for ( $index = 3; $index <= 100; $index++ ) {
+			$settled                              = $this->settled_record( $index, 60 );
+			$records[ $settled['operation_ref'] ] = $settled;
+		}
+		update_option( MainWP_Child_Maintenance::ABILITIES_V2_OPERATIONS_OPTION, $records, false );
+
+		// A later run is the write that has to find a slot for its own record, and the abandoned run
+		// is the oldest thing in the store it could take one from. Whether that write is refused or
+		// makes room is what the retry below then depends on, so it is left unasserted here.
+		$this->real_execute( $subject, array( 'spam' ), 5, '123e4567-e89b-42d3-a456-426614174524' );
+
+		$retry = $this->real_request(
+			$subject,
+			'ability_maintenance_execute_v2',
+			array(
+				'operation_ref'      => $abandoned['operation_ref'],
+				'actions'            => array( 'autodraft' ),
+				'revision_retention' => 5,
+				'snapshot_revision'  => $preview['snapshot_revision'],
+				'action_hash'        => hash( 'sha256', wp_json_encode( array( array( 'autodraft' ), 5 ) ) ),
+			)
+		);
+
+		$this->assertTrue( $retry['ok'] );
+		$this->assertSame( 'unknown', $retry['status'] );
+		$this->assertSame( 'unknown', $retry['outcomes'][0]['status'] );
+		$this->assertSame( $before, $wpdb->get_var( $auto_drafts ), 'The retry has to replay the stored outcome, not delete the rows a second time.' );
 	}
 
 	/**
@@ -795,11 +869,11 @@ class Test_MainWP_Child_Maintenance_V2 extends WP_UnitTestCase {
 	}
 
 	/** Build one durable record left in 'running' by a run that never came back. */
-	private function running_record( $index, $age ) {
+	private function running_record( $index, $age, $snapshot = null ) {
 		$operation_ref = sprintf( '123e4567-e89b-42d3-a456-%012d', $index );
 		$actions       = array( 'autodraft' );
 		$retention     = 5;
-		$snapshot      = str_repeat( 'b', 64 );
+		$snapshot      = null === $snapshot ? str_repeat( 'b', 64 ) : $snapshot;
 		$action_hash   = hash( 'sha256', wp_json_encode( array( $actions, $retention ) ) );
 		$at            = time() - $age;
 		return array(
@@ -834,6 +908,22 @@ class Test_MainWP_Child_Maintenance_V2 extends WP_UnitTestCase {
 		$record['finished_at']    = time() - $age;
 		$record['report_emitted'] = true;
 		$record['updated_at']     = time() - $age;
+		return $record;
+	}
+
+	/** Build the record the store leaves behind when it settles a run abandoned $age seconds ago. */
+	private function settled_unknown_record( $index, $age, $snapshot = null ) {
+		$record                = $this->running_record( $index, $age, $snapshot );
+		$record['status']      = 'unknown';
+		$record['outcomes']    = array(
+			array(
+				'action'     => 'autodraft',
+				'status'     => 'unknown',
+				'affected'   => null,
+				'error_code' => 'outcome_unknown',
+			),
+		);
+		$record['finished_at'] = $record['updated_at'];
 		return $record;
 	}
 

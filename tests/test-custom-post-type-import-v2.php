@@ -223,6 +223,35 @@ class Test_Custom_Post_Type_Import_V2 extends WP_UnitTestCase {
 	}
 
 	/**
+	 * A null meta value is accepted, and validating it emits no deprecation.
+	 */
+	public function test_null_meta_value_is_accepted_without_a_deprecation() {
+		$payload             = $this->payload();
+		$payload['postmeta'] = array( array( 'meta_key' => 'fixture_null', 'meta_value' => null ) );
+
+		$deprecations = array();
+		set_error_handler(
+			static function ( $number, $message ) use ( &$deprecations ) {
+				unset( $number );
+				if ( false === strpos( $message, 'strlen' ) ) {
+					return false;
+				}
+				$deprecations[] = $message;
+				return true;
+			},
+			E_DEPRECATED
+		);
+		try {
+			$result = $this->import( $payload );
+		} finally {
+			restore_error_handler();
+		}
+
+		$this->assertSame( array(), $deprecations );
+		$this->assertSame( 'complete', $result['outcome'] );
+	}
+
+	/**
 	 * A closed nonempty taxonomy row is created and assigned.
 	 */
 	public function test_nonempty_terms_are_confirmed() {

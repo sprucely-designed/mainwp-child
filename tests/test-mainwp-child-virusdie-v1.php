@@ -195,6 +195,39 @@ class Test_MainWP_Child_Virusdie_V1 extends WP_UnitTestCase {
 		$this->assertTrue( method_exists( $callable, 'virusdie_sync_install_v1' ) );
 	}
 
+	public function test_the_staging_file_carries_a_php_suffix_in_the_web_root() {
+		$token = 'stagingsuffixprobe';
+		add_filter(
+			'random_password',
+			static function () use ( $token ) {
+				return $token;
+			}
+		);
+		$probe         = new Virusdie_Staging_Probe();
+		$extensionless = ABSPATH . '.mainwp-virusdie-' . $token;
+		$suffixed      = $extensionless . '.php';
+		$target        = ABSPATH . 'virusdie_staging_probe.php';
+
+		try {
+			// The staging file is unlinked before install_artifact() returns, so occupying a
+			// candidate name and watching the exclusive create collide is the only way to see
+			// which of the two names it actually opened.
+			file_put_contents( $suffixed, 'occupied' );
+			$this->assertFalse( $probe->stage( 'virusdie_staging_probe.php', '<?php // artifact' ) );
+			unlink( $suffixed );
+
+			file_put_contents( $extensionless, 'occupied' );
+			$this->assertTrue( $probe->stage( 'virusdie_staging_probe.php', '<?php // artifact' ) );
+			$this->assertSame( '<?php // artifact', file_get_contents( $target ) );
+		} finally {
+			foreach ( array( $extensionless, $suffixed, $target ) as $leftover ) {
+				if ( file_exists( $leftover ) ) {
+					unlink( $leftover );
+				}
+			}
+		}
+	}
+
 	private function install_request( $bytes ) {
 		return $this->request(
 			'install',
@@ -356,5 +389,13 @@ class Testable_MainWP_Child_Virusdie extends MainWP_Child_Virusdie {
 
 	public function seed_durable_receipt( $request_ref, $receipt ) {
 		return parent::create_receipt( $request_ref, $receipt );
+	}
+}
+
+/** Reaches the real staging and publication path, which Testable_MainWP_Child_Virusdie replaces. */
+class Virusdie_Staging_Probe extends MainWP_Child_Virusdie {
+
+	public function stage( $basename, $bytes ) {
+		return $this->install_artifact( $basename, $bytes );
 	}
 }

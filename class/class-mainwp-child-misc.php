@@ -623,7 +623,11 @@ class MainWP_Child_Misc {
         if ( in_array( $action, array( 'run_snippet_v2', 'apply_snippet_v2', 'remove_snippet_v2' ), true ) ) {
             // phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized -- JSON request body, length-capped and strictly validated by json_decode; sanitizing would corrupt it.
             $raw_request = isset( $_POST['request'] ) && is_string( $_POST['request'] ) ? wp_unslash( $_POST['request'] ) : '';
-            $request     = 70000 >= strlen( $raw_request ) ? json_decode( $raw_request, true ) : null;
+            // The bound covers the worst-case encoding of a body the Dashboard is allowed to send,
+            // not the size of the code inside it: wp_json_encode() with default flags turns every
+            // non-ASCII byte into a six-character \uXXXX escape, so the accepted 60000 bytes of
+            // code can reach 360000 on the wire, plus the envelope around it.
+            $request = 393216 >= strlen( $raw_request ) ? json_decode( $raw_request, true ) : null;
             MainWP_Helper::write( $this->snippet_v2( $action, $request ) );
         }
 
@@ -937,16 +941,52 @@ class MainWP_Child_Misc {
             $output = '';
             $status = 'failed';
         }
+        // JSON cannot carry invalid UTF-8 at all, and without stripping wp_check_invalid_utf8()
+        // answers one bad byte by discarding the whole string, so a run would report empty output
+        // next to 'succeeded'. Returning the valid text is the truthful half of that choice.
+        // Stripping runs before the cap because it can change the byte length, and the cap has to
+        // describe what actually ships.
+        $output    = wp_check_invalid_utf8( $output, true );
         $truncated = 65535 < strlen( $output );
         if ( $truncated ) {
-            $output = substr( $output, 0, 65535 );
+            $output = $this->snippet_v2_cut_utf8( $output, 65535 );
         }
-        $output = wp_check_invalid_utf8( $output );
         return array(
             'status'           => $status,
             'output'           => $output,
             'output_truncated' => $truncated,
         );
+    }
+
+    /**
+     * Cut UTF-8 text to a byte budget without splitting the character on the boundary.
+     *
+     * A raw byte cut leaves a partial multi-byte sequence, which every downstream UTF-8 check then
+     * reads as a corrupt string.
+     *
+     * @param string $value Valid UTF-8 text.
+     * @param int    $limit Byte budget.
+     * @return string
+     */
+    private function snippet_v2_cut_utf8( $value, $limit ) {
+        if ( function_exists( 'mb_strcut' ) ) {
+            return mb_strcut( $value, 0, $limit, 'UTF-8' );
+        }
+
+        $cut  = substr( $value, 0, $limit );
+        $last = strlen( $cut ) - 1;
+        // Continuation bytes are 10xxxxxx; walking back over them lands on the lead byte of the
+        // character the cut ended inside.
+        while ( 0 <= $last && 0x80 === ( ord( $cut[ $last ] ) & 0xC0 ) ) {
+            --$last;
+        }
+        if ( 0 > $last ) {
+            return $cut;
+        }
+        $lead     = ord( $cut[ $last ] );
+        $expected = 0xF0 <= $lead ? 4 : ( 0xE0 <= $lead ? 3 : ( 0xC0 <= $lead ? 2 : 1 ) );
+
+        return strlen( $cut ) - $last < $expected ? substr( $cut, 0, $last ) : $cut;
     }
 
     /**

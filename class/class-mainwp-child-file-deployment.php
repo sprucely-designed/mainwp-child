@@ -251,7 +251,7 @@ class MainWP_Child_File_Deployment {
 
     /** Read one exact target snapshot. */
     protected function target_snapshot( $destination_class, $relative_destination ) {
-        $path = $this->target_path( $destination_class, $relative_destination, false );
+        $path = $this->target_path( $destination_class, $relative_destination );
         if ( false === $path ) {
             return false;
         }
@@ -342,7 +342,7 @@ class MainWP_Child_File_Deployment {
 
     /** Atomically deploy bytes after preserving the exact prior target. */
     protected function apply_deployment( $destination_class, $relative_destination, $bytes, $before ) { // phpcs:ignore Generic.Metrics.CyclomaticComplexity -- Filesystem transaction with compensation.
-        $path = $this->target_path( $destination_class, $relative_destination, true );
+        $path = $this->target_path( $destination_class, $relative_destination );
         if ( false === $path || ! $this->ensure_safe_parent( dirname( $path ) ) ) {
             return false;
         }
@@ -375,7 +375,7 @@ class MainWP_Child_File_Deployment {
 
     /** Restore the exact retained prior target state. */
     protected function apply_rollback( $receipt ) {
-        $path = $this->target_path( $receipt['destination_class'], $receipt['relative_destination'], false );
+        $path = $this->target_path( $receipt['destination_class'], $receipt['relative_destination'] );
         if ( false === $path ) {
             return false;
         }
@@ -634,7 +634,7 @@ class MainWP_Child_File_Deployment {
     }
 
     /** Return a contained absolute target path. */
-    private function target_path( $destination_class, $relative_destination, $allow_missing_parent ) {
+    private function target_path( $destination_class, $relative_destination ) {
         $normalized = $this->normalize_destination( $destination_class, $relative_destination );
         if ( false === $normalized ) {
             return false;
@@ -649,27 +649,27 @@ class MainWP_Child_File_Deployment {
         $prefix   = 'wp-content/' . ( 'mu_plugins' === $destination_class ? 'mu-plugins' : $destination_class ) . '/';
         $suffix   = substr( $normalized, strlen( $prefix ) );
         $path     = rtrim( $base_map[ $destination_class ], '/\\' ) . '/' . $suffix;
-        if ( ! $this->safe_parent_chain( $base_map[ $destination_class ], dirname( $path ), $allow_missing_parent ) ) {
+        if ( ! $this->safe_parent_chain( $base_map[ $destination_class ], dirname( $path ) ) ) {
             return false;
         }
         return $path;
     }
 
     /** Verify that no existing path component is a symlink. */
-    private function safe_parent_chain( $base, $parent, $allow_missing ) {
+    private function safe_parent_chain( $base, $parent ) {
         $base = rtrim( $base, '/\\' );
         if ( 0 !== strpos( $parent . '/', $base . '/' ) || is_link( $base ) ) {
             return false;
         }
         $relative = ltrim( substr( $parent, strlen( $base ) ), '/\\' );
         $current  = $base;
+        // A component that does not exist yet is not a containment problem: apply_deployment()
+        // creates it through ensure_safe_parent(), and normalize_destination() has already banned
+        // '..', '.', empty segments and backslashes.
         foreach ( '' === $relative ? array() : explode( '/', $relative ) as $part ) {
             $current .= '/' . $part;
             if ( file_exists( $current ) && ( is_link( $current ) || ! is_dir( $current ) ) ) {
                 return false;
-            }
-            if ( ! file_exists( $current ) && ! $allow_missing ) {
-                continue;
             }
         }
         return true;

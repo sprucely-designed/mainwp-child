@@ -406,10 +406,13 @@ class MainWP_Custom_Post_Type {
         if ( ! is_array( $data['postmeta'] ) || 2000 < count( $data['postmeta'] ) ) {
             return false;
         }
+        // A null meta_value is accepted and reaches strlen() as null, which PHP 8.1+ deprecates; the
+        // notice would print ahead of the payload on a site with display_errors on and break the
+        // Dashboard's parse of an otherwise valid import. The cast keeps every verdict identical.
         foreach ( $data['postmeta'] as $meta ) {
             $meta_keys = is_array( $meta ) ? array_keys( $meta ) : array();
             sort( $meta_keys );
-            if ( array( 'meta_key', 'meta_value' ) !== $meta_keys || ! is_string( $meta['meta_key'] ) || '' === $meta['meta_key'] || 255 < strlen( $meta['meta_key'] ) || ( ! is_scalar( $meta['meta_value'] ) && null !== $meta['meta_value'] ) || 1048576 < strlen( maybe_serialize( $meta['meta_value'] ) ) ) {
+            if ( array( 'meta_key', 'meta_value' ) !== $meta_keys || ! is_string( $meta['meta_key'] ) || '' === $meta['meta_key'] || 255 < strlen( $meta['meta_key'] ) || ( ! is_scalar( $meta['meta_value'] ) && null !== $meta['meta_value'] ) || 1048576 < strlen( (string) maybe_serialize( $meta['meta_value'] ) ) ) {
                 return false;
             }
         }

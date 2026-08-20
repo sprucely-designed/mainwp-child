@@ -102,6 +102,37 @@ class Test_MainWP_Child_Staging_V2_Fixture extends MainWP_Child_Staging {
 	}
 }
 
+/** Carries the protocol-2 response out of action() before MainWP_Helper::write() ends the request. */
+class Test_MainWP_Child_Staging_V2_Dispatched extends RuntimeException {
+
+	/** @var array */
+	public $response;
+
+	/** @param array $response Closed protocol response. */
+	public function __construct( $response ) {
+		parent::__construct( 'abilities_v2 dispatch reached' );
+		$this->response = $response;
+	}
+}
+
+/**
+ * A site with no WP Staging, driven through the real action() dispatcher.
+ *
+ * MainWP_Helper::write() ends the request with die(), so the response is thrown out of the
+ * protocol seam instead: catching it is what proves dispatch got past the provider gates.
+ */
+class Test_MainWP_Child_Staging_V2_Absent_Provider_Fixture extends MainWP_Child_Staging {
+
+	/** Skip the installed-plugin lookup; this site has no WP Staging. */
+	public function __construct() {
+	}
+
+	/** @param mixed $request Decoded request. @return array */
+	public function abilities_v2( $request ) {
+		throw new Test_MainWP_Child_Staging_V2_Dispatched( parent::abilities_v2( $request ) );
+	}
+}
+
 /** Staging protocol-v2 contract tests. */
 class Test_MainWP_Child_Staging_V2 extends WP_UnitTestCase {
 
@@ -357,17 +388,8 @@ class Test_MainWP_Child_Staging_V2 extends WP_UnitTestCase {
 				'payload'   => array(),
 			)
 		);
-		$this->assertSame( array( 'inventory', 'settings' ), $capabilities['operations'] );
+		$this->assertSame( array( 'inventory' ), $capabilities['operations'] );
 		$this->assertFalse( $capabilities['mutation_supported'] );
-
-		$current = $subject->abilities_v2(
-			array(
-				'protocol'  => '2',
-				'operation' => 'settings',
-				'payload'   => array(),
-			)
-		);
-		$this->assertTrue( $current['ok'] );
 
 		$result = $subject->abilities_v2(
 			array(
@@ -375,7 +397,7 @@ class Test_MainWP_Child_Staging_V2 extends WP_UnitTestCase {
 				'operation'   => 'replace_settings',
 				'request_ref' => '123e4567-e89b-42d3-a456-426614174936',
 				'payload'     => array(
-					'if_match' => $current['revision'],
+					'if_match' => str_repeat( 'a', 64 ),
 					'settings' => array(
 						'query_limit'      => 900,
 						'file_limit'       => 250,
@@ -393,6 +415,94 @@ class Test_MainWP_Child_Staging_V2 extends WP_UnitTestCase {
 		$this->assertSame( 'unsupported_operation', $result['error_code'] );
 		$this->assertFalse( get_option( 'wpstg_settings', false ), 'A provider-absent site must not gain WP Staging settings.' );
 		$this->assertSame( array(), get_option( 'mainwp_staging_abilities_v2_receipts', array() ) );
+	}
+
+	/**
+	 * `wpstg_settings` exists only where WP Staging does. Reading it on a site without the plugin
+	 * clamps an absent option into a full set of defaults, so a revision handed back there is a
+	 * checksum of settings the site never had.
+	 */
+	public function test_settings_claims_no_revision_without_wp_staging() {
+		delete_option( 'wpstg_settings' );
+		$subject = ( new ReflectionClass( MainWP_Child_Staging::class ) )->newInstanceWithoutConstructor();
+		$this->assertFalse( $subject->is_plugin_installed, 'WP Staging must be absent for this test to mean anything.' );
+
+		$absent = $subject->abilities_v2(
+			array(
+				'protocol'  => '2',
+				'operation' => 'settings',
+				'payload'   => array(),
+			)
+		);
+		$capabilities = $subject->abilities_v2(
+			array(
+				'protocol'  => '2',
+				'operation' => 'capabilities',
+				'payload'   => array(),
+			)
+		);
+
+		$this->assertFalse( $absent['ok'] );
+		$this->assertSame( 'unsupported_operation', $absent['error_code'] );
+		$this->assertArrayNotHasKey( 'revision', $absent );
+		$this->assertNotContains( 'settings', $capabilities['operations'] );
+
+		// With the plugin present the read answers for real provider state and stays available.
+		$this->staging->settings = array( 'queryLimit' => 900 );
+		$present                 = $this->invoke_v2( 'settings', array() );
+
+		$this->assertTrue( $present['ok'] );
+		$this->assertSame( 900, $present['query_limit'] );
+		$this->assertMatchesRegularExpression( '/^[a-f0-9]{64}$/', $present['revision'] );
+		$this->assertContains( 'settings', $this->invoke_v2( 'capabilities', array() )['operations'] );
+	}
+
+	/**
+	 * A protocol-2 request has to be answered in protocol 2. The provider gates in action() end the
+	 * request with a legacy error blob, which the Dashboard cannot tell apart from an old Child or a
+	 * broken transport, so this goes through the real dispatcher rather than calling abilities_v2().
+	 */
+	public function test_action_answers_a_v2_request_in_protocol_2_without_wp_staging() {
+		$subject = new Test_MainWP_Child_Staging_V2_Absent_Provider_Fixture();
+		$this->assertFalse( $subject->is_plugin_installed, 'WP Staging must be absent for this test to mean anything.' );
+
+		$_POST['mwp_action'] = 'abilities_v2';
+		$_POST['request']    = wp_json_encode(
+			array(
+				'protocol'  => '2',
+				'operation' => 'capabilities',
+				'payload'   => array(),
+			)
+		);
+		$gate = static function ( $translation, $text ) {
+			if ( in_array( $text, array( 'Please install WP Staging plugin on child website', 'WP Staging failed to load correctly on the child website.' ), true ) ) {
+				throw new RuntimeException( 'action() ended the request at the provider gate: ' . $text );
+			}
+			return $translation;
+		};
+		add_filter( 'gettext', $gate, 10, 2 );
+
+		$thrown = null;
+		try {
+			$subject->action();
+		} catch ( Throwable $throwable ) {
+			$thrown = $throwable;
+		}
+
+		remove_filter( 'gettext', $gate, 10 );
+		unset( $_POST['mwp_action'], $_POST['request'] );
+
+		$this->assertInstanceOf(
+			Test_MainWP_Child_Staging_V2_Dispatched::class,
+			$thrown,
+			null === $thrown ? 'action() returned without reaching the protocol-2 dispatch.' : $thrown->getMessage()
+		);
+		$response = $thrown->response;
+		$this->assertSame( '2', $response['protocol'] );
+		$this->assertSame( 'capabilities', $response['operation'] );
+		$this->assertTrue( $response['ok'] );
+		$this->assertSame( array( 'inventory' ), $response['operations'] );
+		$this->assertFalse( $response['mutation_supported'] );
 	}
 
 	/**

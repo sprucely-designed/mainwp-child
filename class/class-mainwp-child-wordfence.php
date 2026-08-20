@@ -1864,6 +1864,9 @@ SQL
                 if ( 'del' === $op ) {
                     // wp_delete_file() only gained a return value in WP 6.7 and we support 6.2+, so
                     // the readback decides; the return would report every delete as failed on 6.2-6.6.
+                    // Without the clear, a warning raised earlier in the request by anything at all
+                    // would be handed to the Dashboard as this deletion's reason.
+                    error_clear_last();
                     wp_delete_file( $localFile );
                     clearstatcache( true, $localFile );
                     if ( ! file_exists( $localFile ) ) {
@@ -1978,7 +1981,10 @@ SQL
             return array( 'errorMsg' => 'An invalid file was requested for deletion.' );
         }
         // wp_delete_file() only gained a return value in WP 6.7 and we support 6.2+, so the readback
-        // decides; the return would report every delete as failed on 6.2-6.6.
+        // decides; the return would report every delete as failed on 6.2-6.6. Without the clear, a
+        // warning raised earlier in the request by anything at all would be handed to the Dashboard
+        // as this deletion's reason.
+        error_clear_last();
         wp_delete_file( $localFile );
         clearstatcache( true, $localFile );
         if ( ! file_exists( $localFile ) ) {

@@ -214,6 +214,63 @@ class Test_MainWP_Child_Favorites_V2 extends WP_UnitTestCase {
 		delete_option( $option );
 	}
 
+	public function test_a_second_install_is_refused_while_the_install_lane_is_held() {
+		$subject = new Testable_MainWP_Child_Favorites_V2( array(), array(), array() );
+		update_site_option(
+			'mainwp_child_favorites_install_lock',
+			array(
+				'owner'      => '123e4567-e89b-42d3-a456-426614173030',
+				'expires_at' => time() + 300,
+			)
+		);
+
+		$result = $subject->install_verified_v2( $this->install_request() );
+
+		$this->assertFalse( $result['ok'] );
+		$this->assertSame( 'lock_busy', $result['code'] );
+		$this->assertSame( 0, $subject->download_count );
+		$this->assertSame( 0, $subject->install_count );
+		$this->assertSame( array(), $subject->receipts );
+
+		delete_site_option( 'mainwp_child_favorites_install_lock' );
+	}
+
+	public function test_a_failed_install_releases_the_lane_for_the_next_request() {
+		$subject                            = new Testable_MainWP_Child_Favorites_V2( array(), array(), array() );
+		$subject->downloaded_package_digest = str_repeat( 'b', 64 );
+
+		$failed = $subject->install_verified_v2( $this->install_request() );
+
+		$this->assertSame( 'digest_mismatch', $failed['code'] );
+		// Releasing only means something if the lane was actually held while the package was fetched.
+		$this->assertIsArray( $subject->lock_during_download );
+		$this->assertFalse( get_site_option( 'mainwp_child_favorites_install_lock', false ) );
+
+		$subject->downloaded_package_digest = str_repeat( 'a', 64 );
+		$retry                              = $this->install_request();
+		$retry['payload']['request_ref']    = '123e4567-e89b-42d3-a456-426614173031';
+
+		$second = $subject->install_verified_v2( $retry );
+
+		$this->assertTrue( $second['ok'] );
+		$this->assertSame( 'completed', $second['status'] );
+		$this->assertSame( 1, $subject->install_count );
+	}
+
+	public function test_a_settled_install_result_survives_a_lost_lane_release() {
+		$subject = new Lock_Release_Loss_MainWP_Child_Favorites_V2( array(), array(), array() );
+		$request = $this->install_request();
+
+		$result = $subject->install_verified_v2( $request );
+
+		$this->assertIsArray( $subject->lock_during_download );
+		$this->assertTrue( $result['ok'] );
+		$this->assertSame( 'completed', $result['status'] );
+		$this->assertNull( $result['code'] );
+		$this->assertSame( 1, $subject->install_count );
+		$this->assertSame( $result, $subject->receipts[ $request['payload']['request_ref'] ]['result'] );
+	}
+
 	public function test_single_file_plugin_archive_must_stay_at_the_archive_root() {
 		if ( ! class_exists( '\ZipArchive' ) ) {
 			$this->markTestSkipped( 'ZipArchive is unavailable.' );
@@ -416,6 +473,9 @@ class Testable_MainWP_Child_Favorites_V2 extends MainWP_Child_Favorites {
 
 	public $downloaded_package_digest;
 
+	/** The install lane as it stood while the package was being fetched. */
+	public $lock_during_download = false;
+
 	public $receipts = array();
 
 	public $durable_receipts = false;
@@ -441,6 +501,7 @@ class Testable_MainWP_Child_Favorites_V2 extends MainWP_Child_Favorites {
 	protected function download_package( $url ) {
 		unset( $url );
 		++$this->download_count;
+		$this->lock_during_download = get_site_option( 'mainwp_child_favorites_install_lock', false );
 		return '/private/tmp/favorites-fixture.zip';
 	}
 
@@ -546,6 +607,15 @@ class Testable_MainWP_Child_Favorites_V2 extends MainWP_Child_Favorites {
 
 	public function effect_hash_for_test( $payload ) {
 		return $this->install_effect_hash( $payload );
+	}
+}
+
+/** Frees the install lane but loses the acknowledgement, the way a failing option store would. */
+class Lock_Release_Loss_MainWP_Child_Favorites_V2 extends Testable_MainWP_Child_Favorites_V2 {
+
+	protected function end_install_lock() {
+		parent::end_install_lock();
+		return false;
 	}
 }
 

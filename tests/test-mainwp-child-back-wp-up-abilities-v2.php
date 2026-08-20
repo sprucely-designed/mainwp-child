@@ -732,37 +732,56 @@ class Test_MainWP_Child_Back_WP_Up_Abilities_V2 extends WP_UnitTestCase {
 	 * A compressed log is decompressed once, forward, so a finished run that ends exactly on the
 	 * reader's 64 KB window boundary is still recognised. gzeof() reports end of stream only after
 	 * a read that returns nothing, so the seeked-window reader asked for a second gzip window at
-	 * that offset, read zero bytes, and reported the completed run as unknown. The bzip2 case
-	 * covers the same rewritten path; its reader probed a byte ahead and never had the miss.
+	 * that offset, read zero bytes, and reported the completed run as unknown.
 	 */
-	public function test_backup_progress_reads_a_compressed_log_in_one_forward_pass() {
-		$directory = $this->make_log_directory();
-		$closing   = '</body>' . PHP_EOL . '</html>';
-		$header    = '<html><head>' . PHP_EOL .
+	public function test_backup_progress_reads_a_gzip_log_in_one_forward_pass() {
+		$this->assert_boundary_log_is_recognised( 'backwpup_log_boundary_gz.html.gz', gzencode( $this->boundary_log_body() ) );
+	}
+
+	/**
+	 * The bzip2 reader is the same rewritten forward pass; it probed a byte ahead and never had the
+	 * gzip miss, but it is the same code and gets the same boundary case. It lives in its own test
+	 * so a PHP build without ext-bz2 reports this one leg as skipped rather than taking the gzip
+	 * assertions down with an undefined-function error, or passing silently over an unread path.
+	 */
+	public function test_backup_progress_reads_a_bzip2_log_in_one_forward_pass() {
+		if ( ! function_exists( 'bzcompress' ) ) {
+			$this->markTestSkipped( 'ext-bz2 is not loaded, so the bzip2 log reader is unverified on this build.' );
+		}
+		$this->assert_boundary_log_is_recognised( 'backwpup_log_boundary_bz.html.bz2', bzcompress( $this->boundary_log_body() ) );
+	}
+
+	/**
+	 * A finished BackWPup log that decompresses to exactly one 64 KB read window.
+	 *
+	 * @return string
+	 */
+	private function boundary_log_body() {
+		$closing = '</body>' . PHP_EOL . '</html>';
+		$header  = '<html><head>' . PHP_EOL .
 			'<meta name="backwpup_errors" content="0" />' . PHP_EOL .
 			'</head>' . PHP_EOL . '<body>' . PHP_EOL;
-		$body      = $header . str_repeat( 'x', 65536 - strlen( $header ) - strlen( $closing ) ) . $closing;
+		$body    = $header . str_repeat( 'x', 65536 - strlen( $header ) - strlen( $closing ) ) . $closing;
 		$this->assertSame( 65536, strlen( $body ), 'The log must decompress to exactly one read window.' );
+		return $body;
+	}
 
-		$archives = array(
-			'backwpup_log_boundary_gz.html.gz'  => gzencode( $body ),
-			'backwpup_log_boundary_bz.html.bz2' => bzcompress( $body ),
-		);
-		foreach ( $archives as $name => $bytes ) {
-			$this->assertIsString( $bytes );
-			file_put_contents( trailingslashit( $directory ) . $name, $bytes ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_file_put_contents -- Disposable fixture.
-		}
-		$subject = $this->progress_fixture( $directory );
+	/**
+	 * @param string $name  Compressed log basename, as BackWPup stores it.
+	 * @param string $bytes Compressed log contents.
+	 * @return void
+	 */
+	private function assert_boundary_log_is_recognised( $name, $bytes ) {
+		$this->assertIsString( $bytes );
+		$directory = $this->make_log_directory();
+		file_put_contents( trailingslashit( $directory ) . $name, $bytes ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_file_put_contents -- Disposable fixture.
+		$logfile = substr( $name, 0, (int) strrpos( $name, '.' ) );
 
-		foreach ( array( 'backwpup_log_boundary_gz.html', 'backwpup_log_boundary_bz.html' ) as $logfile ) {
-			$result = $this->invoke_provider( $subject, 'abilities_v2_provider_backup_progress', array( array( 'job_id' => 7, 'logfile' => $logfile ), 0 ) );
-			$this->assertSame( 'completed', $result['state'], $logfile . ' records a finished run.' );
-			$this->assertSame( 100, $result['progress_percent'] );
-		}
+		$result = $this->invoke_provider( $this->progress_fixture( $directory ), 'abilities_v2_provider_backup_progress', array( array( 'job_id' => 7, 'logfile' => $logfile ), 0 ) );
+		$this->assertSame( 'completed', $result['state'], $logfile . ' records a finished run.' );
+		$this->assertSame( 100, $result['progress_percent'] );
 
-		foreach ( array_keys( $archives ) as $name ) {
-			wp_delete_file( trailingslashit( $directory ) . $name );
-		}
+		wp_delete_file( trailingslashit( $directory ) . $name );
 		$this->assertTrue( rmdir( $directory ) );
 	}
 
@@ -1095,25 +1114,54 @@ class Test_MainWP_Child_Back_WP_Up_Abilities_V2 extends WP_UnitTestCase {
 	}
 
 	/**
-	 * Plain, gzip and bzip2 logs are streamed without whole-file allocation.
+	 * Plain and gzip logs are streamed without whole-file allocation.
 	 */
-	public function test_provider_log_streams_plain_gzip_and_bzip2() {
-		$temp_dir = wp_tempnam( 'mainwp-backwpup-v2-compressed-log' );
-		$this->assertIsString( $temp_dir );
-		wp_delete_file( $temp_dir );
-		$this->assertTrue( wp_mkdir_p( $temp_dir ) );
+	public function test_provider_log_streams_plain_and_gzip() {
+		$content = $this->streamed_log_content();
+		$this->assert_logs_stream_bounded_excerpts(
+			array(
+				'backwpup_log_plain.html'   => $content,
+				'backwpup_log_gzip.html.gz' => gzencode( $content ),
+			)
+		);
+	}
+
+	/**
+	 * bzip2 logs stream the same way. Kept apart from the plain and gzip legs so a PHP build without
+	 * ext-bz2 reports this reader as skipped instead of killing the whole method with an
+	 * undefined-function error, or reporting green over a compression path nothing read.
+	 */
+	public function test_provider_log_streams_bzip2() {
+		if ( ! function_exists( 'bzcompress' ) ) {
+			$this->markTestSkipped( 'ext-bz2 is not loaded, so the bzip2 log reader is unverified on this build.' );
+		}
+		$this->assert_logs_stream_bounded_excerpts( array( 'backwpup_log_bzip.html.bz2' => bzcompress( $this->streamed_log_content() ) ) );
+	}
+
+	/**
+	 * One BackWPup log body carrying the values the reader has to redact.
+	 *
+	 * @return string
+	 */
+	private function streamed_log_content() {
 		$header = '<meta name="backwpup_jobname" content="Nightly" />' .
 			'<meta name="backwpup_jobtime" content="200" />' .
 			'<meta name="backwpup_jobruntime" content="5" />' .
 			'<meta name="backwpup_errors" content="0" />' .
 			'<meta name="backwpup_warnings" content="0" />' .
 			'<meta name="backwpup_jobtype" content="DBDUMP" />';
-		$content = $header . '<body>' . str_repeat( 'safe ', 300 ) . ' password: hidden-value https://provider.example.test/private</body>';
-		$files   = array(
-			'backwpup_log_plain.html'    => $content,
-			'backwpup_log_gzip.html.gz'  => gzencode( $content ),
-			'backwpup_log_bzip.html.bz2' => bzcompress( $content ),
-		);
+		return $header . '<body>' . str_repeat( 'safe ', 300 ) . ' password: hidden-value https://provider.example.test/private</body>';
+	}
+
+	/**
+	 * @param array $files Log basename to file contents, as BackWPup stores them.
+	 * @return void
+	 */
+	private function assert_logs_stream_bounded_excerpts( $files ) {
+		$temp_dir = wp_tempnam( 'mainwp-backwpup-v2-compressed-log' );
+		$this->assertIsString( $temp_dir );
+		wp_delete_file( $temp_dir );
+		$this->assertTrue( wp_mkdir_p( $temp_dir ) );
 		foreach ( $files as $name => $bytes ) {
 			$this->assertIsString( $bytes );
 			file_put_contents( trailingslashit( $temp_dir ) . $name, $bytes ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_file_put_contents -- Disposable fixture.
@@ -1135,7 +1183,7 @@ class Test_MainWP_Child_Back_WP_Up_Abilities_V2 extends WP_UnitTestCase {
 		};
 
 		$rows = $this->invoke_provider( $fixture, 'abilities_v2_provider_list_logs', array( 'all' ) );
-		$this->assertCount( 3, $rows );
+		$this->assertCount( count( $files ), $rows );
 		foreach ( $rows as $row ) {
 			$excerpt = $this->invoke_provider( $fixture, 'abilities_v2_provider_read_log', array( $row['target'], 0, 100 ) );
 			$this->assertIsArray( $excerpt );

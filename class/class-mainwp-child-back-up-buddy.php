@@ -1863,6 +1863,12 @@ class MainWP_Child_Back_Up_Buddy { //phpcs:ignore -- NOSONAR - multi methods.
                 return false;
             }
             require_once $backup_class_file; // NOSONAR - WP compatible.
+            if ( ! class_exists( '\\pb_backupbuddy_backup' ) ) {
+                // A file that loaded without defining the class leaves the same uncatchable ending
+                // as a missing one: instantiating an undefined class is an Error nothing here
+                // catches, so the caller's effect_failed path would be skipped just the same.
+                return false;
+            }
         }
         $backup = new \pb_backupbuddy_backup();
         return method_exists( $backup, 'start_backup_process' ) && true === $backup->start_backup_process( $profile, 'manual', array(), $steps, '', $serial, array(), '', '' );

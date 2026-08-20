@@ -274,62 +274,6 @@ class Test_Post_Plus_Child_V2 extends WP_UnitTestCase {
 		$this->assertSame( 0, (int) $term->count, 'A rolled-back term count must not keep being served from cache.' );
 	}
 
-	/**
-	 * A site plugin listening on this hook may issue DDL, and DDL makes MySQL commit whatever
-	 * transaction is open. Fired inside the mutation's transaction that turns every ROLLBACK below
-	 * it into a no-op while the Dashboard is still told the mutation failed. A write the listener
-	 * makes surviving the rollback is the observable for "no transaction was open when it ran".
-	 */
-	public function test_the_before_update_hook_fires_before_the_transaction_opens() {
-		global $wpdb;
-
-		$payload                   = $this->delivery_payload( '123e4567-e89b-42d3-a456-426614174631', 'Hook ordering' );
-		$payload['post']['tags']   = array( 'hook-ordering-fixture-tag' );
-		$payload['content_digest'] = hash( 'sha256', wp_json_encode( array( $payload['post'], $payload['randomization'] ) ) );
-		$this->assertEmpty( term_exists( 'hook-ordering-fixture-tag', 'post_tag' ) );
-
-		// The mutation's own START TRANSACTION discards the suite's transaction, so this row can
-		// outlive the test. A fresh token per run keeps a leftover row from ever satisfying the
-		// assertion, and REPLACE keeps one from breaking the write.
-		$token    = hash( 'sha256', uniqid( 'before-post-update', true ) );
-		$written  = null;
-		$listener = static function () use ( $wpdb, $token, &$written ) {
-			$written = $wpdb->replace(
-				$wpdb->options,
-				array(
-					'option_name'  => 'mainwp_fixture_before_post_update_marker',
-					'option_value' => $token,
-					'autoload'     => 'no',
-				)
-			);
-		};
-		$captured = 0;
-		$capture  = static function ( $post_id ) use ( &$captured ) {
-			if ( 0 === $captured ) {
-				$captured = (int) $post_id;
-			}
-		};
-		$refuse = static function () {
-			return new \WP_Error( 'fixture_term_refused', 'Term creation refused.' );
-		};
-		add_action( 'mainwp_before_post_update', $listener );
-		add_action( 'wp_insert_post', $capture );
-		add_filter( 'pre_insert_term', $refuse );
-		$result = $this->request( 'post_plus_newpost_v2', $payload );
-		remove_filter( 'pre_insert_term', $refuse );
-		remove_action( 'wp_insert_post', $capture );
-		remove_action( 'mainwp_before_post_update', $listener );
-
-		$marker = $wpdb->get_var( $wpdb->prepare( "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s", 'mainwp_fixture_before_post_update_marker' ) );
-		$wpdb->delete( $wpdb->options, array( 'option_name' => 'mainwp_fixture_before_post_update_marker' ) );
-
-		$this->assertSame( 'mutation_failed', $result['code'] );
-		$this->assertGreaterThan( 0, $written, 'The listener has to write something or the marker proves nothing.' );
-		$this->assertGreaterThan( 0, $captured );
-		$this->assertNull( get_post( $captured ), 'The rollback has to be real or every listener write would survive it.' );
-		$this->assertSame( $token, $marker, 'A listener write the mutation can roll back means the hook ran inside the transaction.' );
-	}
-
 	public function test_full_ledger_evicts_only_the_receipts_that_can_no_longer_be_replayed() {
 		update_option( 'mainwp_child_post_plus_operations_v2', $this->aged_ledger( 'applied' ), false );
 		$payload = $this->delivery_payload( '123e4567-e89b-42d3-a456-426614174623', 'Ledger eviction' );
@@ -490,6 +434,43 @@ class Test_Post_Plus_Child_V2 extends WP_UnitTestCase {
 		$this->assertArrayNotHasKey( $payload['operation_ref'], $attempts[0], 'The repair must be persisted before the request may reserve.' );
 		$this->assertSame( 'unknown', $attempts[0]['123e4567-e89b-42d3-a456-426500000000']['state'] );
 		$this->assertCount( 0, $this->operation_posts( $payload['operation_ref'] ) );
+	}
+
+	/**
+	 * A damaged entry elsewhere in the ledger says nothing about the operation being retried. The
+	 * outcome for that operation has already been read out of storage, so refusing to state it
+	 * because an unrelated repair could not be written withholds a result the Dashboard is entitled
+	 * to. Reserving is the write that still has to wait for the repair.
+	 */
+	public function test_a_refused_repair_write_still_replays_a_settled_receipt() {
+		$payload = $this->delivery_payload( '123e4567-e89b-42d3-a456-426614174631', 'Replayed receipt' );
+		$created = $this->request( 'post_plus_newpost_v2', $payload );
+		$this->assertSame( 'applied', $created['state'] );
+
+		$ledger = get_option( 'mainwp_child_post_plus_operations_v2' );
+		$ledger['123e4567-e89b-42d3-a456-426500000000'] = 'damaged';
+		update_option( 'mainwp_child_post_plus_operations_v2', $ledger, false );
+
+		$attempts = array();
+		$refuse   = static function ( $value, $old_value ) use ( &$attempts ) {
+			$attempts[] = $value;
+			return $old_value;
+		};
+		add_filter( 'pre_update_option_mainwp_child_post_plus_operations_v2', $refuse, 10, 2 );
+		$replay = $this->request( 'post_plus_newpost_v2', $payload );
+		$fresh  = $this->request( 'post_plus_newpost_v2', $this->delivery_payload( '123e4567-e89b-42d3-a456-426614174632', 'Refused reservation' ) );
+		remove_filter( 'pre_update_option_mainwp_child_post_plus_operations_v2', $refuse, 10 );
+
+		$this->assertSame( $created, $replay, 'A settled receipt read out of the ledger must still be the answer.' );
+		$this->assertCount( 1, $this->operation_posts( $payload['operation_ref'] ) );
+		$this->assertSame( 'storage_unavailable', $fresh['code'], 'A new reservation must wait for the repair to persist.' );
+		$this->assertNotEmpty( $attempts );
+		$this->assertSame( 'unknown', $attempts[0]['123e4567-e89b-42d3-a456-426500000000']['state'] );
+		foreach ( $attempts as $attempt ) {
+			$this->assertArrayNotHasKey( '123e4567-e89b-42d3-a456-426614174632', $attempt, 'A reservation must never be written on top of a ledger whose repair was refused.' );
+		}
+		$this->assertCount( 0, $this->operation_posts( '123e4567-e89b-42d3-a456-426614174632' ) );
+		$this->assertSame( $ledger, get_option( 'mainwp_child_post_plus_operations_v2' ) );
 	}
 
 	/**

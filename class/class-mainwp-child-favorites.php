@@ -27,11 +27,14 @@ class MainWP_Child_Favorites {
     const INSTALL_LOCK_OPTION = 'mainwp_child_favorites_install_lock';
 
     /**
-     * Lane owner token of the request currently installing.
+     * Exact lane row this request wrote, empty while it holds no lane.
+     *
+     * The owner token inside it is what stops the release from dropping a lane that expired and
+     * was already taken over by the next request.
      *
      * @var string
      */
-    private $install_lock_owner = '';
+    private $install_lock_claim = '';
 
     /**
      * Handle the package-state callable.
@@ -245,58 +248,130 @@ class MainWP_Child_Favorites {
     /**
      * Take the single install lane, or report it busy.
      *
+     * The winner is decided by the unique index on `wp_options.option_name`, the way core's
+     * `WP_Upgrader::create_lock` decides it: the insert either creates the row or loses to whoever
+     * created it first, so no two requests can both read the lane free and both write themselves
+     * into it. `wp_sitemeta` carries no such constraint, which is why this is not a site option.
+     *
+     * The cost is scope. On multisite every subsite has its own options table while the plugins
+     * directory is shared network-wide, so the lane serialises installs within one site and says
+     * nothing about a subsite racing its siblings; core's own plugin-install lock draws that same
+     * boundary. What it does guarantee is one install at a time per site, and a lane that a killed
+     * request cannot hold past its expiry.
+     *
      * @return bool Whether this request owns the lane.
      */
     protected function begin_install_lock() {
-        $now      = time();
-        $existing = get_site_option( self::INSTALL_LOCK_OPTION, null );
-        if ( is_array( $existing ) && isset( $existing['expires_at'] ) && is_int( $existing['expires_at'] ) && $existing['expires_at'] >= $now ) {
-            return false;
-        }
-        // An abandoned lane is only free once its row is actually gone: a delete that did not take
-        // leaves the previous holder's marker readable, and overwriting it would hand two requests
-        // the same lane.
-        if ( null !== $existing && ( ! delete_site_option( self::INSTALL_LOCK_OPTION ) || null !== get_site_option( self::INSTALL_LOCK_OPTION, null ) ) ) {
-            return false;
-        }
-        // The check above and the write below are not one operation, so two racers arriving within
-        // these few statements can both come away holding the lane: each read it free before either
-        // wrote, and the read-back below only catches whichever one got overwritten. Closing that
-        // needs an atomic insert, the way core's WP_Upgrader::create_lock uses INSERT IGNORE. This
-        // is a bounded known limit, not an oversight: the window two installs can collide in shrinks
-        // from the whole download-unpack-activate sequence to these few statements.
-        $owner = wp_generate_uuid4();
-        $lock  = array(
-            'owner'      => $owner,
-            // Long enough to cover a download, an unpack and an activation; short enough that a
-            // request killed mid-install frees the lane on its own instead of wedging it.
-            'expires_at' => $now + 15 * MINUTE_IN_SECONDS,
+        $now   = time();
+        $claim = wp_json_encode(
+            array(
+                'owner'      => wp_generate_uuid4(),
+                // Long enough to cover a download, an unpack and an activation; short enough that a
+                // request killed mid-install frees the lane on its own instead of wedging it.
+                'expires_at' => $now + 15 * MINUTE_IN_SECONDS,
+            )
         );
-        // add_site_option cannot fail closed on its own, so reading the owner back is what proves
-        // this request holds the lane rather than a racer that wrote over it.
-        if ( ! add_site_option( self::INSTALL_LOCK_OPTION, $lock ) || get_site_option( self::INSTALL_LOCK_OPTION, null ) !== $lock ) {
+        if ( ! is_string( $claim ) ) {
             return false;
         }
-        $this->install_lock_owner = $owner;
+        if ( $this->claim_install_lock( $claim ) ) {
+            $this->install_lock_claim = $claim;
+            return true;
+        }
+        $held = $this->read_install_lock();
+        // Nothing to read means the insert lost to something this request cannot see, so report busy
+        // and leave the decision to the next request, which will have a row to decide against.
+        if ( ! is_string( $held ) || '' === $held ) {
+            return false;
+        }
+        $lock = $this->install_lock_value( $held );
+        if ( null !== $lock && $lock['expires_at'] >= $now ) {
+            return false;
+        }
+        // An unparseable row is taken over on the same terms as an expired one. A lane row is not a
+        // receipt: a receipt carries evidence about an effect that may already have happened, which
+        // is why this file refuses to forget one, whereas a lane row only asserts that some request
+        // held the lane, and a row nobody can parse does not even assert that. It cannot be honored
+        // and it cannot be shown live, so refusing on its behalf protects nothing and costs every
+        // install after it.
+        // Either way the takeover runs against the exact row that was found. Core's release_lock
+        // deletes unconditionally, which would drop whatever a racer put there in the meantime;
+        // matching the value means only one racer gets to clear it, and the insert below still has
+        // to win on its own.
+        if ( ! $this->drop_install_lock( $held ) || ! $this->claim_install_lock( $claim ) ) {
+            return false;
+        }
+        $this->install_lock_claim = $claim;
         return true;
     }
 
     /**
      * Release the install lane this request owns.
      *
+     * The delete matches the exact row this request wrote, so a lane that ran past its expiry and
+     * was taken over meanwhile stays with its new owner.
+     *
      * @return bool Whether the release was verified.
      */
     protected function end_install_lock() {
-        $lock                     = get_site_option( self::INSTALL_LOCK_OPTION, null );
-        $owner                    = $this->install_lock_owner;
-        $this->install_lock_owner = '';
-        // Never drop a lane this request does not hold: after an expiry the marker belongs to
-        // whoever took it next.
-        if ( '' === $owner || ! is_array( $lock ) || ! isset( $lock['owner'] ) || ! is_string( $lock['owner'] ) || ! hash_equals( $owner, $lock['owner'] ) ) {
-            return false;
+        $claim                    = $this->install_lock_claim;
+        $this->install_lock_claim = '';
+        return '' !== $claim && $this->drop_install_lock( $claim );
+    }
+
+    /** Create the lane row, letting the unique option name pick the winner. */
+    private function claim_install_lock( $claim ) {
+        global $wpdb;
+        // 'no' reads as not-autoloaded on every supported WordPress version; the 'off' token core
+        // writes today does not exist before 6.6.
+        // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- The options API cannot express an insert that loses instead of overwriting.
+        $inserted = $wpdb->query( $wpdb->prepare( "INSERT IGNORE INTO $wpdb->options ( option_name, option_value, autoload ) VALUES ( %s, %s, 'no' )", self::INSTALL_LOCK_OPTION, $claim ) );
+        $this->forget_install_lock_cache();
+        return 1 === (int) $inserted;
+    }
+
+    /** Read the lane row itself rather than a per-process cache of it. */
+    private function read_install_lock() {
+        global $wpdb;
+        // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- A lane decision has to ask the row that other requests are competing for.
+        return $wpdb->get_var( $wpdb->prepare( "SELECT option_value FROM $wpdb->options WHERE option_name = %s LIMIT 1", self::INSTALL_LOCK_OPTION ) );
+    }
+
+    /** Delete one exact lane row, leaving any other holder's row where it is. */
+    private function drop_install_lock( $claim ) {
+        global $wpdb;
+        // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- delete_option() cannot condition on the value, which is the whole owner check.
+        $deleted = $wpdb->query( $wpdb->prepare( "DELETE FROM $wpdb->options WHERE option_name = %s AND option_value = %s", self::INSTALL_LOCK_OPTION, $claim ) );
+        $this->forget_install_lock_cache();
+        return 1 === (int) $deleted;
+    }
+
+    /** Parse one lane row into its owner and expiry. */
+    private function install_lock_value( $raw ) {
+        if ( ! is_string( $raw ) || '' === $raw ) {
+            return null;
         }
-        delete_site_option( self::INSTALL_LOCK_OPTION );
-        return null === get_site_option( self::INSTALL_LOCK_OPTION, null );
+        $lock = json_decode( $raw, true );
+        if ( ! is_array( $lock ) || ! isset( $lock['owner'], $lock['expires_at'] ) || ! is_string( $lock['owner'] ) || ! is_int( $lock['expires_at'] ) ) {
+            return null;
+        }
+        return $lock;
+    }
+
+    /**
+     * Correct the options cache for a row this class writes with SQL.
+     *
+     * Reads answer "no such option" straight out of the notoptions bucket, so a lane row inserted
+     * behind the options API stays invisible to every later get_option() in the request unless
+     * that bucket is corrected. Core's upgrader lock inherits that staleness; this one does not.
+     */
+    private function forget_install_lock_cache() {
+        wp_cache_delete( self::INSTALL_LOCK_OPTION, 'options' );
+        $notoptions = wp_cache_get( 'notoptions', 'options' );
+        if ( is_array( $notoptions ) && isset( $notoptions[ self::INSTALL_LOCK_OPTION ] ) ) {
+            unset( $notoptions[ self::INSTALL_LOCK_OPTION ] );
+            wp_cache_set( 'notoptions', $notoptions, 'options' );
+        }
     }
 
     /** Return one stored install result without dispatching. */

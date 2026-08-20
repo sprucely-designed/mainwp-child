@@ -258,12 +258,16 @@ class Test_MainWP_Child_Code_Snippets_V2 extends WP_UnitTestCase {
 		$this->assertStringStartsWith( $result['output'], $full );
 	}
 
-	/** Output carrying an invalid byte reports the text around it rather than nothing. */
+	/**
+	 * Output carrying an invalid byte reports the text around it rather than nothing, and says so:
+	 * the run is far short of the byte cap, so only the strip can account for the missing byte.
+	 */
 	public function test_invalid_bytes_in_output_do_not_discard_the_valid_text() {
 		$result = $this->fixture->snippet_v2( 'run_snippet_v2', $this->request( 'R', 'echo "before" . chr( 0xC3 ) . "after";' ) );
 
 		$this->assertSame( 'succeeded', $result['status'] );
-		$this->assertFalse( $result['output_truncated'] );
+		$this->assertLessThan( 65535, strlen( $result['output'] ), 'The cap cannot be what shortened this output.' );
+		$this->assertTrue( $result['output_truncated'], 'Dropping bytes and reporting a complete output is the dishonest answer.' );
 		$this->assertStringContainsString( 'before', $result['output'] );
 		$this->assertStringContainsString( 'after', $result['output'] );
 		$this->assertSame( 1, preg_match( '//u', $result['output'] ), 'What is reported must be valid UTF-8.' );

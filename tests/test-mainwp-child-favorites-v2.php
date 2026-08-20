@@ -216,13 +216,7 @@ class Test_MainWP_Child_Favorites_V2 extends WP_UnitTestCase {
 
 	public function test_a_second_install_is_refused_while_the_install_lane_is_held() {
 		$subject = new Testable_MainWP_Child_Favorites_V2( array(), array(), array() );
-		update_site_option(
-			'mainwp_child_favorites_install_lock',
-			array(
-				'owner'      => '123e4567-e89b-42d3-a456-426614173030',
-				'expires_at' => time() + 300,
-			)
-		);
+		$this->assertTrue( add_option( 'mainwp_child_favorites_install_lock', $this->lane_row( '123e4567-e89b-42d3-a456-426614173030', time() + 300 ), '', false ) );
 
 		$result = $subject->install_verified_v2( $this->install_request() );
 
@@ -232,19 +226,73 @@ class Test_MainWP_Child_Favorites_V2 extends WP_UnitTestCase {
 		$this->assertSame( 0, $subject->install_count );
 		$this->assertSame( array(), $subject->receipts );
 
-		delete_site_option( 'mainwp_child_favorites_install_lock' );
+		delete_option( 'mainwp_child_favorites_install_lock' );
+	}
+
+	/**
+	 * The lane is only a lane if the database decides who holds it. This seeds a live lane row and
+	 * then puts the options cache in the state a SQL-written row really can leave it in, where
+	 * get_option() reports the option missing. An acquirer that decides from that read takes the
+	 * lane and overwrites the holder; one that decides from an insert against the unique option
+	 * name cannot, whatever the read says.
+	 */
+	public function test_the_install_lane_is_decided_by_the_row_not_by_a_cached_read() {
+		global $wpdb;
+
+		$held = $this->lane_row( '123e4567-e89b-42d3-a456-426614173032', time() + 300 );
+		$this->assertSame( 1, $wpdb->query( $wpdb->prepare( "INSERT INTO $wpdb->options ( option_name, option_value, autoload ) VALUES ( %s, %s, 'no' )", 'mainwp_child_favorites_install_lock', $held ) ) );
+		wp_cache_delete( 'mainwp_child_favorites_install_lock', 'options' );
+		wp_cache_set( 'notoptions', array( 'mainwp_child_favorites_install_lock' => true ), 'options' );
+		$this->assertFalse( get_option( 'mainwp_child_favorites_install_lock', false ) );
+
+		$subject = new Testable_MainWP_Child_Favorites_V2( array(), array(), array() );
+		$result  = $subject->install_verified_v2( $this->install_request() );
+
+		$this->assertSame( 'lock_busy', $result['code'] );
+		$this->assertSame( 0, $subject->download_count );
+		$this->assertSame( 0, $subject->install_count );
+		$this->assertSame( $held, $wpdb->get_var( $wpdb->prepare( "SELECT option_value FROM $wpdb->options WHERE option_name = %s", 'mainwp_child_favorites_install_lock' ) ) );
+		// The refused acquire also left the cache agreeing with the row instead of still lying.
+		$this->assertSame( $held, get_option( 'mainwp_child_favorites_install_lock', false ) );
+
+		delete_option( 'mainwp_child_favorites_install_lock' );
+	}
+
+	/**
+	 * A lane row is not a receipt. A receipt carries evidence about an effect that may already have
+	 * happened, so this file refuses to forget one; a lane row only asserts that some request held
+	 * the lane, and a row nobody can parse does not even assert that. Refusing on its behalf would
+	 * brick installs permanently with no operator escape.
+	 */
+	public function test_an_unparseable_lane_row_is_taken_over_instead_of_refusing_forever() {
+		$this->assertTrue( add_option( 'mainwp_child_favorites_install_lock', 'not-a-lane-row', '', false ) );
+
+		$subject = new Testable_MainWP_Child_Favorites_V2( array(), array(), array() );
+		$result  = $subject->install_verified_v2( $this->install_request() );
+
+		$this->assertTrue( $result['ok'] );
+		$this->assertSame( 'completed', $result['status'] );
+		$this->assertSame( 1, $subject->install_count );
+		// Taken over, not ignored: the unreadable row was gone and this request's own lane stood in
+		// its place while the package was fetched.
+		$this->assertIsArray( $subject->lock_during_download );
+		$this->assertArrayHasKey( 'owner', $subject->lock_during_download );
+		$this->assertFalse( get_option( 'mainwp_child_favorites_install_lock', false ) );
 	}
 
 	public function test_a_failed_install_releases_the_lane_for_the_next_request() {
 		$subject                            = new Testable_MainWP_Child_Favorites_V2( array(), array(), array() );
 		$subject->downloaded_package_digest = str_repeat( 'b', 64 );
+		// Caches "no such option" first, so the lane read taken mid-install has to survive the
+		// notoptions bucket rather than be served by it.
+		$this->assertFalse( get_option( 'mainwp_child_favorites_install_lock', false ) );
 
 		$failed = $subject->install_verified_v2( $this->install_request() );
 
 		$this->assertSame( 'digest_mismatch', $failed['code'] );
 		// Releasing only means something if the lane was actually held while the package was fetched.
 		$this->assertIsArray( $subject->lock_during_download );
-		$this->assertFalse( get_site_option( 'mainwp_child_favorites_install_lock', false ) );
+		$this->assertFalse( get_option( 'mainwp_child_favorites_install_lock', false ) );
 
 		$subject->downloaded_package_digest = str_repeat( 'a', 64 );
 		$retry                              = $this->install_request();
@@ -426,6 +474,15 @@ class Test_MainWP_Child_Favorites_V2 extends WP_UnitTestCase {
 		);
 	}
 
+	private function lane_row( $owner, $expires_at ) {
+		return wp_json_encode(
+			array(
+				'owner'      => $owner,
+				'expires_at' => $expires_at,
+			)
+		);
+	}
+
 	private function state_request( $type, $slug ) {
 		return array(
 			'protocol'    => '2',
@@ -501,7 +558,8 @@ class Testable_MainWP_Child_Favorites_V2 extends MainWP_Child_Favorites {
 	protected function download_package( $url ) {
 		unset( $url );
 		++$this->download_count;
-		$this->lock_during_download = get_site_option( 'mainwp_child_favorites_install_lock', false );
+		$held                       = get_option( 'mainwp_child_favorites_install_lock', '' );
+		$this->lock_during_download = is_string( $held ) && '' !== $held ? json_decode( $held, true ) : false;
 		return '/private/tmp/favorites-fixture.zip';
 	}
 

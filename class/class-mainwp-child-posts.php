@@ -582,11 +582,10 @@ class MainWP_Child_Posts { //phpcs:ignore -- NOSONAR - multi methods.
             // A quarantine is stamped at first observation, so an unpersisted repair is re-stamped on
             // every request and can never grow old enough to be evicted or pruned - a ledger of damaged
             // entries would refuse every mutation forever. Persisting it here freezes those timestamps
-            // and lets the entries age out normally, and a refused write must fail this request rather
-            // than put the request back on that loop.
-            $records = $this->content_v2_prune_records( $protocol, $records, $repaired );
-            if ( false === $records ) {
-                return $this->content_v2_error( $protocol, $operation, 'storage_unavailable' );
+            // and lets the entries age out normally.
+            $pruned = $this->content_v2_prune_records( $protocol, $records, $repaired );
+            if ( false !== $pruned ) {
+                $records = $pruned;
             }
 
             $operation_ref = $normalized['operation_ref'];
@@ -594,6 +593,20 @@ class MainWP_Child_Posts { //phpcs:ignore -- NOSONAR - multi methods.
                 if ( ! hash_equals( $records[ $operation_ref ]['dashboard_ref'], $normalized['dashboard_ref'] ) || ! hash_equals( $records[ $operation_ref ]['effect_hash'], $effect_hash ) ) {
                     return $this->content_v2_error( $protocol, $operation, 'request_conflict' );
                 }
+                // A settled receipt is answered from the ledger already read, writing nothing and
+                // changing nothing, so a repair that could not be stored has no bearing on it -
+                // refusing to state an outcome we are holding would be the worse failure.
+                if ( 'reserved' !== $records[ $operation_ref ]['state'] && ! $records[ $operation_ref ]['retryable'] ) {
+                    return $this->content_v2_project( $protocol, $operation, $records[ $operation_ref ] );
+                }
+            }
+            // Everything past here writes, and reserving on top of a ledger whose repair was refused is
+            // what puts the store back on the re-stamping loop above.
+            if ( false === $pruned ) {
+                return $this->content_v2_error( $protocol, $operation, 'storage_unavailable' );
+            }
+
+            if ( isset( $records[ $operation_ref ] ) ) {
                 if ( 'reserved' === $records[ $operation_ref ]['state'] ) {
                     $record = $this->content_v2_reconcile_reserved( $protocol, $records[ $operation_ref ], $records, 'reserved' );
                     if ( false === $record ) {
@@ -602,15 +615,13 @@ class MainWP_Child_Posts { //phpcs:ignore -- NOSONAR - multi methods.
                     if ( 'reserved' !== $record['state'] ) {
                         return $this->content_v2_project( $protocol, $operation, $record );
                     }
-                } elseif ( 'not_applied' === $records[ $operation_ref ]['state'] && $records[ $operation_ref ]['retryable'] ) {
+                } else {
                     $records[ $operation_ref ]['state']      = 'reserved';
                     $records[ $operation_ref ]['retryable']  = false;
                     $records[ $operation_ref ]['updated_at'] = time();
                     if ( ! $this->content_v2_write_records( $protocol, $records ) ) {
                         return $this->content_v2_error( $protocol, $operation, 'storage_unavailable' );
                     }
-                } else {
-                    return $this->content_v2_project( $protocol, $operation, $records[ $operation_ref ] );
                 }
             } elseif ( $normalized['expires_at'] < time() - 60 ) {
                 return $this->content_v2_error( $protocol, $operation, 'expired_request' );
@@ -996,6 +1007,9 @@ class MainWP_Child_Posts { //phpcs:ignore -- NOSONAR - multi methods.
         }
         $old_post   = 'update' === $normalized['mode'] ? get_post( $normalized['target_post_id'] ) : null;
         $old_status = $old_post instanceof \WP_Post ? $old_post->post_status : '';
+        if ( false === $wpdb->query( 'START TRANSACTION' ) ) { // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+            return $this->content_v2_error( $protocol, $operation, 'storage_unavailable' );
+        }
 
         $postarr = array(
             'post_type'      => $normalized['post']['post_type'],
@@ -1020,10 +1034,11 @@ class MainWP_Child_Posts { //phpcs:ignore -- NOSONAR - multi methods.
             $postarr['ID'] = $normalized['target_post_id'];
         }
 
-        // Site plugins listen here, and a listener that issues DDL triggers MySQL's implicit
-        // commit. Inside the transaction that would silently turn every ROLLBACK below into a
-        // no-op: the post stays durable while the Dashboard is told the mutation failed. So the
-        // notification fires first and the transaction opens around the writes only.
+        // Known hazard: a site listener that issues DDL trips MySQL's implicit commit, after which
+        // content_v2_rollback() is a no-op and this request can still answer mutation_failed for a
+        // post that is already durable. Firing the hook outside the transaction is not the fix - the
+        // listener's own writes would then survive the rollback and run again on the Dashboard retry,
+        // which is a common cost paid for a rare one.
         $hook_post = $postarr;
         unset( $hook_post['meta_input'] );
         do_action(
@@ -1034,10 +1049,6 @@ class MainWP_Child_Posts { //phpcs:ignore -- NOSONAR - multi methods.
             implode( ',', $normalized['post']['tags'] ),
             array()
         );
-
-        if ( false === $wpdb->query( 'START TRANSACTION' ) ) { // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
-            return $this->content_v2_error( $protocol, $operation, 'storage_unavailable' );
-        }
 
         $post_id = wp_insert_post( wp_slash( $postarr ), true );
         if ( is_wp_error( $post_id ) || ! is_int( $post_id ) || 1 > $post_id ) {

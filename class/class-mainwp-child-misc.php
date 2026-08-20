@@ -946,10 +946,15 @@ class MainWP_Child_Misc {
         // next to 'succeeded'. Returning the valid text is the truthful half of that choice.
         // Stripping runs before the cap because it can change the byte length, and the cap has to
         // describe what actually ships.
-        $output    = wp_check_invalid_utf8( $output, true );
-        $truncated = 65535 < strlen( $output );
-        if ( $truncated ) {
-            $output = $this->snippet_v2_cut_utf8( $output, 65535 );
+        $produced = $output;
+        $output   = wp_check_invalid_utf8( $output, true );
+        // output_truncated is the only field saying the shipped text is not what the run produced,
+        // so it covers bytes the strip removed as well as bytes the cap cut. It does not mean
+        // "cut at the end"; a scrubbed run can lose bytes from the middle and stay under the cap.
+        $truncated = $output !== $produced;
+        if ( 65535 < strlen( $output ) ) {
+            $output    = $this->snippet_v2_cut_utf8( $output, 65535 );
+            $truncated = true;
         }
         return array(
             'status'           => $status,

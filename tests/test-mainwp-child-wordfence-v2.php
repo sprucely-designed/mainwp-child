@@ -293,7 +293,13 @@ class Test_MainWP_Child_Wordfence_V2 extends WP_UnitTestCase {
 	private function hold_lock_elsewhere( $name ) {
 		$other = new \wpdb( DB_USER, DB_PASSWORD, DB_NAME, DB_HOST );
 		$other->suppress_errors( true );
-		$this->assertSame( '1', (string) $other->get_var( $other->prepare( 'SELECT GET_LOCK(%s,0)', $name ) ) );
+		$held = (string) $other->get_var( $other->prepare( 'SELECT GET_LOCK(%s,0)', $name ) );
+		if ( '1' !== $held ) {
+			// A lock this connection never took needs no release, but the connection is ours either
+			// way and a failing assertion would otherwise strand it for the rest of the run.
+			$other->close();
+		}
+		$this->assertSame( '1', $held );
 		return $other;
 	}
 

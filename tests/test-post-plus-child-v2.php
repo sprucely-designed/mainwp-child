@@ -126,8 +126,14 @@ class Test_Post_Plus_Child_V2 extends WP_UnitTestCase {
 
 		// get_post_meta() hands back meta_id order, so the ranking is only exercised when the
 		// ordinary key is read after the featured image.
-		$keys = array_keys( get_post_meta( $post_id ) );
-		$this->assertGreaterThan( array_search( '_thumbnail_id', $keys, true ), array_search( 'fixture_ordinary_meta', $keys, true ) );
+		$keys     = array_keys( get_post_meta( $post_id ) );
+		$featured = array_search( '_thumbnail_id', $keys, true );
+		$ordinary = array_search( 'fixture_ordinary_meta', $keys, true );
+		// A missing key returns false, and false compares below any position, so the ordering
+		// assertion would pass while the fixture had quietly stopped exercising the ranking.
+		$this->assertIsInt( $featured );
+		$this->assertIsInt( $ordinary );
+		$this->assertGreaterThan( $featured, $ordinary );
 		$this->assertSame( 'unsupported_media', $this->source_compatibility( $post_id ) );
 
 		add_post_meta( $post_id, '_elementor_data', '[]' );

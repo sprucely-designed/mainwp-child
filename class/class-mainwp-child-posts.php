@@ -1156,7 +1156,7 @@ class MainWP_Child_Posts { //phpcs:ignore -- NOSONAR - multi methods.
             }
         }
 
-        $wpdb->query( 'ROLLBACK' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
+        $wpdb->query( 'ROLLBACK' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery -- Transaction control has no wpdb wrapper, and caching a ROLLBACK is meaningless.
 
         foreach ( $touched as $id ) {
             clean_post_cache( $id );

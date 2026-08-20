@@ -394,6 +394,23 @@ class MainWP_Child_Comments {
                 continue;
             }
 
+            // The claim guarded the swap, not the WordPress transition that follows it. Core updates
+            // the row by ID alone, so anything that moved the comment since the claim would be
+            // overwritten rather than seen. Confirming the claim is still held immediately before the
+            // call refuses that instead.
+            $owned = $this->holds_v2_claim( $item['comment_id'] );
+            if ( null === $owned ) {
+                $this->release_v2_claim( $comment );
+                $results[] = $this->moderation_result( $item['comment_id'], 'failed', $before, $this->current_v2_status( $item['comment_id'] ), 'status_unavailable', 'The comment status could not be verified.' );
+                continue;
+            }
+            if ( ! $owned ) {
+                $this->release_v2_claim( $comment );
+                $current   = $this->current_v2_status( $item['comment_id'] );
+                $results[] = $this->moderation_result( $item['comment_id'], 'conflict', $current, $current, 'status_conflict', 'The comment status changed before moderation.' );
+                continue;
+            }
+
             $changed = $this->apply_v2_moderation( $request['action'], $comment );
             $after   = $this->current_v2_status( $item['comment_id'] );
             if ( true === $changed && $this->moderation_post_state_matches( $request['action'], $after ) ) {
@@ -462,6 +479,21 @@ class MainWP_Child_Comments {
             if ( false === $claimed ) {
                 $current   = $this->current_v2_status( $item['comment_id'] );
                 $results[] = $this->deletion_result( $item['comment_id'], 'conflict', $current, (bool) get_comment( $item['comment_id'] ), 'status_conflict', 'The comment is not in trash.' );
+                continue;
+            }
+
+            // A forced delete removes the row whatever it now holds, so losing the claim between the
+            // swap and this call would destroy a comment another actor had just put back. Nothing is
+            // deleted unless this request still owns the claim it took.
+            $owned = $this->holds_v2_claim( $item['comment_id'] );
+            if ( null === $owned ) {
+                $this->release_v2_claim( $comment );
+                $results[] = $this->deletion_result( $item['comment_id'], 'failed', $before, (bool) get_comment( $item['comment_id'] ), 'delete_failed', 'Permanent deletion could not be verified.' );
+                continue;
+            }
+            if ( ! $owned ) {
+                $this->release_v2_claim( $comment );
+                $results[] = $this->deletion_result( $item['comment_id'], 'conflict', $this->current_v2_status( $item['comment_id'] ), (bool) get_comment( $item['comment_id'] ), 'status_conflict', 'The comment is not in trash.' );
                 continue;
             }
 
@@ -660,9 +692,10 @@ class MainWP_Child_Comments {
      *
      * WordPress has no conditional comment update, so the precondition is enforced by swapping the
      * row out of its observed status in a single guarded statement. Whoever wins the swap owns the
-     * transition; every other actor now sees a status that no longer matches what it read. The
-     * WordPress call that follows is handed the pre-claim comment, so core still performs the real
-     * transition, its trash metadata and its hooks with the correct prior status.
+     * transition; every other actor now sees a status that no longer matches what it read. The swap
+     * does not keep the row still afterwards, so holds_v2_claim() re-reads it right before core is
+     * called. The WordPress call that follows is handed the pre-claim comment, so core still performs
+     * the real transition, its trash metadata and its hooks with the correct prior status.
      *
      * @param \WP_Comment $comment Comment read during the precondition check.
      * @return bool|null True when claimed, false when the status already moved, null when the write could not be run.
@@ -693,6 +726,30 @@ class MainWP_Child_Comments {
         // row, but that gap is one statement wide against the whole WordPress transition that follows it.
         update_comment_meta( (int) $comment->comment_ID, self::CLAIM_META, (string) $comment->comment_approved . '|' . time() );
         return true;
+    }
+
+    /**
+     * Whether the comment row still holds the claim this request took.
+     *
+     * The claim only guards the swap into the holding value. Every WordPress transition and the
+     * forced delete address the row by ID alone, so a competing write landing after the claim would
+     * be silently overwritten by the call this check precedes. Reading the row back immediately
+     * before that call narrows the exposure to core's own read-modify-write; the remaining gap
+     * between this read and core's statement cannot be closed without reimplementing the transition.
+     *
+     * A row that has moved on, including one that no longer exists, is a claim this request no longer
+     * owns rather than a storage failure, so only an unusable $wpdb is reported as unverifiable.
+     *
+     * @param int $comment_id Comment ID.
+     * @return bool|null True while the claim is held, false once it is not, null when it could not be read.
+     */
+    private function holds_v2_claim( $comment_id ) {
+        global $wpdb;
+        if ( ! is_object( $wpdb ) || ! is_callable( array( $wpdb, 'get_var' ) ) || ! is_callable( array( $wpdb, 'prepare' ) ) ) {
+            return null;
+        }
+        $raw = $wpdb->get_var( $wpdb->prepare( "SELECT comment_approved FROM {$wpdb->comments} WHERE comment_ID = %d", $comment_id ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- The cached comment cannot answer whether the row still holds the claim.
+        return null !== $raw && self::CLAIM_STATUS === (string) $raw;
     }
 
     /**

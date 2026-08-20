@@ -1159,6 +1159,14 @@ class MainWP_Child_WP_Rocket {//phpcs:ignore -- NOSONAR - multi methods.
                 return $this->abilities_v2_error( $operation, 'request_conflict' );
             }
             if ( 'dispatching' !== $receipt['state'] ) {
+                // The effect hash binds what the request asked for, not what the stored answer says
+                // was done, and the store is a WordPress option. A settled success naming any other
+                // category list would assert an effect no receipt establishes, so it is refused for
+                // what it is: a store this request cannot read its outcome back from. Re-dispatching
+                // is not the alternative, because the receipt is evidence the work may already have run.
+                if ( ! $this->abilities_v2_response_binds_categories( $receipt['response'], $categories ) ) {
+                    return $this->abilities_v2_error( $operation, 'storage_unavailable' );
+                }
                 return $receipt['response'];
             }
             // A reservation nobody settled belongs to a request that either died before WP Rocket
@@ -1289,6 +1297,21 @@ class MainWP_Child_WP_Rocket {//phpcs:ignore -- NOSONAR - multi methods.
             && true === $response['ok']
             && 'requested' === $response['status']
             && is_array( $response['categories'] );
+    }
+
+    /**
+     * Whether a validated stored response still asserts exactly the categories this request carries.
+     *
+     * A refusal carries no category claim at all, so only a settled success has anything to bind.
+     * The comparison is order sensitive on purpose: the effect hash is taken over the ordered list,
+     * so the same list in another order is a different request, not the same one.
+     *
+     * @param array $response   Stored response that already passed receipt validation.
+     * @param array $categories Public category names this request carries.
+     * @return bool
+     */
+    private function abilities_v2_response_binds_categories( $response, $categories ) {
+        return ! array_key_exists( 'categories', $response ) || $response['categories'] === $categories;
     }
 
     /**

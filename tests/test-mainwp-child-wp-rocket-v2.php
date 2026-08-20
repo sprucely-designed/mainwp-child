@@ -496,6 +496,43 @@ class Test_MainWP_Child_WP_Rocket_V2 extends WP_UnitTestCase {
 		$this->assertSame( array(), $this->rocket->provider_calls );
 	}
 
+	/**
+	 * A replayed receipt may only assert the categories the request it answers actually binds.
+	 *
+	 * The effect hash covers the request's category list, not the stored answer's, and the receipt
+	 * store is a WordPress option. Without a binding check, an altered stored response lets an
+	 * authenticated retry be told ok/requested for categories nothing ever asked for or queued.
+	 */
+	public function test_a_receipt_never_replays_categories_the_request_does_not_bind() {
+		$request_ref = '123e4567-e89b-42d3-a456-426614174928';
+		$request     = array(
+			'protocol'    => '2',
+			'operation'   => 'optimize_database',
+			'request_ref' => $request_ref,
+			'payload'     => array( 'categories' => array( 'revisions' ) ),
+		);
+
+		foreach ( array( array( 'fabricated' ), array(), array( 'revisions', 'all_transients' ) ) as $tampered ) {
+			$this->store_receipt( $request_ref, $this->bound_receipt( array( 'revisions' ), $tampered ) );
+
+			$result = $this->invoke_transport( $request );
+
+			$this->assertFalse( $result['ok'], wp_json_encode( $result ) );
+			$this->assertSame( 'storage_unavailable', $result['error_code'] );
+			$this->assertArrayNotHasKey( 'categories', $result );
+			$this->assertSame( array(), $this->rocket->provider_calls, 'A receipt that may already have queued the work must not queue it again.' );
+		}
+
+		// The untouched receipt still replays, so the check binds the claim rather than refusing every retry.
+		$this->store_receipt( $request_ref, $this->bound_receipt( array( 'revisions' ), array( 'revisions' ) ) );
+		$replayed = $this->invoke_transport( $request );
+
+		$this->assertTrue( $replayed['ok'], wp_json_encode( $replayed ) );
+		$this->assertSame( 'requested', $replayed['status'] );
+		$this->assertSame( array( 'revisions' ), $replayed['categories'] );
+		$this->assertSame( array(), $this->rocket->provider_calls );
+	}
+
 	/** The receipt check and the dispatch it guards run under one held lock. */
 	public function test_the_optimization_runs_under_the_named_request_lock() {
 		$result = $this->invoke_v2(
@@ -556,6 +593,48 @@ class Test_MainWP_Child_WP_Rocket_V2 extends WP_UnitTestCase {
 			),
 			'accepted_at' => $accepted_at,
 		);
+	}
+
+	/**
+	 * Build a settled receipt bound to one request whose stored answer names another category list.
+	 *
+	 * @param array $requested Categories the request carries, and so the ones the effect hash binds.
+	 * @param array $answered  Categories the stored response asserts.
+	 * @return array
+	 */
+	private function bound_receipt( $requested, $answered ) {
+		$receipt                           = $this->settled_receipt( time() );
+		$receipt['effect_hash']            = $this->effect_hash( $requested );
+		$receipt['response']['categories'] = $answered;
+
+		return $receipt;
+	}
+
+	/**
+	 * Put one receipt in the store under the given reference.
+	 *
+	 * @param string $request_ref Request reference.
+	 * @param array  $receipt     Receipt to store.
+	 * @return void
+	 */
+	private function store_receipt( $request_ref, $receipt ) {
+		update_option( 'mainwp_wp_rocket_abilities_v2_receipts', array( $request_ref => $receipt ), false );
+	}
+
+	/**
+	 * Invoke the protocol the way an authenticated Child request reaches it.
+	 *
+	 * @param array $request Request.
+	 * @return array
+	 */
+	private function invoke_transport( $request ) {
+		$respond = $this->action_response_method();
+		try {
+			$_POST['request'] = wp_json_encode( $request );
+			return $respond->invoke( $this->rocket, 'abilities_v2' );
+		} finally {
+			unset( $_POST['request'] );
+		}
 	}
 
 	/**

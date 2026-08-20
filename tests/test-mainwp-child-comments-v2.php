@@ -254,6 +254,58 @@ class Test_MainWP_Child_Comments_V2 extends WP_UnitTestCase {
 	}
 
 	/**
+	 * A status change landing inside the claim is refused, not overwritten by the transition.
+	 *
+	 * The claim guards the swap into the holding value, not the WordPress call it was taken for, and
+	 * that call updates the row by ID alone. A competing moderator that lands after the claim would
+	 * otherwise have its result overwritten and the Dashboard told the batch applied.
+	 */
+	public function test_moderation_refuses_a_status_changed_inside_the_claim() {
+		$comment_id = $this->create_comment( '0' );
+		$interrupt  = $this->change_status_inside_the_claim( $comment_id, 'spam' );
+
+		$result = $this->moderate( 'approve', $comment_id, 'pending' );
+		remove_action( 'added_comment_meta', $interrupt, 10 );
+
+		$this->assertSame( 0, $result['applied'] );
+		$this->assertSame( 'conflict', $result['results'][0]['outcome'] );
+		$this->assertSame( 'status_conflict', $result['results'][0]['error_code'] );
+		$this->assertSame( 'spam', $result['results'][0]['status_after'] );
+		$this->assertSame( 'spam', wp_get_comment_status( $comment_id ), 'The competing change must survive the transition this request skipped.' );
+		$this->assertSame( '', get_comment_meta( $comment_id, '_mainwp_v2_claim', true ) );
+	}
+
+	/** A comment restored inside the claim is not permanently deleted by the request that claimed it. */
+	public function test_permanent_delete_refuses_a_comment_restored_inside_the_claim() {
+		$comment_id = $this->create_comment( '1' );
+		wp_trash_comment( $comment_id );
+		$interrupt = $this->change_status_inside_the_claim( $comment_id, '1' );
+
+		$result = $this->comments->comments_v2(
+			'delete_permanently',
+			array(
+				'operation' => 'delete_permanently',
+				'dry_run'   => false,
+				'items'     => array(
+					array(
+						'comment_id'      => $comment_id,
+						'expected_status' => 'trash',
+					),
+				),
+			)
+		);
+		remove_action( 'added_comment_meta', $interrupt, 10 );
+
+		$this->assertSame( 0, $result['deleted'] );
+		$this->assertSame( 0, $result['eligible'] );
+		$this->assertSame( 'conflict', $result['results'][0]['outcome'] );
+		$this->assertSame( 'status_conflict', $result['results'][0]['error_code'] );
+		$this->assertTrue( $result['results'][0]['exists_after'] );
+		$this->assertNotNull( get_comment( $comment_id ), 'A comment another actor restored must not be destroyed by the claim it landed inside.' );
+		$this->assertSame( 'approved', wp_get_comment_status( $comment_id ) );
+	}
+
+	/**
 	 * A claim stranded by a fatal is put back, but not while its owner could still be running.
 	 *
 	 * The claim swaps the comment out of its real status, so a request that dies between the claim and
@@ -357,6 +409,30 @@ class Test_MainWP_Child_Comments_V2 extends WP_UnitTestCase {
 			return $query;
 		};
 		add_filter( 'query', $interrupt );
+		return $interrupt;
+	}
+
+	/**
+	 * Act as a competing actor that lands inside the window the claim is held open.
+	 *
+	 * The claim's compare-and-swap is followed by the meta write that records it, so hooking the
+	 * moment that marker is stored puts the competing change after the claim was taken and before
+	 * anything the claim was taken for runs. That is the gap the swap itself does not cover.
+	 *
+	 * @param int    $comment_id Comment to change.
+	 * @param string $approved   Raw comment_approved value the competitor writes.
+	 * @return callable
+	 */
+	private function change_status_inside_the_claim( $comment_id, $approved ) {
+		global $wpdb;
+		$interrupt = static function ( $meta_id, $object_id, $meta_key ) use ( $comment_id, $approved, $wpdb ) {
+			if ( '_mainwp_v2_claim' !== $meta_key || (int) $comment_id !== (int) $object_id ) {
+				return;
+			}
+			$wpdb->query( $wpdb->prepare( "UPDATE {$wpdb->comments} SET comment_approved = %s WHERE comment_ID = %d", $approved, $comment_id ) );
+			clean_comment_cache( $comment_id );
+		};
+		add_action( 'added_comment_meta', $interrupt, 10, 3 );
 		return $interrupt;
 	}
 

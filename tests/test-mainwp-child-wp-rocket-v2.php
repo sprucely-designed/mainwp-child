@@ -386,6 +386,89 @@ class Test_MainWP_Child_WP_Rocket_V2 extends WP_UnitTestCase {
 		$this->assertSame( array(), $this->rocket->provider_calls, 'A request that may already be queued must never be queued again.' );
 	}
 
+	/**
+	 * A reservation older than any live retry is retired instead of orphaning its reference forever.
+	 *
+	 * The reservation is stored before WP Rocket is called, so a process that died in between leaves
+	 * one behind for work that never ran. Past the retry horizon that queue entry has drained or been
+	 * abandoned, and answering the reference outcome_unknown for good is the worse harm.
+	 */
+	public function test_a_reservation_past_the_retry_horizon_is_retired_and_dispatched_again() {
+		$request = array(
+			'protocol'    => '2',
+			'operation'   => 'optimize_database',
+			'request_ref' => '123e4567-e89b-42d3-a456-426614174925',
+			'payload'     => array( 'categories' => array( 'revisions' ) ),
+		);
+		update_option(
+			'mainwp_wp_rocket_abilities_v2_receipts',
+			array(
+				$request['request_ref'] => array(
+					'effect_hash' => $this->effect_hash( array( 'revisions' ) ),
+					'state'       => 'dispatching',
+					'response'    => null,
+					'accepted_at' => time() - ( DAY_IN_SECONDS + 3600 ),
+				),
+			),
+			false
+		);
+
+		$result = $this->invoke_v2( $request );
+		$stored = get_option( 'mainwp_wp_rocket_abilities_v2_receipts' );
+
+		$this->assertTrue( $result['ok'], wp_json_encode( $result ) );
+		$this->assertSame( 'requested', $result['status'] );
+		$this->assertCount( 1, $this->rocket->provider_calls, 'Past the retry horizon the request has to reach WP Rocket instead of answering unknown for good.' );
+		$this->assertSame( 'settled', $stored[ $request['request_ref'] ]['state'] );
+	}
+
+	/**
+	 * A store full of receipts stamped in the future must not lock the ability out.
+	 *
+	 * Option data is untrusted input, so an impossible timestamp is not a young receipt: nothing may
+	 * read age from it, and eviction has to treat it like any other entry it cannot use.
+	 */
+	public function test_future_dated_receipts_never_hold_the_optimization_store_shut() {
+		$receipts = array();
+		for ( $index = 0; $index < 100; $index++ ) {
+			$receipts[ sprintf( '123e4567-e89b-42d3-a456-4266141752%02d', $index ) ] = $this->settled_receipt( time() + ( 10 * YEAR_IN_SECONDS ) );
+		}
+		update_option( 'mainwp_wp_rocket_abilities_v2_receipts', $receipts, false );
+
+		$request = array(
+			'protocol'    => '2',
+			'operation'   => 'optimize_database',
+			'request_ref' => '123e4567-e89b-42d3-a456-426614174926',
+			'payload'     => array( 'categories' => array( 'revisions' ) ),
+		);
+		$result  = $this->invoke_v2( $request );
+		$stored  = get_option( 'mainwp_wp_rocket_abilities_v2_receipts' );
+
+		$this->assertTrue( $result['ok'], wp_json_encode( $result ) );
+		$this->assertCount( 1, $this->rocket->provider_calls );
+		$this->assertArrayHasKey( $request['request_ref'], $stored );
+		$this->assertLessThanOrEqual( 100, count( $stored ) );
+	}
+
+	/** A receipt stamped in the future is not an outcome the Child may hand back as this request's answer. */
+	public function test_a_future_dated_receipt_is_refused_instead_of_replayed() {
+		$request = array(
+			'protocol'    => '2',
+			'operation'   => 'optimize_database',
+			'request_ref' => '123e4567-e89b-42d3-a456-426614174927',
+			'payload'     => array( 'categories' => array( 'revisions' ) ),
+		);
+		$receipt                = $this->settled_receipt( time() + YEAR_IN_SECONDS );
+		$receipt['effect_hash'] = $this->effect_hash( array( 'revisions' ) );
+		update_option( 'mainwp_wp_rocket_abilities_v2_receipts', array( $request['request_ref'] => $receipt ), false );
+
+		$result = $this->invoke_v2( $request );
+
+		$this->assertFalse( $result['ok'], wp_json_encode( $result ) );
+		$this->assertSame( 'storage_unavailable', $result['error_code'] );
+		$this->assertSame( array(), $this->rocket->provider_calls );
+	}
+
 	/** A corrupted receipt is never replayed as an answer and never re-runs the optimization. */
 	public function test_an_unreadable_receipt_refuses_instead_of_replaying_or_rerunning() {
 		$request = array(
@@ -473,6 +556,16 @@ class Test_MainWP_Child_WP_Rocket_V2 extends WP_UnitTestCase {
 			),
 			'accepted_at' => $accepted_at,
 		);
+	}
+
+	/**
+	 * The effect hash the handler computes for one category set.
+	 *
+	 * @param array $categories Public category names.
+	 * @return string
+	 */
+	private function effect_hash( $categories ) {
+		return hash( 'sha256', wp_json_encode( array( 'optimize_database', $categories ) ) );
 	}
 
 	/**

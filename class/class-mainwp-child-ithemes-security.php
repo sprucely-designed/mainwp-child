@@ -46,6 +46,17 @@ class MainWP_Child_IThemes_Security { //phpcs:ignore -- NOSONAR - multi methods.
     public $is_plugin_installed = false;
 
     /**
+     * Seconds a stored timestamp may lead the current time by and still be usable.
+     *
+     * Receipts come out of a WordPress option, so their timestamps are untrusted input. A small
+     * allowance keeps a site whose clock drifted or moved backwards from calling its own recent
+     * receipts corrupt, while anything further ahead is an impossible moment this store never wrote.
+     *
+     * @var int
+     */
+    private const ABILITIES_V2_CLOCK_SKEW = 300;
+
+    /**
      * Create a public static instance of MainWP_Child_IThemes_Security.
      *
      * @return MainWP_Child_IThemes_Security|null
@@ -427,7 +438,7 @@ class MainWP_Child_IThemes_Security { //phpcs:ignore -- NOSONAR - multi methods.
                 $response = $this->abilities_v2_error( $operation, 'storage_unavailable' );
             } elseif ( ! $preview && isset( $receipts[ $request_ref ] ) ) {
                 $receipt = $receipts[ $request_ref ];
-                if ( ! is_array( $receipt ) || ! $this->abilities_v2_exact_keys( $receipt, array( 'effect_hash', 'created_at', 'response' ) ) || ! $this->abilities_v2_valid_hash( $receipt['effect_hash'] ) || ! is_int( $receipt['created_at'] ) || ! $this->abilities_v2_valid_receipt_response( $operation, $request_ref, $receipt['response'] ) ) {
+                if ( ! is_array( $receipt ) || ! $this->abilities_v2_exact_keys( $receipt, array( 'effect_hash', 'created_at', 'response' ) ) || ! $this->abilities_v2_valid_hash( $receipt['effect_hash'] ) || ! $this->abilities_v2_trusted_timestamp( $receipt['created_at'] ) || ! $this->abilities_v2_valid_receipt_response( $operation, $request_ref, $receipt['response'] ) ) {
                     $response = $this->abilities_v2_error( $operation, 'storage_unavailable' );
                 } elseif ( 'ability_solid_file_scan_v2' === $operation && $this->abilities_v2_receipt_awaits_completion( $receipt ) ) {
                     $result = $this->abilities_v2_poll_file_scan();
@@ -566,10 +577,25 @@ class MainWP_Child_IThemes_Security { //phpcs:ignore -- NOSONAR - multi methods.
         if ( ! $this->abilities_v2_valid_request_ref( $ref ) || ! is_array( $receipt ) || ! $this->abilities_v2_exact_keys( $receipt, array( 'effect_hash', 'created_at', 'response' ) ) ) {
             return false;
         }
-        if ( ! $this->abilities_v2_valid_hash( $receipt['effect_hash'] ) || ! is_int( $receipt['created_at'] ) || ! is_array( $receipt['response'] ) || ! isset( $receipt['response']['operation'] ) || ! is_string( $receipt['response']['operation'] ) ) {
+        if ( ! $this->abilities_v2_valid_hash( $receipt['effect_hash'] ) || ! $this->abilities_v2_trusted_timestamp( $receipt['created_at'] ) || ! is_array( $receipt['response'] ) || ! isset( $receipt['response']['operation'] ) || ! is_string( $receipt['response']['operation'] ) ) {
             return false;
         }
         return $this->abilities_v2_valid_receipt_response( $receipt['response']['operation'], strtolower( $ref ), $receipt['response'] );
+    }
+
+    /**
+     * Whether a stored timestamp is a moment this store could actually have written.
+     *
+     * A value that is not an integer, not positive, or further in the future than clock skew
+     * explains is not a younger timestamp; it is an unusable one, so nothing may read age from it.
+     * An entry carrying one is therefore not a receipt worth protecting either, however much of the
+     * rest of it looks like an open scan.
+     *
+     * @param mixed $value Stored timestamp.
+     * @return bool
+     */
+    private function abilities_v2_trusted_timestamp( $value ) {
+        return is_int( $value ) && 0 < $value && time() + self::ABILITIES_V2_CLOCK_SKEW >= $value;
     }
 
     /**

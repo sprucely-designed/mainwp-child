@@ -760,6 +760,70 @@ class Test_MainWP_Child_IThemes_Security_V2 extends WP_UnitTestCase {
 	}
 
 	/**
+	 * A store full of receipts stamped in the future must not lock every mutation out.
+	 *
+	 * Option data is untrusted input, so an impossible timestamp is not a young receipt: nothing may
+	 * read age from it, and eviction has to treat it like any other entry it cannot use. These scans
+	 * are completed, so the deliberate refusal that protects open scans has no part in this.
+	 */
+	public function test_future_dated_receipts_never_hold_the_mutation_store_shut() {
+		$fixture = new IThemes_Security_V2_Protocol_Fixture();
+		$fixture->results['ability_solid_release_lockouts_v2'] = array(
+			'requested_count'      => 1,
+			'releasable_count'     => 1,
+			'released_count'       => 1,
+			'already_absent_count' => 0,
+			'failed_count'         => 0,
+			'revision'             => str_repeat( 'c', 64 ),
+		);
+		$receipts = array();
+		for ( $index = 1; $index <= 100; $index++ ) {
+			$ref              = sprintf( '123e4567-e89b-42d3-a456-%012d', $index );
+			$receipts[ $ref ] = $this->completed_scan_receipt( $ref, time() + ( 10 * YEAR_IN_SECONDS ) );
+		}
+		update_option( 'mainwp_solid_abilities_v2_receipts', $receipts, false );
+
+		$new_ref = '123e4567-e89b-42d3-a456-426614174805';
+		$result  = $fixture->abilities_v2(
+			array(
+				'protocol'    => '2',
+				'operation'   => 'ability_solid_release_lockouts_v2',
+				'request_ref' => $new_ref,
+				'payload'     => array(
+					'lockout_refs' => array( str_repeat( 'a', 64 ) ),
+					'if_match'     => str_repeat( 'b', 64 ),
+				),
+			)
+		);
+		$stored  = get_option( 'mainwp_solid_abilities_v2_receipts', array() );
+
+		$this->assertTrue( $result['ok'], wp_json_encode( $result ) );
+		$this->assertCount( 1, $fixture->calls );
+		$this->assertArrayHasKey( $new_ref, $stored );
+		$this->assertLessThanOrEqual( 100, count( $stored ) );
+	}
+
+	/** A receipt stamped in the future is not an outcome the Child may hand back as this request's answer. */
+	public function test_a_future_dated_receipt_is_refused_instead_of_replayed() {
+		$fixture = new IThemes_Security_V2_Protocol_Fixture();
+		$ref     = '123e4567-e89b-42d3-a456-426614174806';
+		update_option( 'mainwp_solid_abilities_v2_receipts', array( $ref => $this->completed_scan_receipt( $ref, time() + YEAR_IN_SECONDS ) ), false );
+
+		$result = $fixture->abilities_v2(
+			array(
+				'protocol'    => '2',
+				'operation'   => 'ability_solid_file_scan_v2',
+				'request_ref' => $ref,
+				'payload'     => array(),
+			)
+		);
+
+		$this->assertFalse( $result['ok'], wp_json_encode( $result ) );
+		$this->assertSame( 'storage_unavailable', $result['code'] );
+		$this->assertSame( array(), $fixture->calls, 'An unusable receipt is not a reason to run the scan again either.' );
+	}
+
+	/**
 	 * @param string $request_ref Request reference.
 	 * @param int    $created_at  Receipt age.
 	 * @return array

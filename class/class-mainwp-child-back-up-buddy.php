@@ -34,6 +34,18 @@ if ( ! defined( 'ABSPATH' ) ) {
 class MainWP_Child_Back_Up_Buddy { //phpcs:ignore -- NOSONAR - multi methods.
 
     /**
+     * How far ahead of this site's clock a stored or provider timestamp may sit and still be read
+     * as a real observation time.
+     *
+     * Neither source is written by a clock the Child owns: BackupBuddy stamps its own records, an
+     * NTP correction can land mid-run, and the ledger option travels with a database that may have
+     * been dumped on another machine. A few minutes ahead is ordinary skew. Past that the value is
+     * not a later observation of anything, and reading it as one is what lets a record that never
+     * changes look freshly observed on every probe.
+     */
+    const ABILITIES_V2_CLOCK_SKEW = 300;
+
+    /**
      * Public static variable to hold the single instance of MainWP_Child_Back_Up_Buddy.
      * @var null
      */
@@ -693,6 +705,43 @@ class MainWP_Child_Back_Up_Buddy { //phpcs:ignore -- NOSONAR - multi methods.
     /** @return int */
     protected function abilities_v2_now() {
         return time();
+    }
+
+    /**
+     * A timestamp out of stored state or out of a BackupBuddy record, only when it can be believed.
+     *
+     * Both are untrusted input. The option can be edited, restored, or carried over from another
+     * host, and a provider record is written by whichever build of BackupBuddy is installed. A value
+     * that is not a positive number, or that sits further ahead than ABILITIES_V2_CLOCK_SKEW allows,
+     * states nothing about when anything happened, so callers get null and must treat the record as
+     * one they hold no advancing evidence for.
+     *
+     * @param mixed $value Timestamp as read.
+     * @return int|null
+     */
+    private function abilities_v2_trusted_time( $value ) {
+        if ( ! is_numeric( $value ) || (int) $value <= 0 ) {
+            return null;
+        }
+        $seconds = (int) $value;
+        return $seconds > $this->abilities_v2_now() + self::ABILITIES_V2_CLOCK_SKEW ? null : $seconds;
+    }
+
+    /**
+     * Whether the ledger holds no believable observation of a record since $horizon.
+     *
+     * An updated_at that cannot be believed is not a recent observation, so the record counts as
+     * unobserved rather than as permanently fresh. Reading it the other way would keep such a
+     * record out of both the staleness horizon and the age-out pass at once, and a hundred of them
+     * would refuse every new operation forever.
+     *
+     * @param array $record  Stored operation record.
+     * @param int   $horizon Oldest observation time that still counts as recent.
+     * @return bool
+     */
+    private function abilities_v2_unobserved_since( $record, $horizon ) {
+        $observed = $this->abilities_v2_trusted_time( isset( $record['updated_at'] ) ? $record['updated_at'] : null );
+        return null === $observed || $observed < $horizon;
     }
 
     /** @return string */
@@ -1393,7 +1442,10 @@ class MainWP_Child_Back_Up_Buddy { //phpcs:ignore -- NOSONAR - multi methods.
      * ledger. Writing the pass back is the only place a refreshed observation becomes durable.
      *
      * The probe has to find advancing evidence for a record to survive: a run BackupBuddy stopped
-     * stepping keeps its old timestamp, settles, and ages out exactly as it did before.
+     * stepping keeps its old timestamp, settles, and ages out exactly as it did before. A timestamp
+     * abilities_v2_trusted_time() refuses, in the ledger or in BackupBuddy's own record, counts as no
+     * evidence rather than as fresh evidence, so a frozen future stamp cannot rescue the same zombie
+     * on every pass.
      *
      * @return array
      */
@@ -1412,12 +1464,13 @@ class MainWP_Child_Back_Up_Buddy { //phpcs:ignore -- NOSONAR - multi methods.
             }
             $record = $this->abilities_v2_settle_stale_operation( $record );
             $records['operations'][ $key ] = $record;
-            if ( in_array( isset( $record['state'] ) ? $record['state'] : '', array( 'succeeded', 'failed', 'cancelled', 'unknown' ), true ) && isset( $record['updated_at'] ) && $record['updated_at'] < $cutoff ) {
+            if ( in_array( isset( $record['state'] ) ? $record['state'] : '', array( 'succeeded', 'failed', 'cancelled', 'unknown' ), true ) && $this->abilities_v2_unobserved_since( $record, $cutoff ) ) {
                 unset( $records['operations'][ $key ] );
             }
         }
         foreach ( $records['receipts'] as $key => $receipt ) {
-            if ( isset( $receipt['created_at'] ) && $receipt['created_at'] < $cutoff ) {
+            $created = $this->abilities_v2_trusted_time( isset( $receipt['created_at'] ) ? $receipt['created_at'] : null );
+            if ( null === $created || $created < $cutoff ) {
                 unset( $records['receipts'][ $key ] );
             }
         }
@@ -1440,7 +1493,7 @@ class MainWP_Child_Back_Up_Buddy { //phpcs:ignore -- NOSONAR - multi methods.
      * @return bool
      */
     private function abilities_v2_prune_needs_evidence( $record, $cutoff ) {
-        return is_array( $record ) && isset( $record['state'], $record['updated_at'] ) && is_int( $record['updated_at'] ) && $record['updated_at'] < $cutoff && in_array( $record['state'], array( 'queued', 'running', 'cancel_requested', 'unknown' ), true );
+        return is_array( $record ) && isset( $record['state'], $record['updated_at'] ) && $this->abilities_v2_unobserved_since( $record, $cutoff ) && in_array( $record['state'], array( 'queued', 'running', 'cancel_requested', 'unknown' ), true );
     }
 
     /**
@@ -1467,7 +1520,7 @@ class MainWP_Child_Back_Up_Buddy { //phpcs:ignore -- NOSONAR - multi methods.
         if ( ! is_array( $record ) || ! isset( $record['state'], $record['updated_at'] ) || ! is_int( $record['updated_at'] ) ) {
             return $record;
         }
-        if ( in_array( $record['state'], array( 'queued', 'running', 'cancel_requested' ), true ) && $record['updated_at'] < $this->abilities_v2_now() - DAY_IN_SECONDS ) {
+        if ( in_array( $record['state'], array( 'queued', 'running', 'cancel_requested' ), true ) && $this->abilities_v2_unobserved_since( $record, $this->abilities_v2_now() - DAY_IN_SECONDS ) ) {
             $record['state'] = 'unknown';
         }
         return $record;
@@ -1850,9 +1903,14 @@ class MainWP_Child_Back_Up_Buddy { //phpcs:ignore -- NOSONAR - multi methods.
             // every step and judges its own timeouts by it (see get_backup_status()), so it is the
             // one signal that separates a long backup from an abandoned one. Adopting it as the
             // observation time keeps a genuine long run out of the staleness settle below while an
-            // abandoned run still ages out of the ledger.
-            if ( isset( $data['updated_time'] ) && is_numeric( $data['updated_time'] ) ) {
-                $record['updated_at'] = max( $record['updated_at'], min( $this->abilities_v2_now(), (int) $data['updated_time'] ) );
+            // abandoned run still ages out of the ledger. A stamp the trust check rejects is not a
+            // step the Child can date, so it buys the record nothing: the min() below is only there
+            // to absorb the few minutes of skew a stamp is allowed to be ahead by, and clamping an
+            // arbitrary future value would report the current time on every probe of a record that
+            // stopped changing days ago.
+            $activity = $this->abilities_v2_trusted_time( isset( $data['updated_time'] ) ? $data['updated_time'] : null );
+            if ( null !== $activity ) {
+                $record['updated_at'] = max( $record['updated_at'], min( $this->abilities_v2_now(), $activity ) );
             }
         }
         return $record;
@@ -1861,20 +1919,26 @@ class MainWP_Child_Back_Up_Buddy { //phpcs:ignore -- NOSONAR - multi methods.
     /**
      * Last time BackupBuddy itself touched a remote send record.
      *
-     * A send stamps update_time as it works through the file. Where a build does not carry that key
-     * the record is still rewritten on every chunk, so the file's own modification time states the
-     * same fact, and a send that died stops moving either way.
+     * A send stamps update_time as it works through the file. Where a build does not carry that key,
+     * or stamps something the trust check refuses, the record is still rewritten on every chunk, so
+     * the file's own modification time states the same fact, and a send that died stops moving
+     * either way. Both readings go through the trust check: a stamp ahead of this clock is not a
+     * later observation of anything, and a record nothing rewrites stops advancing its own mtime
+     * too, so neither reading can keep a dead send looking alive.
      *
      * @param array  $data Send record contents.
      * @param string $file Send record path.
      * @return int|null
      */
     private function abilities_v2_send_activity_time( $data, $file ) {
-        if ( isset( $data['update_time'] ) && is_numeric( $data['update_time'] ) ) {
-            return (int) $data['update_time'];
+        if ( isset( $data['update_time'] ) ) {
+            $stamped = $this->abilities_v2_trusted_time( $data['update_time'] );
+            if ( null !== $stamped ) {
+                return $stamped;
+            }
         }
         $modified = filemtime( $file );
-        return false === $modified ? null : (int) $modified;
+        return false === $modified ? null : $this->abilities_v2_trusted_time( $modified );
     }
 
     /**

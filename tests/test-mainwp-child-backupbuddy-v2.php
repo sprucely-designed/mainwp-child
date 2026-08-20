@@ -718,6 +718,74 @@ class Test_MainWP_Child_BackupBuddy_V2_Provider_Boundary extends WP_UnitTestCase
 	}
 
 	/**
+	 * A timestamp ahead of this site's clock is unusable, not fresh. Dating a record by it would
+	 * report the current time on every probe of a record that stopped changing days ago, so status
+	 * would keep claiming 'running' and the age-out pass would keep rescuing the same zombie. Only a
+	 * stamp inside the skew allowance is a real step, and a ledger timestamp nothing can believe is
+	 * no observation either.
+	 */
+	public function test_a_future_timestamp_is_not_evidence_a_run_advanced() {
+		$now             = time();
+		$far             = $now + ( 30 * DAY_IN_SECONDS );
+		$backup_zombie   = $this->long_running_operation_record( 7, $now - ( 8 * DAY_IN_SECONDS ) );
+		$transfer_zombie = $this->long_running_operation_record( 8, $now - ( 8 * DAY_IN_SECONDS ), 'transfer' );
+		$skewed          = $this->long_running_operation_record( 9, $now - ( 8 * DAY_IN_SECONDS ) );
+		$corrupt_ledger  = $this->long_running_operation_record( 10, $far );
+		$fileoptions     = Test_MainWP_BackupBuddy_Core_Stub::$log_directory . 'fileoptions/';
+		update_option(
+			'mainwp_backupbuddy_ability_operations_v1',
+			array(
+				'operations' => array(
+					$backup_zombie['operation_ref']   => $backup_zombie,
+					$transfer_zombie['operation_ref'] => $transfer_zombie,
+					$skewed['operation_ref']          => $skewed,
+					$corrupt_ledger['operation_ref']  => $corrupt_ledger,
+				),
+				'receipts'   => array(),
+			)
+		);
+		// A crashed backup whose step time was written far ahead of this clock: nothing has advanced.
+		file_put_contents( $fileoptions . $backup_zombie['serial'] . '.txt', wp_json_encode( array( 'updated_time' => $far, 'finish_time' => 0, 'archive_file' => '' ) ) );
+		// The same for a send, with the record itself frozen too, so the only current-looking thing
+		// about it is the stamp the provider left in the future.
+		file_put_contents( $fileoptions . 'send-mainwp-ability-' . $transfer_zombie['serial'] . '.txt', wp_json_encode( array( 'status' => 'running', 'update_time' => $far ) ) );
+		touch( $fileoptions . 'send-mainwp-ability-' . $transfer_zombie['serial'] . '.txt', $now - ( 9 * DAY_IN_SECONDS ) );
+		// A running backup on a host whose clock is a couple of minutes ahead is still stepping.
+		file_put_contents( $fileoptions . $skewed['serial'] . '.txt', wp_json_encode( array( 'updated_time' => $now + 120, 'finish_time' => 0, 'archive_file' => '' ) ) );
+		clearstatcache();
+
+		$fixture  = new Test_MainWP_Child_BackupBuddy_V2_Effect_Fixture();
+		$statuses = array();
+		foreach ( array( 'backup' => $backup_zombie, 'transfer' => $transfer_zombie, 'skewed' => $skewed, 'ledger' => $corrupt_ledger ) as $label => $record ) {
+			$statuses[ $label ] = $fixture->abilities_v2(
+				array(
+					'operation'     => 'get_operation',
+					'operation_ref' => $record['operation_ref'],
+				)
+			);
+		}
+
+		$this->assertSame( 'unknown', $statuses['backup']['operation']['state'], 'A backup whose step time is in the future has not been observed advancing, so it must not be reported running.' );
+		$this->assertSame( $now - ( 8 * DAY_IN_SECONDS ), $statuses['backup']['operation']['updated_at'], 'An unusable stamp must not become a fresh observation time.' );
+		$this->assertSame( 'unknown', $statuses['transfer']['operation']['state'], 'A send whose update_time is in the future is not alive, and the frozen record does not say otherwise.' );
+		$this->assertSame( $now - ( 8 * DAY_IN_SECONDS ), $statuses['transfer']['operation']['updated_at'] );
+		$this->assertSame( 'running', $statuses['skewed']['operation']['state'], 'A stamp inside the skew allowance is still evidence the run advanced.' );
+		$this->assertGreaterThanOrEqual( $now, $statuses['skewed']['operation']['updated_at'], 'Genuine provider activity still buys the operation time.' );
+		$this->assertSame( 'unknown', $statuses['ledger']['operation']['state'], 'A stored timestamp in the future is not a recent observation either.' );
+		$this->assertSame( $far, $statuses['ledger']['operation']['updated_at'], 'Settling is not an observation, so the stored time still stands as read.' );
+
+		$deleted = $this->delete_one_archive( $fixture, 'serial13', $this->request_ref );
+		$this->assertTrue( $deleted['deleted'], 'The mutation itself must still succeed.' );
+
+		$stored = get_option( 'mainwp_backupbuddy_ability_operations_v1' );
+		$this->assertArrayNotHasKey( $backup_zombie['operation_ref'], $stored['operations'], 'A future step time must not rescue a dead backup from the age-out on every pass.' );
+		$this->assertArrayNotHasKey( $transfer_zombie['operation_ref'], $stored['operations'], 'A future update_time must not rescue a dead send either.' );
+		$this->assertArrayNotHasKey( $corrupt_ledger['operation_ref'], $stored['operations'], 'A hundred records carrying future timestamps would otherwise refuse every new operation forever.' );
+		$this->assertArrayHasKey( $skewed['operation_ref'], $stored['operations'], 'A backup BackupBuddy is really stepping must still survive the age-out.' );
+		$this->assertSame( 'running', $stored['operations'][ $skewed['operation_ref'] ]['state'] );
+	}
+
+	/**
 	 * Delete an archive through the real dispatcher. Any mutation runs the ledger age-out pass; this
 	 * is the cheapest one to drive against the real filesystem.
 	 *

@@ -54,6 +54,17 @@ class MainWP_Child_WP_Rocket {//phpcs:ignore -- NOSONAR - multi methods.
     private const ABILITIES_V2_MAX_RECEIPTS = 100;
 
     /**
+     * Seconds a stored timestamp may lead the current time by and still be usable.
+     *
+     * Receipts come out of a WordPress option, so their timestamps are untrusted input. A small
+     * allowance keeps a site whose clock drifted or moved backwards from calling its own recent
+     * receipts corrupt, while anything further ahead is an impossible moment this store never wrote.
+     *
+     * @var int
+     */
+    private const ABILITIES_V2_CLOCK_SKEW = 300;
+
+    /**
      * Public variable to hold the infomration if the WP Rocket plugin is installed on the child site.
      *
      * @var bool If WP Rocket intalled, return true, if not, return false.
@@ -1125,7 +1136,7 @@ class MainWP_Child_WP_Rocket {//phpcs:ignore -- NOSONAR - multi methods.
     }
 
     /**
-     * Run one optimization request at most once, under the held request lock.
+     * Run one optimization request at most once inside the retry horizon, under the held request lock.
      *
      * @param string $request_ref Validated request reference.
      * @param array  $categories Public category names.
@@ -1147,9 +1158,19 @@ class MainWP_Child_WP_Rocket {//phpcs:ignore -- NOSONAR - multi methods.
             if ( ! hash_equals( $receipt['effect_hash'], $effect_hash ) ) {
                 return $this->abilities_v2_error( $operation, 'request_conflict' );
             }
-            // A reservation nobody settled belongs to a request that reached WP Rocket's queue and
-            // then lost its answer. Running it again would optimize twice, so the outcome is unknown.
-            return 'dispatching' === $receipt['state'] ? $this->abilities_v2_error( $operation, 'outcome_unknown' ) : $receipt['response'];
+            if ( 'dispatching' !== $receipt['state'] ) {
+                return $receipt['response'];
+            }
+            // A reservation nobody settled belongs to a request that either died before WP Rocket
+            // saw it or reached the queue and lost its answer. While that queue entry could still
+            // be draining, running it again would optimize twice, so the outcome is unknown.
+            if ( $this->abilities_v2_reservation_is_live( $receipt['accepted_at'] ) ) {
+                return $this->abilities_v2_error( $operation, 'outcome_unknown' );
+            }
+            // Past the horizon the reservation proves nothing: the earlier cleanup has drained or
+            // been abandoned, and a reference that can only ever answer outcome_unknown is a worse
+            // outcome than a second queued cleanup. Retire it and let this request dispatch.
+            unset( $receipts[ $request_ref ] );
         }
 
         // The request is well formed, so a missing WP Rocket is refused for what it is rather than blamed on the payload.
@@ -1237,7 +1258,7 @@ class MainWP_Child_WP_Rocket {//phpcs:ignore -- NOSONAR - multi methods.
         if ( ! is_array( $receipt ) || ! $this->abilities_v2_exact_keys( $receipt, array( 'effect_hash', 'state', 'response', 'accepted_at' ) ) ) {
             return false;
         }
-        if ( ! is_string( $receipt['effect_hash'] ) || 1 !== preg_match( '/^[0-9a-f]{64}$/D', $receipt['effect_hash'] ) || ! is_int( $receipt['accepted_at'] ) || 0 >= $receipt['accepted_at'] ) {
+        if ( ! is_string( $receipt['effect_hash'] ) || 1 !== preg_match( '/^[0-9a-f]{64}$/D', $receipt['effect_hash'] ) || ! $this->abilities_v2_trusted_timestamp( $receipt['accepted_at'] ) ) {
             return false;
         }
         if ( 'dispatching' === $receipt['state'] ) {
@@ -1271,6 +1292,40 @@ class MainWP_Child_WP_Rocket {//phpcs:ignore -- NOSONAR - multi methods.
     }
 
     /**
+     * Whether a stored timestamp is a moment this store could actually have written.
+     *
+     * A value that is not an integer, not positive, or further in the future than clock skew
+     * explains is not a younger timestamp; it is an unusable one, so nothing may read age from it.
+     *
+     * @param mixed $value Stored timestamp.
+     * @return bool
+     */
+    private function abilities_v2_trusted_timestamp( $value ) {
+        return is_int( $value ) && 0 < $value && time() + self::ABILITIES_V2_CLOCK_SKEW >= $value;
+    }
+
+    /**
+     * The moment before which no Dashboard retry of a request is still expected.
+     *
+     * @return int
+     */
+    private function abilities_v2_retry_horizon() {
+        return time() - ( DAY_IN_SECONDS + 60 );
+    }
+
+    /**
+     * Whether an unsettled reservation still stands for work that could be in flight.
+     *
+     * An untrustworthy timestamp is not a young one, so it can never hold a reservation open.
+     *
+     * @param mixed $accepted_at Stored reservation timestamp.
+     * @return bool
+     */
+    private function abilities_v2_reservation_is_live( $accepted_at ) {
+        return $this->abilities_v2_trusted_timestamp( $accepted_at ) && $accepted_at >= $this->abilities_v2_retry_horizon();
+    }
+
+    /**
      * Validate a UUID request reference.
      *
      * @param mixed $value Candidate reference.
@@ -1296,7 +1351,7 @@ class MainWP_Child_WP_Rocket {//phpcs:ignore -- NOSONAR - multi methods.
         if ( self::ABILITIES_V2_MAX_RECEIPTS > count( $receipts ) ) {
             return $receipts;
         }
-        $horizon   = time() - ( DAY_IN_SECONDS + 60 );
+        $horizon   = $this->abilities_v2_retry_horizon();
         $evictable = array();
         foreach ( $receipts as $reference => $receipt ) {
             if ( ! $this->abilities_v2_valid_request_ref( $reference ) || ! $this->abilities_v2_valid_receipt( $receipt ) ) {

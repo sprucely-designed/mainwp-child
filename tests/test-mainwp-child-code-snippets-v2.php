@@ -129,6 +129,15 @@ class Test_MainWP_Child_Code_Snippets_V2_Wire_Fixture extends MainWP_Child_Misc 
 }
 
 /** Code Snippets protocol-v2 contract tests. */
+/** Exposes the real option writer, which every other fixture in this file replaces. */
+class Test_MainWP_Child_Code_Snippets_V2_Option_Probe extends MainWP_Child_Misc {
+
+	/** @return bool */
+	public function store( $name, $value ) {
+		return $this->snippet_v2_update_option( $name, $value );
+	}
+}
+
 class Test_MainWP_Child_Code_Snippets_V2 extends WP_UnitTestCase {
 
 	/**
@@ -259,6 +268,36 @@ class Test_MainWP_Child_Code_Snippets_V2 extends WP_UnitTestCase {
 		$this->assertSame( 'failed', $result['status'] );
 		$this->assertSame( '', $result['output'] );
 		$this->assertFalse( $result['output_truncated'], 'Nothing was printed, so nothing was withheld.' );
+	}
+
+	/** Drop an option's cached copy so the next read comes from the column, as a fresh request would. */
+	private function flush_option_cache( $name ) {
+		wp_cache_delete( $name, 'options' );
+		wp_cache_delete( 'alloptions', 'options' );
+		wp_cache_delete( 'notoptions', 'options' );
+	}
+
+	/** An option already holding the requested value has been stored, not failed to store. */
+	public function test_rewriting_an_option_with_its_current_value_is_not_a_storage_failure() {
+		$probe = new Test_MainWP_Child_Code_Snippets_V2_Option_Probe();
+		delete_option( 'mainwp_ext_snippets_enabled' );
+
+		$this->assertTrue( $probe->store( 'mainwp_ext_snippets_enabled', true ), 'The first write creates the option.' );
+
+		// Every apply arrives in its own request, so the value comes back from the column rather than
+		// from the cache update_option() just primed with the PHP value. Dropping the cached copy is
+		// what makes this the second apply instead of a continuation of the first.
+		$this->flush_option_cache( 'mainwp_ext_snippets_enabled' );
+		$this->assertSame( '1', get_option( 'mainwp_ext_snippets_enabled' ), 'A stored true reads back as text.' );
+		$this->assertTrue( $probe->store( 'mainwp_ext_snippets_enabled', true ), 'An already-enabled flag is stored, so writing it again is not a failure.' );
+
+		$this->assertTrue( $probe->store( 'mainwp_ext_code_snippets', array( 'Slug' => "echo 'ok';" ) ) );
+		$this->flush_option_cache( 'mainwp_ext_code_snippets' );
+		$this->assertTrue( $probe->store( 'mainwp_ext_code_snippets', array( 'Slug' => "echo 'ok';" ) ), 'An unchanged array value is stored too.' );
+
+		delete_option( 'mainwp_ext_snippets_enabled' );
+		$this->flush_option_cache( 'mainwp_ext_snippets_enabled' );
+		$this->assertFalse( $probe->store( 'mainwp_ext_snippets_enabled', false ), 'An absent option does not count as holding false.' );
 	}
 
 	/** A snippet that leaves its own buffer open must not leak text past the encoded reply. */

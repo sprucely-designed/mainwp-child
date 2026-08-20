@@ -844,7 +844,15 @@ class MainWP_Child_Misc {
      * @return bool
      */
     protected function snippet_v2_update_option( $name, $value ) {
-        return update_option( $name, $value ) || get_option( $name, null ) === $value;
+        if ( update_option( $name, $value ) ) {
+            return true;
+        }
+        // update_option() reports false for a write that changed nothing, so the fallback decides
+        // whether the option already holds what was asked for. It has to compare stored forms, not
+        // values: the column is text, so a stored true reads back as '1' and an identity test would
+        // call an already-enabled flag a storage failure and roll the whole apply back.
+        $stored = get_option( $name, null );
+        return null !== $stored && (string) maybe_serialize( $stored ) === (string) maybe_serialize( $value );
     }
 
     /**

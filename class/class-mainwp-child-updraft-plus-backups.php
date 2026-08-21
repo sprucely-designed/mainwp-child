@@ -78,21 +78,8 @@ class MainWP_Child_Updraft_Plus_Backups { //phpcs:ignore -- NOSONAR - multi meth
 
         add_filter( 'mainwp_site_sync_others_data', array( $this, 'sync_others_data' ), 10, 2 );
 
-        // Register the cursor callback used by MainWP Child Stats.
-        if ( did_action( 'plugins_loaded' ) ) {
-            $this->maybe_register_updraftplus_cursor_hook();
-        } else {
-            add_action( 'plugins_loaded', array( $this, 'maybe_register_updraftplus_cursor_hook' ), 100 );
-        }
-    }
-
-    /**
-     * Register the cursor callback used by MainWP Child Stats.
-     *
-     * @return void
-     */
-    public function maybe_register_updraftplus_cursor_hook() {
-        if ( false === has_filter( 'updraftplus_save_last_backup', array( __CLASS__, 'hook_updraft_plus_save_last_backup' ) ) ) {
+        // Reports owns the UpdraftPlus backup cursor when its callback is available.
+        if ( false === has_filter( 'updraftplus_save_last_backup', array( 'WP_MainWP_Stream\MainWP_Child_Report_Helper', 'hook_updraftplus_save_last_backup' ) ) ) {
             add_filter( 'updraftplus_save_last_backup', array( __CLASS__, 'hook_updraft_plus_save_last_backup' ) );
         }
 
@@ -219,7 +206,13 @@ class MainWP_Child_Updraft_Plus_Backups { //phpcs:ignore -- NOSONAR - multi meth
             return false;
         }
 
-        return false !== strpos( $package, 'downloads.wordpress.org/' ) || false !== strpos( $package, 'api.wordpress.org/' );
+        $host = wp_parse_url( $package, PHP_URL_HOST );
+
+        if ( ! is_string( $host ) ) {
+            return false;
+        }
+
+        return in_array( strtolower( $host ), array( 'downloads.wordpress.org', 'api.wordpress.org' ), true );
     }
 
     /**
@@ -238,7 +231,7 @@ class MainWP_Child_Updraft_Plus_Backups { //phpcs:ignore -- NOSONAR - multi meth
 
         if ( isset( $last_backup['backup_time'] ) ) {
             $backup_time = $last_backup['backup_time'];
-            if ( $last_backup['success'] ) {
+            if ( ! empty( $last_backup['success'] ) ) {
                 MainWP_Utility::update_lasttime_backup( 'updraftplus', $backup_time );
             }
         }

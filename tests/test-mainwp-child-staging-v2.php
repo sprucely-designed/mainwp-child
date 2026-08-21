@@ -766,9 +766,18 @@ class Test_MainWP_Child_Staging_V2 extends WP_UnitTestCase {
 		$stored = get_option( 'mainwp_staging_abilities_v2_operation_receipts', array() );
 
 		$this->assertTrue( $result['ok'] );
-		$this->assertArrayNotHasKey( '123e4567-e89b-42d3-a456-4266141749b0', $stored );
-		$this->assertArrayHasKey( '123e4567-e89b-42d3-a456-4266141749b1', $stored, 'only one slot is freed per request' );
 		$this->assertCount( 100, $stored );
+		$this->assertArrayHasKey( '123e4567-e89b-42d3-a456-426614174946', $stored );
+
+		// Both disposable entries sort equal, and asort() is only stable from PHP 8.0, so which of
+		// the two goes is not the contract. That exactly one goes, and that no live receipt goes
+		// with it, is.
+		$disposable = array( '123e4567-e89b-42d3-a456-4266141749b0', '123e4567-e89b-42d3-a456-4266141749b1' );
+		$survivors  = array_values( array_intersect( $disposable, array_keys( $stored ) ) );
+		$this->assertCount( 1, $survivors, 'one slot is freed, and it comes from an entry no retry can be answered from' );
+		foreach ( array_keys( $this->fill_receipts( 98, time() ) ) as $live ) {
+			$this->assertArrayHasKey( $live, $stored, 'a receipt still inside the horizon must outlive both disposable entries' );
+		}
 	}
 
 	/** @param int $count How many. @param int $created_at Stamp. @param string|null $first Reference of the first entry. @return array */

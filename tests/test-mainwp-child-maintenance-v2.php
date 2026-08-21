@@ -1322,7 +1322,6 @@ class Test_MainWP_Child_Maintenance_V2 extends WP_UnitTestCase {
 	public function test_table_optimize_reports_the_tables_it_rebuilt_when_the_budget_runs_out_mid_loop() {
 		global $wpdb;
 		$prefixed = 0;
-		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- The action's own table list, read the same way.
 		foreach ( $wpdb->get_results( 'SHOW TABLE STATUS FROM `' . esc_sql( DB_NAME ) . '`', ARRAY_A ) as $table ) {
 			if ( 0 === strpos( $table['Name'], $wpdb->prefix ) ) {
 				++$prefixed;

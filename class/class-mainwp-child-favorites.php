@@ -27,6 +27,36 @@ class MainWP_Child_Favorites {
     const INSTALL_LOCK_OPTION = 'mainwp_child_favorites_install_lock';
 
     /**
+     * Receipt option key prefix.
+     *
+     * @var string
+     */
+    const RECEIPT_PREFIX = 'mainwp_child_favorites_receipt_';
+
+    /**
+     * Index of the receipt rows this class wrote.
+     *
+     * Deliberately outside RECEIPT_PREFIX so the index can never name itself as a receipt.
+     *
+     * @var string
+     */
+    const RECEIPT_INDEX_OPTION = 'mainwp_child_favorites_install_index';
+
+    /**
+     * Receipt keys the index tracks at once.
+     *
+     * @var int
+     */
+    const RECEIPT_INDEX_CAP = 200;
+
+    /**
+     * Indexed rows one mutation may reclaim.
+     *
+     * @var int
+     */
+    const RECEIPT_SWEEP_LIMIT = 5;
+
+    /**
      * Exact lane row this request wrote, empty while it holds no lane.
      *
      * The owner token inside it is what stops the release from dropping a lane that expired and
@@ -564,7 +594,39 @@ class MainWP_Child_Favorites {
 
     /** Reserve one effect before package acquisition or installation. */
     protected function create_install_receipt( $request_ref, $receipt ) {
-        return $this->request_ref( $request_ref ) && is_array( $receipt ) && isset( $receipt['request_ref'] ) && $receipt['request_ref'] === $request_ref && $this->valid_install_receipt( $receipt ) && add_option( $this->receipt_key( $request_ref ), $receipt, '', false );
+        if ( ! $this->request_ref( $request_ref ) || ! is_array( $receipt ) || ! isset( $receipt['request_ref'] ) || $receipt['request_ref'] !== $request_ref || ! $this->valid_install_receipt( $receipt ) || ! add_option( $this->receipt_key( $request_ref ), $receipt, '', false ) ) {
+            return false;
+        }
+        $this->reclaim_retained_receipts( $this->receipt_key( $request_ref ), $receipt['expires_at'] );
+        return true;
+    }
+
+    /**
+     * Reclaim a few rows nobody came back for, then record the one this request just wrote.
+     *
+     * A request reference is one-shot, so the eviction on the install path only ever reaches the
+     * reference the current request names; every other row sits in wp_options until the site is
+     * torn down. Finding them means either a prefix scan of that table, unindexed and on the hot
+     * install path, or an index of the keys this class wrote.
+     *
+     * Both halves run inside the install lane and neither may change this request's answer. The
+     * index is advisory and its failures are ignored; the sweep deletes only what
+     * install_receipt_expired() already permits, which never includes a dispatch marker. Sweeping
+     * before recording keeps the row just written out of this request's own budget.
+     *
+     * @param string $option_key Receipt key this request wrote.
+     * @param int    $expires_at Retention moment stored on it.
+     */
+    private function reclaim_retained_receipts( $option_key, $expires_at ) {
+        $index = new MainWP_Child_Receipt_Index( self::RECEIPT_PREFIX );
+        $index->sweep(
+            self::RECEIPT_INDEX_OPTION,
+            self::RECEIPT_SWEEP_LIMIT,
+            function ( $value ) {
+                return $this->valid_install_receipt( $value ) && $this->install_receipt_expired( $value );
+            }
+        );
+        $index->add( self::RECEIPT_INDEX_OPTION, $option_key, $expires_at, self::RECEIPT_INDEX_CAP );
     }
 
     /** Replace one exact dispatch marker with its terminal result. */
@@ -579,7 +641,7 @@ class MainWP_Child_Favorites {
 
     /** Derive the non-secret option key for one UUID request reference. */
     private function receipt_key( $request_ref ) {
-        return 'mainwp_child_favorites_receipt_' . hash( 'sha256', $request_ref );
+        return self::RECEIPT_PREFIX . hash( 'sha256', $request_ref );
     }
 
     /** Download a private one-use package through WordPress safe HTTP. */

@@ -110,6 +110,32 @@ class Test_MainWP_WordPress_SEO_V2 extends WP_UnitTestCase {
 		$other->close();
 	}
 
+	public function test_release_reads_an_absent_lock_as_released_and_retries_a_failed_release_once() {
+		$subject = new Testable_MainWP_WordPress_SEO_V2( '25.5', $this->safe_options() );
+		// The lock name reads home_url(), so it is resolved while the real connection is still in place.
+		$subject->lock_name();
+		$real = $GLOBALS['wpdb'];
+
+		try {
+			$absent          = new Testable_Yoast_Release_Wpdb( array( array( '', null ) ) );
+			$GLOBALS['wpdb'] = $absent;
+			$this->assertTrue( $subject->end_lock() );
+			$this->assertCount( 1, $absent->queries );
+
+			$retried         = new Testable_Yoast_Release_Wpdb( array( array( 'MySQL server has gone away', null ), array( '', '1' ) ) );
+			$GLOBALS['wpdb'] = $retried;
+			$this->assertTrue( $subject->end_lock() );
+			$this->assertCount( 2, $retried->queries );
+
+			$failing         = new Testable_Yoast_Release_Wpdb( array( array( 'Lost connection', null ), array( 'Lost connection', null ) ) );
+			$GLOBALS['wpdb'] = $failing;
+			$this->assertFalse( $subject->end_lock() );
+			$this->assertCount( 2, $failing->queries );
+		} finally {
+			$GLOBALS['wpdb'] = $real;
+		}
+	}
+
 	public function test_inputs_are_closed_and_uuid_uses_request_ref() {
 		$subject = new Testable_MainWP_WordPress_SEO_V2( '25.5', $this->safe_options() );
 		$request = $this->read_request();
@@ -311,6 +337,10 @@ class Testable_MainWP_WordPress_SEO_V2 extends MainWP_WordPress_SEO {
 		return $this->abilities_v2_lock_name();
 	}
 
+	public function end_lock() {
+		return $this->abilities_v2_end_lock();
+	}
+
 	protected function abilities_v2_receipt( $operation, $request ) {
 		$key = $operation . ':' . $request['request_ref'];
 		if ( ! isset( $this->test_receipts[ $key ] ) ) {
@@ -338,6 +368,34 @@ class Testable_MainWP_WordPress_SEO_V2 extends MainWP_WordPress_SEO {
 
 	public function fail_next_write( $name ) {
 		$this->test_fail_name = $name;
+	}
+}
+
+/** Answers RELEASE_LOCK() from a script, so each release attempt is observable. */
+class Testable_Yoast_Release_Wpdb {
+
+	/** @var array Queries this substitute was asked to run. */
+	public $queries = array();
+
+	/** @var string */
+	public $last_error = '';
+
+	/** @var array One array( error, result ) per expected release attempt. */
+	private $answers;
+
+	public function __construct( $answers ) {
+		$this->answers = $answers;
+	}
+
+	public function prepare( $query, ...$args ) {
+		return $query;
+	}
+
+	public function get_var( $query ) {
+		$this->queries[]  = $query;
+		$answer           = array_shift( $this->answers );
+		$this->last_error = $answer[0];
+		return $answer[1];
 	}
 }
 

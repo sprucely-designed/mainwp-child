@@ -185,6 +185,102 @@ class Test_MainWP_Child_Virusdie_V1 extends WP_UnitTestCase {
 		delete_option( $key );
 	}
 
+	/**
+	 * A request reference is one-shot, so nothing ever comes back to the row it created and the
+	 * eviction on the mutation path only reaches the reference the current request names. Every
+	 * other expired row is left behind, and the index is what a later mutation finds them by.
+	 */
+	public function test_a_mutation_reclaims_a_leaked_receipt_row_from_an_earlier_reference() {
+		$subject                   = new Testable_MainWP_Child_Virusdie();
+		$subject->durable_receipts = true;
+		$subject->gateway_bytes    = '<?php // signed fixture';
+		$request                   = $this->install_request( $subject->gateway_bytes );
+		$key                       = 'mainwp_child_virusdie_v1_' . hash( 'sha256', $request['payload']['request_ref'] );
+		$leaked                    = 'mainwp_child_virusdie_v1_' . hash( 'sha256', '123e4567-e89b-42d3-a456-426614175020' );
+		$this->assertTrue( add_option( $leaked, $this->expired_receipt( '123e4567-e89b-42d3-a456-426614175020' ), '', false ) );
+		$this->assertTrue( update_option( 'mainwp_child_virusdie_receipt_index', array( array( 'key' => $leaked, 'expires_at' => time() - 86400 ) ), false ) );
+
+		$result = $subject->request_v1( $request );
+
+		$this->assertTrue( $result['ok'] );
+		$this->assertSame( 'completed', $result['status'] );
+		$this->assertNull( $this->cold_option( $leaked ) );
+		// The reclaimed entry left with its row, and this request's own row took its place.
+		$this->assertSame( array( $key ), wp_list_pluck( get_option( 'mainwp_child_virusdie_receipt_index', array() ), 'key' ) );
+
+		delete_option( $key );
+		delete_option( 'mainwp_child_virusdie_receipt_index' );
+	}
+
+	/**
+	 * A row nothing can parse is exactly the row a resent request still needs standing in its way:
+	 * deleting one would let the same reference run its effect a second time.
+	 */
+	public function test_a_malformed_indexed_receipt_row_is_kept_rather_than_reclaimed() {
+		$subject                   = new Testable_MainWP_Child_Virusdie();
+		$subject->durable_receipts = true;
+		$subject->gateway_bytes    = '<?php // signed fixture';
+		$request                   = $this->install_request( $subject->gateway_bytes );
+		$malformed                 = 'mainwp_child_virusdie_v1_' . hash( 'sha256', '123e4567-e89b-42d3-a456-426614175021' );
+		$this->assertTrue( add_option( $malformed, array( 'effect_hash' => 'unreadable' ), '', false ) );
+		update_option( 'mainwp_child_virusdie_receipt_index', array( array( 'key' => $malformed, 'expires_at' => time() - 86400 ) ), false );
+
+		$this->assertTrue( $subject->request_v1( $request )['ok'] );
+
+		$this->assertSame( array( 'effect_hash' => 'unreadable' ), $this->cold_option( $malformed ) );
+		$this->assertContains( $malformed, wp_list_pluck( get_option( 'mainwp_child_virusdie_receipt_index', array() ), 'key' ) );
+
+		delete_option( $malformed );
+		delete_option( 'mainwp_child_virusdie_v1_' . hash( 'sha256', $request['payload']['request_ref'] ) );
+		delete_option( 'mainwp_child_virusdie_receipt_index' );
+	}
+
+	/**
+	 * The index is bookkeeping, so a full one gives up its oldest entry rather than travelling back
+	 * into a mutation as a refusal. The row that entry named goes back to leaking, which is where it
+	 * was before there was an index at all.
+	 */
+	public function test_a_full_index_drops_its_oldest_entry_instead_of_refusing_the_mutation() {
+		$subject                   = new Testable_MainWP_Child_Virusdie();
+		$subject->durable_receipts = true;
+		$subject->gateway_bytes    = '<?php // signed fixture';
+		$request                   = $this->install_request( $subject->gateway_bytes );
+		$key                       = 'mainwp_child_virusdie_v1_' . hash( 'sha256', $request['payload']['request_ref'] );
+		$full                      = array();
+		for ( $index = 0; $index < 200; ++$index ) {
+			$full[] = array(
+				'key'        => 'mainwp_child_virusdie_v1_' . hash( 'sha256', 'filler-' . $index ),
+				'expires_at' => time() + 86400,
+			);
+		}
+		update_option( 'mainwp_child_virusdie_receipt_index', $full, false );
+
+		$result = $subject->request_v1( $request );
+
+		$this->assertTrue( $result['ok'] );
+		$this->assertSame( 1, $subject->installs );
+		$stored = wp_list_pluck( get_option( 'mainwp_child_virusdie_receipt_index', array() ), 'key' );
+		$this->assertCount( 200, $stored );
+		$this->assertNotContains( $full[0]['key'], $stored );
+		$this->assertSame( $key, end( $stored ) );
+
+		delete_option( $key );
+		delete_option( 'mainwp_child_virusdie_receipt_index' );
+	}
+
+	/**
+	 * Read one option past the request-local cache.
+	 *
+	 * update_option() primes that cache, so a row asserted straight after a write reads back from
+	 * memory whether or not the store ever kept it.
+	 */
+	private function cold_option( $key ) {
+		wp_cache_delete( $key, 'options' );
+		wp_cache_delete( 'notoptions', 'options' );
+		wp_cache_delete( 'alloptions', 'options' );
+		return get_option( $key, null );
+	}
+
 	public function test_callable_dispatch_map_registers_the_narrow_protocol() {
 		$reflection = new ReflectionClass( MainWP_Child_Callable::class );
 		$callable   = $reflection->newInstanceWithoutConstructor();

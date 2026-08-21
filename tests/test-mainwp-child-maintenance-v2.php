@@ -775,6 +775,58 @@ class Test_MainWP_Child_Maintenance_V2 extends WP_UnitTestCase {
 		);
 	}
 
+	/**
+	 * Lock renewal re-arms the lock TTL and every page keeps deleting something, so neither existing
+	 * bound ends a sweep on a busy site: the request would run to PHP's execution limit and die with
+	 * the record unsettled. The wall clock has to stop it, and report the rows it destroyed.
+	 */
+	public function test_revision_sweep_stops_when_the_wall_clock_budget_runs_out() {
+		global $wpdb;
+		$parent_id = self::factory()->post->create();
+		$this->insert_revisions( $parent_id, 503 );
+		// One second of sweep budget once the settle margin comes off, so the stop is reachable
+		// without waiting out the 120s ceiling.
+		$original_limit = ini_get( 'max_execution_time' );
+		ini_set( 'max_execution_time', MainWP_Child_Maintenance::ABILITIES_V2_REVISION_SWEEP_MARGIN + 1 );
+		// Burn the budget inside the first batch, so the sweep is over time by the time it decides
+		// whether to start the second one.
+		$stall = static function ( $query ) {
+			static $stalled = false;
+			if ( ! $stalled && 1 === preg_match( '/^\s*DELETE\s+FROM\s+\S*posts\b/i', $query ) ) {
+				$stalled = true;
+				$until   = time() + 2;
+				while ( time() < $until ) {
+					usleep( 50000 );
+				}
+			}
+			return $query;
+		};
+
+		add_filter( 'query', $stall );
+		try {
+			list( , $result ) = $this->real_execute( $this->real_subject(), array( 'revisions' ), 2, '123e4567-e89b-42d3-a456-426614174520' );
+		} finally {
+			remove_filter( 'query', $stall );
+			ini_set( 'max_execution_time', $original_limit );
+		}
+
+		$remaining = (int) $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM $wpdb->posts WHERE post_type = 'revision' AND post_parent = %d", $parent_id ) );
+		$this->assertTrue( $result['ok'] );
+		$this->assertSame( 'unknown', $result['status'] );
+		$this->assertSame(
+			array(
+				'action'     => 'revisions',
+				'status'     => 'unknown',
+				'affected'   => 503 - $remaining,
+				'error_code' => 'outcome_unknown',
+			),
+			$result['outcomes'][0],
+			'The outcome has to count the rows that really left the table.'
+		);
+		$this->assertGreaterThan( 0, $result['outcomes'][0]['affected'] );
+		$this->assertGreaterThan( 2, $remaining, 'Revisions over retention must still be there: the sweep stopped, it did not finish.' );
+	}
+
 	/** Fill one parent with revisions cheaply; the sweep only ever reads them through SQL. */
 	private function insert_revisions( $parent_id, $count ) {
 		global $wpdb;

@@ -39,6 +39,12 @@ class MainWP_Child_Maintenance {
     /** Revision parents examined per sweep page. */
     const ABILITIES_V2_REVISION_PARENT_PAGE = 200;
 
+    /** Seconds one revision sweep may spend deleting. */
+    const ABILITIES_V2_REVISION_SWEEP_BUDGET = 120;
+
+    /** Seconds a stopped sweep still needs to settle its record and release the lock. */
+    const ABILITIES_V2_REVISION_SWEEP_MARGIN = 10;
+
     /**
      * Current v2 mutation-lock owner.
      *
@@ -971,6 +977,23 @@ class MainWP_Child_Maintenance {
     }
 
     /**
+     * Instant a revision sweep has to stop deleting at.
+     *
+     * @return int Unix timestamp.
+     */
+    private function abilities_v2_revision_sweep_deadline() {
+        // PHP's execution limit is what actually ends an unbounded sweep, and it ends it with a
+        // fatal that leaves the record unsettled and the lock held. Stopping short of it keeps the
+        // margin needed to write the outcome and release the lock. A limit of 0 is CLI or an
+        // explicitly unlimited request, where only the budget applies.
+        $limit = (int) ini_get( 'max_execution_time' );
+        if ( 0 >= $limit ) {
+            return time() + self::ABILITIES_V2_REVISION_SWEEP_BUDGET;
+        }
+        return time() + max( 1, min( self::ABILITIES_V2_REVISION_SWEEP_BUDGET, $limit - self::ABILITIES_V2_REVISION_SWEEP_MARGIN ) );
+    }
+
+    /**
      * Delete revisions with exact retention.
      *
      * @param int $revision_retention Revisions retained per parent.
@@ -982,12 +1005,25 @@ class MainWP_Child_Maintenance {
             return $this->abilities_v2_delete_rows( 'posts', "post_type = 'revision'" );
         }
         $affected = 0;
+        $deadline = $this->abilities_v2_revision_sweep_deadline();
         while ( true ) {
             // A site with enough parents keeps paging past the 300s lock TTL, so the lock is renewed
             // and re-verified before every page. Once this run can no longer prove it owns the lock
             // it stops deleting and reports the rows it already destroyed alongside the unknown,
             // rather than claiming a sweep it could not finish under the lock.
             if ( ! $this->abilities_v2_renew_mutation() ) {
+                return array(
+                    'status'     => 'unknown',
+                    'affected'   => $affected,
+                    'error_code' => 'outcome_unknown',
+                );
+            }
+            // Renewal re-arms the lock TTL, so it never ends this loop on a site whose editors keep
+            // creating revisions: every page still finds parents over retention and still deletes
+            // something, so the progress invariant stays satisfied and only the execution limit is
+            // left to stop the run. The wall clock stops it first, before the page rather than
+            // after, so the margin is still there to settle the record.
+            if ( time() >= $deadline ) {
                 return array(
                     'status'     => 'unknown',
                     'affected'   => $affected,
@@ -1014,10 +1050,12 @@ class MainWP_Child_Maintenance {
                 if ( ! is_numeric( $parent ) ) {
                     return $this->abilities_v2_failed_outcome( 'mutation_failed', $affected );
                 }
-                $removed        = $this->abilities_v2_delete_parent_revisions( (int) $parent, $revision_retention );
+                $removed        = $this->abilities_v2_delete_parent_revisions( (int) $parent, $revision_retention, $deadline );
                 $affected      += $removed['deleted'];
                 $page_affected += $removed['deleted'];
-                if ( 'lock_lost' === $removed['status'] ) {
+                // Two different reasons to stop mid-parent, one truthful report: the rows are gone
+                // either way and what is left over retention is not known from here.
+                if ( 'lock_lost' === $removed['status'] || 'out_of_time' === $removed['status'] ) {
                     return array(
                         'status'     => 'unknown',
                         'affected'   => $affected,
@@ -1040,9 +1078,10 @@ class MainWP_Child_Maintenance {
      *
      * @param int $parent_id          Parent post ID.
      * @param int $revision_retention Revisions retained for this parent.
-     * @return array<string,int|string> Rows deleted, and whether this parent completed, hit a failed statement, or lost the lock.
+     * @param int $deadline           Instant the sweep has to stop deleting at.
+     * @return array<string,int|string> Rows deleted, and whether this parent completed, hit a failed statement, lost the lock, or ran out of time.
      */
-    private function abilities_v2_delete_parent_revisions( $parent_id, $revision_retention ) {
+    private function abilities_v2_delete_parent_revisions( $parent_id, $revision_retention, $deadline ) {
         global $wpdb;
         $deleted = 0;
         while ( true ) {
@@ -1091,6 +1130,15 @@ class MainWP_Child_Maintenance {
                 return array(
                     'deleted' => $deleted,
                     'status'  => 'lock_lost',
+                );
+            }
+            // Same wall clock as the pages, because one parent's surplus alone can outlast the
+            // request. Reporting this as 'lock_lost' would be a lie: the lock is held and was just
+            // renewed, and the caller turns both into the same unknown anyway.
+            if ( time() >= $deadline ) {
+                return array(
+                    'deleted' => $deleted,
+                    'status'  => 'out_of_time',
                 );
             }
         }

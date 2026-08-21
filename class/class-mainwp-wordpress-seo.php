@@ -134,6 +134,10 @@ class MainWP_WordPress_SEO {
         try {
             return $this->abilities_v2_execute( $operation, $request, true );
         } finally {
+            // The write and its receipt are already settled by the time this runs, so a release
+            // that fails is not a failure of the request: reporting one would assert a mutation
+            // outcome that did not happen. end_lock() retries on its own, and the lock dies with
+            // the connection on anything but a pooled one.
             $this->abilities_v2_end_lock();
         }
     }
@@ -315,9 +319,19 @@ class MainWP_WordPress_SEO {
         if ( ! is_object( $wpdb ) || ! is_callable( array( $wpdb, 'prepare' ) ) || ! is_callable( array( $wpdb, 'get_var' ) ) ) {
             return false;
         }
-        $wpdb->last_error = '';
-        $released         = $wpdb->get_var( $wpdb->prepare( 'SELECT RELEASE_LOCK(%s)', $this->abilities_v2_lock_name() ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery -- Named lock release must be checked.
-        return empty( $wpdb->last_error ) && '1' === (string) $released;
+        // A lock this session fails to give back outlives the request on a persistent connection
+        // and blocks every later mutation with no way for an operator to clear it, so one failed
+        // release earns a second attempt before it is given up on.
+        for ( $attempt = 0; $attempt < 2; $attempt++ ) {
+            $wpdb->last_error = '';
+            $released         = $wpdb->get_var( $wpdb->prepare( 'SELECT RELEASE_LOCK(%s)', $this->abilities_v2_lock_name() ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery -- Named lock release must be checked.
+            // RELEASE_LOCK() answers NULL when the named lock does not exist, which is the state
+            // the caller asked for.
+            if ( empty( $wpdb->last_error ) && ( null === $released || '1' === (string) $released ) ) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
@@ -560,11 +574,16 @@ class MainWP_WordPress_SEO {
      */
     protected function abilities_v2_write_option( $name, $value ) {
         // Yoast owns these options' autoload flag. Omitting update_option()'s autoload argument
-        // keeps the flag an existing option already stores, so an apply and its rollback cannot
-        // silently move it off autoload. That only holds for options that exist: update_option()
-        // falls through to add_option() for a missing one and creates it autoloaded. Nothing
-        // reaches here with one missing, because abilities_v2_normalize_settings() refuses a
-        // runtime whose wpseo_titles or wpseo option is absent or not an array.
+        // leaves an explicit 'on'/'off' row untouched; since WordPress 6.6 a row WordPress chose
+        // for itself ('auto-on', 'auto-off', 'auto') is re-derived from the new value's size.
+        // That re-derivation depends only on the value, so a rollback lands on the flag the
+        // original value would have had and the pair stays symmetric. Passing the stored raw flag
+        // instead would be worse: wp_determine_option_autoload_value() does not accept 'auto-*'
+        // and falls through to the same filter anyway. All of it assumes the option exists:
+        // update_option() falls through to add_option() for a missing one and creates it
+        // autoloaded. Nothing reaches here with one missing, because
+        // abilities_v2_normalize_settings() refuses a runtime whose wpseo_titles or wpseo option
+        // is absent or not an array.
         return update_option( $name, $value ) || get_option( $name, null ) === $value;
     }
 

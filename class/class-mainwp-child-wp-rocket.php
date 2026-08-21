@@ -1125,7 +1125,11 @@ class MainWP_Child_WP_Rocket {//phpcs:ignore -- NOSONAR - multi methods.
 
         // The receipt lookup and the dispatch it guards have to be one atomic step, or a Dashboard
         // retry racing its own lost request queues the same destructive optimization twice.
-        if ( ! $this->abilities_v2_begin_lock() ) {
+        $lock = $this->abilities_v2_begin_lock();
+        if ( null === $lock ) {
+            return $this->abilities_v2_error( $operation, 'storage_unavailable' );
+        }
+        if ( true !== $lock ) {
             return $this->abilities_v2_error( $operation, 'lock_busy' );
         }
         try {
@@ -1407,16 +1411,25 @@ class MainWP_Child_WP_Rocket {//phpcs:ignore -- NOSONAR - multi methods.
     /**
      * Acquire the Child-wide optimization request lock without waiting.
      *
-     * @return bool
+     * @return bool|null True when acquired, false when another session holds it, null when the lock backend could not answer.
      */
     protected function abilities_v2_begin_lock() {
         global $wpdb;
         if ( ! is_object( $wpdb ) || ! is_callable( array( $wpdb, 'prepare' ) ) || ! is_callable( array( $wpdb, 'get_var' ) ) ) {
-            return false;
+            return null;
         }
         $wpdb->last_error = '';
         $locked           = $wpdb->get_var( $wpdb->prepare( 'SELECT GET_LOCK(%s,0)', $this->abilities_v2_lock_name() ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery -- Named lock is the serialization primitive.
-        return empty( $wpdb->last_error ) && '1' === (string) $locked;
+        if ( ! empty( $wpdb->last_error ) ) {
+            return null;
+        }
+        if ( '1' === (string) $locked ) {
+            return true;
+        }
+        // Only '0' means someone else holds it. GET_LOCK() answers NULL on an error or an
+        // interrupted wait, which says nothing about who holds the lock, so it is not reported
+        // as contention the Child never observed.
+        return '0' === (string) $locked ? false : null;
     }
 
     /**

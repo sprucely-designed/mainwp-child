@@ -427,6 +427,91 @@ class Test_MainWP_Child_Favorites_V2 extends WP_UnitTestCase {
 		$this->assertSame( $captured, $captured->skin->upgrader );
 	}
 
+	/**
+	 * A request reference is one-shot, so nothing ever comes back to the row it created and the
+	 * eviction on the install path only reaches the reference the current request names. Every
+	 * other expired row is left behind, and the index is what a later install finds them by.
+	 */
+	public function test_an_install_reclaims_a_leaked_receipt_row_from_an_earlier_reference() {
+		$subject                   = new Testable_MainWP_Child_Favorites_V2( array(), array(), array() );
+		$subject->durable_receipts = true;
+		$leaked                    = '123e4567-e89b-42d3-a456-426614173040';
+		$leaked_key                = 'mainwp_child_favorites_receipt_' . hash( 'sha256', $leaked );
+		$key                       = 'mainwp_child_favorites_receipt_' . hash( 'sha256', '123e4567-e89b-42d3-a456-426614173021' );
+		$this->assertTrue( add_option( $leaked_key, $this->expired_receipt( $leaked ), '', false ) );
+		$this->assertTrue( update_option( 'mainwp_child_favorites_install_index', array( array( 'key' => $leaked_key, 'expires_at' => time() - DAY_IN_SECONDS ) ), false ) );
+
+		$result = $subject->install_verified_v2( $this->install_request() );
+
+		$this->assertTrue( $result['ok'] );
+		$this->assertSame( 'completed', $result['status'] );
+		$this->assertNull( $this->cold_option( $leaked_key ) );
+		// The reclaimed entry left with its row, and this install's own row took its place.
+		$this->assertSame( array( $key ), wp_list_pluck( get_option( 'mainwp_child_favorites_install_index', array() ), 'key' ) );
+
+		delete_option( $key );
+		delete_option( 'mainwp_child_favorites_install_index' );
+	}
+
+	/**
+	 * A row nothing can parse is exactly the row a resent request still needs standing in its way:
+	 * deleting one would let the same reference install the package a second time.
+	 */
+	public function test_a_malformed_indexed_receipt_row_is_kept_rather_than_reclaimed() {
+		$subject                   = new Testable_MainWP_Child_Favorites_V2( array(), array(), array() );
+		$subject->durable_receipts = true;
+		$malformed                 = 'mainwp_child_favorites_receipt_' . hash( 'sha256', '123e4567-e89b-42d3-a456-426614173041' );
+		$this->assertTrue( add_option( $malformed, array( 'effect_hash' => 'unreadable' ), '', false ) );
+		update_option( 'mainwp_child_favorites_install_index', array( array( 'key' => $malformed, 'expires_at' => time() - DAY_IN_SECONDS ) ), false );
+
+		$this->assertTrue( $subject->install_verified_v2( $this->install_request() )['ok'] );
+
+		$this->assertSame( array( 'effect_hash' => 'unreadable' ), $this->cold_option( $malformed ) );
+		$this->assertContains( $malformed, wp_list_pluck( get_option( 'mainwp_child_favorites_install_index', array() ), 'key' ) );
+
+		delete_option( $malformed );
+		delete_option( 'mainwp_child_favorites_receipt_' . hash( 'sha256', '123e4567-e89b-42d3-a456-426614173021' ) );
+		delete_option( 'mainwp_child_favorites_install_index' );
+	}
+
+	/**
+	 * A dispatch marker never expires into silence however old it is: its effect was never resolved,
+	 * so the sweep reads the same refusal out of the retention predicate that the install path does.
+	 */
+	public function test_an_indexed_dispatch_marker_is_kept_however_old_it_is() {
+		$subject                   = new Testable_MainWP_Child_Favorites_V2( array(), array(), array() );
+		$subject->durable_receipts = true;
+		$aged                      = '123e4567-e89b-42d3-a456-426614173042';
+		$aged_key                  = 'mainwp_child_favorites_receipt_' . hash( 'sha256', $aged );
+		$marker                    = $this->expired_receipt( $aged );
+		$marker['state']           = 'dispatching';
+		$marker['result']          = null;
+		$this->assertTrue( add_option( $aged_key, $marker, '', false ) );
+		update_option( 'mainwp_child_favorites_install_index', array( array( 'key' => $aged_key, 'expires_at' => time() - DAY_IN_SECONDS ) ), false );
+
+		$this->assertTrue( $subject->install_verified_v2( $this->install_request() )['ok'] );
+
+		$this->assertSame( $marker, $this->cold_option( $aged_key ) );
+		$this->assertContains( $aged_key, wp_list_pluck( get_option( 'mainwp_child_favorites_install_index', array() ), 'key' ) );
+
+		delete_option( $aged_key );
+		delete_option( 'mainwp_child_favorites_receipt_' . hash( 'sha256', '123e4567-e89b-42d3-a456-426614173021' ) );
+		delete_option( 'mainwp_child_favorites_install_index' );
+	}
+
+	/**
+	 * Read one option past the request-local cache.
+	 *
+	 * update_option() primes that cache, so a row asserted straight after a write reads back from
+	 * memory whether or not the store ever kept it.
+	 */
+	private function cold_option( $key ) {
+		wp_cache_delete( $key, 'options' );
+		wp_cache_delete( 'notoptions', 'options' );
+		wp_cache_delete( 'alloptions', 'options' );
+		return get_option( $key, null );
+	}
+
 	private function installed_subject() {
 		$subject = new Testable_MainWP_Child_Favorites_V2(
 			array( 'forms/forms.php' => array( 'Version' => '2.1.0' ) ),

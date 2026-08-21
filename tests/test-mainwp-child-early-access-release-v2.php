@@ -415,6 +415,89 @@ class Test_MainWP_Child_Early_Access_Release_V2 extends WP_UnitTestCase {
 		$this->fail( sprintf( 'The fixture directory %s stayed readable at mode 0000, so this test would pass without exercising the walk it covers.', $path ) );
 	}
 
+	/**
+	 * A request reference is one-shot, so nothing ever comes back to the row it created and the
+	 * reclaim on the apply path only reaches the reference the current request names. Every other
+	 * row past retention is left behind, and the index is what a later transition finds them by.
+	 */
+	public function test_a_transition_reclaims_a_leaked_receipt_row_from_an_earlier_reference() {
+		$subject    = new Retained_MainWP_Child_Early_Access_Release();
+		$leaked     = '123e4567-e89b-42d3-a456-426614174710';
+		$leaked_key = $this->receipt_option( $leaked );
+		$request    = $this->apply_request( '123e4567-e89b-42d3-a456-426614174711' );
+		add_option( $leaked_key, $this->settled_receipt( $leaked, time() - 1 ), '', false );
+		update_option( 'mainwp_child_early_access_receipt_index', array( array( 'key' => $leaked_key, 'expires_at' => time() - 1 ) ), false );
+
+		$result = $subject->release_v2( $request );
+
+		$this->assertTrue( $result['ok'] );
+		$this->assertSame( 'applied', $result['status'] );
+		$this->assertNull( $this->cold_option( $leaked_key ) );
+		// The reclaimed entry left with its row, and this transition's own row took its place.
+		$this->assertSame( array( $this->receipt_option( $request['payload']['request_ref'] ) ), wp_list_pluck( get_option( 'mainwp_child_early_access_receipt_index', array() ), 'key' ) );
+
+		delete_option( $this->receipt_option( $request['payload']['request_ref'] ) );
+		delete_option( 'mainwp_child_early_access_receipt_index' );
+	}
+
+	/**
+	 * A row nothing can parse is exactly the row a resent request still needs standing in its way:
+	 * deleting one would let the same reference replace the installed tree a second time.
+	 */
+	public function test_a_malformed_indexed_receipt_row_is_kept_rather_than_reclaimed() {
+		$subject   = new Retained_MainWP_Child_Early_Access_Release();
+		$malformed = $this->receipt_option( '123e4567-e89b-42d3-a456-426614174712' );
+		$request   = $this->apply_request( '123e4567-e89b-42d3-a456-426614174713' );
+		add_option( $malformed, array( 'effect_hash' => 'unreadable' ), '', false );
+		update_option( 'mainwp_child_early_access_receipt_index', array( array( 'key' => $malformed, 'expires_at' => time() - 1 ) ), false );
+
+		$this->assertTrue( $subject->release_v2( $request )['ok'] );
+
+		$this->assertSame( array( 'effect_hash' => 'unreadable' ), $this->cold_option( $malformed ) );
+		$this->assertContains( $malformed, wp_list_pluck( get_option( 'mainwp_child_early_access_receipt_index', array() ), 'key' ) );
+
+		delete_option( $malformed );
+		delete_option( $this->receipt_option( $request['payload']['request_ref'] ) );
+		delete_option( 'mainwp_child_early_access_receipt_index' );
+	}
+
+	/**
+	 * A settled receipt is only free to forget once its result said what happened. One settled as
+	 * unknown never did, so the sweep reads the same refusal out of the retention predicate that the
+	 * apply path does - however long the index has been carrying it.
+	 */
+	public function test_an_indexed_unresolved_result_is_kept_however_old_it_is() {
+		$subject     = new Retained_MainWP_Child_Early_Access_Release();
+		$unresolved  = '123e4567-e89b-42d3-a456-426614174714';
+		$aged_key    = $this->receipt_option( $unresolved );
+		$request     = $this->apply_request( '123e4567-e89b-42d3-a456-426614174715' );
+		$aged        = $this->unresolved_receipt( $unresolved, hash( 'sha256', 'effect-' . $unresolved ), time() - 1 );
+		add_option( $aged_key, $aged, '', false );
+		update_option( 'mainwp_child_early_access_receipt_index', array( array( 'key' => $aged_key, 'expires_at' => time() - 1 ) ), false );
+
+		$this->assertTrue( $subject->release_v2( $request )['ok'] );
+
+		$this->assertSame( $aged, $this->cold_option( $aged_key ) );
+		$this->assertContains( $aged_key, wp_list_pluck( get_option( 'mainwp_child_early_access_receipt_index', array() ), 'key' ) );
+
+		delete_option( $aged_key );
+		delete_option( $this->receipt_option( $request['payload']['request_ref'] ) );
+		delete_option( 'mainwp_child_early_access_receipt_index' );
+	}
+
+	/**
+	 * Read one option past the request-local cache.
+	 *
+	 * update_option() primes that cache, so a row asserted straight after a write reads back from
+	 * memory whether or not the store ever kept it.
+	 */
+	private function cold_option( $key ) {
+		wp_cache_delete( $key, 'options' );
+		wp_cache_delete( 'notoptions', 'options' );
+		wp_cache_delete( 'alloptions', 'options' );
+		return get_option( $key, null );
+	}
+
 	private function receipt_option( $request_ref ) {
 		return 'mainwp_child_early_access_v2_' . hash( 'sha256', $request_ref );
 	}

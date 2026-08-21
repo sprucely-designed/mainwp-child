@@ -1035,10 +1035,10 @@ class MainWP_Child_Posts { //phpcs:ignore -- NOSONAR - multi methods.
         }
 
         // Known hazard: a site listener that issues DDL trips MySQL's implicit commit, after which
-        // content_v2_rollback() is a no-op and this request can still answer mutation_failed for a
-        // post that is already durable. Firing the hook outside the transaction is not the fix - the
-        // listener's own writes would then survive the rollback and run again on the Dashboard retry,
-        // which is a common cost paid for a rare one.
+        // content_v2_rollback() is a no-op. Firing the hook outside the transaction is not the fix -
+        // the listener's own writes would then survive the rollback and run again on the Dashboard
+        // retry, which is a common cost paid for a rare one. Instead the rollback reports whether it
+        // actually landed, and the failures below stop claiming "no effect" when it did not.
         $hook_post = $postarr;
         unset( $hook_post['meta_input'] );
         do_action(
@@ -1052,29 +1052,29 @@ class MainWP_Child_Posts { //phpcs:ignore -- NOSONAR - multi methods.
 
         $post_id = wp_insert_post( wp_slash( $postarr ), true );
         if ( is_wp_error( $post_id ) || ! is_int( $post_id ) || 1 > $post_id ) {
-            $this->content_v2_rollback( null, $normalized );
-            return $this->content_v2_error( $protocol, $operation, 'mutation_failed' );
+            $rolled_back = $this->content_v2_rollback( null, $normalized );
+            return $this->content_v2_error( $protocol, $operation, $this->content_v2_failure_code( $rolled_back ) );
         }
         if ( ! empty( $normalized['post']['categories'] ) ) {
             $category_ids = $this->content_v2_category_ids( $normalized['post']['categories'] );
             $terms        = false === $category_ids ? false : wp_set_post_categories( $post_id, $category_ids, false );
             if ( false === $terms || is_wp_error( $terms ) ) {
-                $this->content_v2_rollback( $post_id, $normalized );
-                return $this->content_v2_error( $protocol, $operation, 'mutation_failed' );
+                $rolled_back = $this->content_v2_rollback( $post_id, $normalized );
+                return $this->content_v2_error( $protocol, $operation, $this->content_v2_failure_code( $rolled_back ) );
             }
         }
         if ( null !== $choices['category_id'] ) {
             $terms = wp_set_post_categories( $post_id, array( $choices['category_id'] ), true );
             if ( is_wp_error( $terms ) ) {
-                $this->content_v2_rollback( $post_id, $normalized );
-                return $this->content_v2_error( $protocol, $operation, 'mutation_failed' );
+                $rolled_back = $this->content_v2_rollback( $post_id, $normalized );
+                return $this->content_v2_error( $protocol, $operation, $this->content_v2_failure_code( $rolled_back ) );
             }
         }
         if ( ! empty( $normalized['post']['tags'] ) ) {
             $terms = wp_set_post_terms( $post_id, $normalized['post']['tags'], 'post_tag', false );
             if ( is_wp_error( $terms ) ) {
-                $this->content_v2_rollback( $post_id, $normalized );
-                return $this->content_v2_error( $protocol, $operation, 'mutation_failed' );
+                $rolled_back = $this->content_v2_rollback( $post_id, $normalized );
+                return $this->content_v2_error( $protocol, $operation, $this->content_v2_failure_code( $rolled_back ) );
             }
         }
 
@@ -1132,7 +1132,7 @@ class MainWP_Child_Posts { //phpcs:ignore -- NOSONAR - multi methods.
      *
      * @param int|null $post_id    Post touched inside the transaction, when one exists.
      * @param array    $normalized Valid normalized mutation.
-     * @return void
+     * @return bool True when no trace of this operation survived, false when one did.
      */
     private function content_v2_rollback( $post_id, $normalized ) {
         global $wpdb;
@@ -1164,6 +1164,35 @@ class MainWP_Child_Posts { //phpcs:ignore -- NOSONAR - multi methods.
         foreach ( $term_ids as $taxonomy => $ids ) {
             clean_term_cache( $ids, $taxonomy );
         }
+
+        // Whether the ROLLBACK landed is not knowable from its return value once a hook listener may
+        // have closed the transaction under it, so the answer comes from storage instead. Only the
+        // purge above makes that re-read honest - before it, the in-transaction row is still cached.
+        // An update target legitimately carries an earlier operation's stamp; only this one's ref
+        // means this write is what survived.
+        foreach ( $touched as $id ) {
+            if ( ! ( get_post( $id ) instanceof \WP_Post ) ) {
+                continue;
+            }
+            $stamp = get_post_meta( $id, '_mainwp_child_content_operation_v2', true );
+            if ( hash_equals( (string) $normalized['operation_ref'], (string) $stamp ) ) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Name the failure a rolled-back mutation may honestly claim.
+     *
+     * The Dashboard retries on mutation_failed, so that code may only be given when the site really
+     * is untouched.
+     *
+     * @param bool $rolled_back Whether the rollback demonstrably left no trace.
+     * @return string Closed error code.
+     */
+    private function content_v2_failure_code( $rolled_back ) {
+        return $rolled_back ? 'mutation_failed' : 'outcome_unknown';
     }
 
     /**

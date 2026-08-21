@@ -280,6 +280,62 @@ class Test_Post_Plus_Child_V2 extends WP_UnitTestCase {
 		$this->assertSame( 0, (int) $term->count, 'A rolled-back term count must not keep being served from cache.' );
 	}
 
+	/**
+	 * A listener on mainwp_before_post_update that issues DDL trips MySQL's implicit commit, and the
+	 * ROLLBACK a later failure runs then discards nothing. mutation_failed tells the Dashboard the
+	 * site is untouched and is the answer it retries on, so a post that outlived its own transaction
+	 * may only be reported as outcome_unknown.
+	 */
+	public function test_a_write_that_outlived_its_transaction_is_not_reported_as_mutation_failed() {
+		global $wpdb;
+
+		$payload                   = $this->delivery_payload( '123e4567-e89b-42d3-a456-426614174633', 'Closed transaction' );
+		$payload['post']['tags']   = array( 'closed-transaction-fixture-tag' );
+		$payload['content_digest'] = hash( 'sha256', wp_json_encode( array( $payload['post'], $payload['randomization'] ) ) );
+
+		$captured = 0;
+		$capture  = static function ( $post_id ) use ( &$captured ) {
+			if ( 0 === $captured ) {
+				$captured = (int) $post_id;
+			}
+		};
+		// DDL is the real-world trigger, but the suite holds the connection at autocommit = 0, where
+		// ending one transaction only opens another around the insert that follows - so the ROLLBACK
+		// still discards it and the hazard never shows. Restoring autocommit commits the same
+		// transaction and leaves the connection where an implicit commit leaves it on a live site.
+		$close = static function () use ( $wpdb ) {
+			$wpdb->query( 'SET autocommit = 1' );
+		};
+		$refuse = static function () {
+			return new \WP_Error( 'fixture_term_refused', 'Term creation refused.' );
+		};
+		add_action( 'mainwp_before_post_update', $close );
+		add_action( 'wp_insert_post', $capture );
+		add_filter( 'pre_insert_term', $refuse );
+		$result = $this->request( 'post_plus_newpost_v2', $payload );
+		remove_filter( 'pre_insert_term', $refuse );
+		remove_action( 'wp_insert_post', $capture );
+		remove_action( 'mainwp_before_post_update', $close );
+
+		$this->assertGreaterThan( 0, $captured );
+		clean_post_cache( $captured );
+		$durable = get_post( $captured );
+		$stamp   = get_post_meta( $captured, '_mainwp_child_content_operation_v2', true );
+		// The commit moved this row outside the transaction the suite rolls back, so it is only gone
+		// if this test removes it - and it has to go before the first assertion that can fail.
+		if ( $durable instanceof \WP_Post ) {
+			wp_delete_post( $captured, true );
+		}
+		// The delete above has to be durable too, so autocommit goes back only once it has run.
+		// Everything this test writes from here is inside the suite's transaction again, which is
+		// what stops one fixture from making the rest of the case durable for the next test.
+		$wpdb->query( 'SET autocommit = 0' );
+
+		$this->assertInstanceOf( \WP_Post::class, $durable, 'The fixture must leave a durable post or it is not exercising this hazard.' );
+		$this->assertSame( $payload['operation_ref'], $stamp );
+		$this->assertSame( 'outcome_unknown', $result['code'], 'mutation_failed asserts the site is untouched, and this post survived.' );
+	}
+
 	public function test_full_ledger_evicts_only_the_receipts_that_can_no_longer_be_replayed() {
 		update_option( 'mainwp_child_post_plus_operations_v2', $this->aged_ledger( 'applied' ), false );
 		$payload = $this->delivery_payload( '123e4567-e89b-42d3-a456-426614174623', 'Ledger eviction' );

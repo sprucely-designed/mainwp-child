@@ -49,6 +49,46 @@ class Test_MainWP_Child_WP_Rocket_V2_Fixture extends MainWP_Child_WP_Rocket {
 	}
 }
 
+/** A lock backend that cannot answer GET_LOCK(). */
+class Test_MainWP_Child_WP_Rocket_V2_Broken_Wpdb {
+
+	/** @var string */
+	public $last_error = '';
+
+	/** @var string */
+	private $error;
+
+	/** @var string|null */
+	private $result;
+
+	/**
+	 * @param string      $error  Driver error reported after the query, empty when the driver itself is fine.
+	 * @param string|null $result GET_LOCK() result.
+	 */
+	public function __construct( $error, $result ) {
+		$this->error  = $error;
+		$this->result = $result;
+	}
+
+	/**
+	 * @param string $query Query.
+	 * @param mixed  ...$args Placeholder values.
+	 * @return string
+	 */
+	public function prepare( $query, ...$args ) {
+		return $query;
+	}
+
+	/**
+	 * @param string $query Query.
+	 * @return string|null
+	 */
+	public function get_var( $query ) {
+		$this->last_error = $this->error;
+		return $this->result;
+	}
+}
+
 /** WP Rocket protocol-v2 contract tests. */
 class Test_MainWP_Child_WP_Rocket_V2 extends WP_UnitTestCase {
 
@@ -570,6 +610,47 @@ class Test_MainWP_Child_WP_Rocket_V2 extends WP_UnitTestCase {
 
 		$this->assertFalse( $result['ok'] );
 		$this->assertSame( 'lock_busy', $result['error_code'] );
+		$this->assertSame( array(), $this->rocket->provider_calls );
+		$this->assertSame( array(), get_option( 'mainwp_wp_rocket_abilities_v2_receipts', array() ) );
+	}
+
+	/** A lock backend that cannot answer is refused as a store failure, not as someone else's lock. */
+	public function test_an_unusable_lock_backend_is_refused_apart_from_a_held_lock() {
+		// The lock name reads home_url(), so it is resolved while the real connection is still in place.
+		$name    = $this->rocket->fixture_lock_name();
+		$request = array(
+			'protocol'    => '2',
+			'operation'   => 'optimize_database',
+			'request_ref' => '123e4567-e89b-42d3-a456-426614174922',
+			'payload'     => array( 'categories' => array( 'revisions' ) ),
+		);
+
+		$backends = array(
+			'driver error'     => new Test_MainWP_Child_WP_Rocket_V2_Broken_Wpdb( 'MySQL server has gone away', null ),
+			'GET_LOCK is NULL' => new Test_MainWP_Child_WP_Rocket_V2_Broken_Wpdb( '', null ),
+		);
+		foreach ( $backends as $label => $backend ) {
+			$real            = $GLOBALS['wpdb'];
+			$GLOBALS['wpdb'] = $backend;
+			try {
+				$result = $this->invoke_v2( $request );
+			} finally {
+				$GLOBALS['wpdb'] = $real;
+			}
+
+			$this->assertFalse( $result['ok'], $label );
+			$this->assertSame( 'storage_unavailable', $result['error_code'], $label );
+		}
+
+		$other = new wpdb( DB_USER, DB_PASSWORD, DB_NAME, DB_HOST );
+		$other->suppress_errors( true );
+		$this->assertSame( '1', (string) $other->get_var( $other->prepare( 'SELECT GET_LOCK(%s,0)', $name ) ) );
+		$held = $this->invoke_v2( $request );
+		$other->get_var( $other->prepare( 'SELECT RELEASE_LOCK(%s)', $name ) );
+		$other->close();
+
+		$this->assertFalse( $held['ok'] );
+		$this->assertSame( 'lock_busy', $held['error_code'] );
 		$this->assertSame( array(), $this->rocket->provider_calls );
 		$this->assertSame( array(), get_option( 'mainwp_wp_rocket_abilities_v2_receipts', array() ) );
 	}

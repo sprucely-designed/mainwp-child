@@ -1117,6 +1117,24 @@ class MainWP_Child_Updates { //phpcs:ignore -- NOSONAR - multi methods.
             return;
         }
 
+        if ( 'update_plugin' === $premium_action || 'plugin' === $legacy_type ) {
+            MainWP_Child_Updraft_Plus_Backups::register_premium_update_guards();
+        }
+
+        // Legacy process compatibility.
+        // phpcs:disable WordPress.Security.NonceVerification
+        if ( isset( $_GET['_detect_plugins_updates'] ) && 'yes' === $_GET['_detect_plugins_updates'] ) {
+            $legacy_action = 'detect_plugin';
+        } elseif ( isset( $_GET['_detect_themes_updates'] ) && 'yes' === $_GET['_detect_themes_updates'] ) {
+            $legacy_action = 'detect_theme';
+        }
+
+        $legacy_type = isset( $_GET['_request_update_premiums_type'] ) ? sanitize_text_field( wp_unslash( $_GET['_request_update_premiums_type'] ) ) : '';
+
+        if ( ! in_array( $premium_action, array( 'detect_plugin', 'detect_theme', 'update_plugin', 'update_theme' ), true ) && ! in_array( $legacy_action, array( 'detect_plugin', 'detect_theme' ), true ) && ! in_array( $legacy_type, array( 'plugin', 'theme' ), true ) ) {
+            return;
+        }
+
         // Legacy process compatibility.
         // phpcs:disable WordPress.Security.NonceVerification
         if ( 'detect_plugin' === $premium_action || 'detect_plugin' === $legacy_action ) {

@@ -501,6 +501,142 @@ class Test_Post_Plus_Child_V2 extends WP_UnitTestCase {
 		$this->assertSame( 'outcome_unknown', $result['code'], 'mutation_failed asserts the site is untouched, and this change survived.' );
 	}
 
+	/**
+	 * A Dashboard may resend an update whose fields already hold the values the row holds, and every
+	 * post column then comes back equal to the pre-operation snapshot. The operation still writes its
+	 * two meta values, so the implicit commit leaves this operation's stamp on a row the column
+	 * comparison reads as untouched, and mutation_failed sends the Dashboard back to repeat a write
+	 * that is already durable.
+	 */
+	public function test_a_durable_update_that_changed_no_column_is_caught_by_its_own_stamp() {
+		global $wpdb;
+
+		$create = $this->unchanged_update_payload( '123e4567-e89b-42d3-a456-426614174645', 'Unchanged durable update' );
+		$first  = $this->request( 'post_plus_newpost_v2', $create );
+		$this->assertTrue( $first['ok'] );
+		$posts = $this->operation_posts( $create['operation_ref'] );
+		$this->assertCount( 1, $posts );
+		$target = (int) $posts[0]->ID;
+		$before = get_post( $target );
+
+		// Resending the stored values verbatim - down to the category the create fell back to and the
+		// tag it attached - is what leaves the columns and both taxonomies equal. Only the second tag
+		// is new, and wp_set_object_terms() gives up on it before it can move anything.
+		$default                      = get_term( (int) get_option( 'default_category' ), 'category' );
+		$fixture_tag                  = get_term_by( 'slug', 'fixture', 'post_tag' );
+		$update                       = $this->unchanged_update_payload( '123e4567-e89b-42d3-a456-426614174646', 'Unchanged durable update' );
+		$update['mode']               = 'update';
+		$update['target_post_id']     = $target;
+		$update['expected_revision']  = $first['post_revision'];
+		$update['post']['categories'] = array( $default->slug );
+		$update['post']['tags']       = array( 'fixture', 'unchanged-update-refused-tag' );
+		$update['content_digest']     = hash( 'sha256', wp_json_encode( array( $update['post'], $update['randomization'] ) ) );
+
+		$close = static function () use ( $wpdb ) {
+			$wpdb->query( 'SET autocommit = 1' );
+		};
+		$pin    = $this->same_second_pin( $target, $before );
+		$refuse = static function () {
+			return new \WP_Error( 'fixture_term_refused', 'Term creation refused.' );
+		};
+		add_action( 'mainwp_before_post_update', $close );
+		add_filter( 'wp_insert_post_data', $pin, 10, 2 );
+		add_filter( 'pre_insert_term', $refuse );
+		$result = $this->request( 'post_plus_newpost_v2', $update );
+		remove_filter( 'pre_insert_term', $refuse );
+		remove_filter( 'wp_insert_post_data', $pin, 10 );
+		remove_action( 'mainwp_before_post_update', $close );
+
+		clean_post_cache( $target );
+		$durable    = get_post( $target );
+		$stamp      = get_post_meta( $target, '_mainwp_child_content_operation_v2', true );
+		$categories = array_map( 'intval', wp_get_object_terms( $target, 'category', array( 'fields' => 'ids' ) ) );
+		$tags       = array_map( 'intval', wp_get_object_terms( $target, 'post_tag', array( 'fields' => 'ids' ) ) );
+		if ( $durable instanceof \WP_Post ) {
+			wp_delete_post( $target, true );
+		}
+		$wpdb->query( 'SET autocommit = 0' );
+
+		$this->assertInstanceOf( \WP_Post::class, $durable, 'The fixture must leave a durable post or it is not exercising this hazard.' );
+		$this->assertSame( $this->post_columns( $before ), $this->post_columns( $durable ), 'The fixture must leave every post column equal or the column comparison was never fooled.' );
+		$this->assertSame( array( (int) $default->term_id ), $categories, 'The categories must be unchanged or the term comparison, not the stamp, is what caught this.' );
+		$this->assertSame( array( (int) $fixture_tag->term_id ), $tags, 'The tags must be unchanged or the term comparison, not the stamp, is what caught this.' );
+		$this->assertSame( $update['operation_ref'], $stamp, 'The fixture must leave this operation stamp durable or it proves nothing about the stamp.' );
+		$this->assertSame( 'outcome_unknown', $result['code'], 'mutation_failed asserts the site is untouched, and this operation stamp survived.' );
+	}
+
+	/**
+	 * The same blind spot with the stamp write suppressed: the columns are equal and the row still
+	 * carries the earlier operation's stamp, while the category this operation attached before the
+	 * tag write failed is durable. The terms are the rest of what the operation writes, so they have
+	 * to answer for themselves.
+	 */
+	public function test_a_durable_update_that_changed_no_column_is_caught_by_its_terms() {
+		global $wpdb;
+
+		$existing = term_exists( 'taxonomy-witness-category', 'category' );
+		if ( is_array( $existing ) ) {
+			$category_id = (int) $existing['term_id'];
+		} else {
+			$created = wp_insert_term( 'Taxonomy Witness', 'category', array( 'slug' => 'taxonomy-witness-category' ) );
+			$this->assertIsArray( $created );
+			$category_id = (int) $created['term_id'];
+		}
+
+		$create = $this->unchanged_update_payload( '123e4567-e89b-42d3-a456-426614174647', 'Unchanged durable terms' );
+		$first  = $this->request( 'post_plus_newpost_v2', $create );
+		$this->assertTrue( $first['ok'] );
+		$posts = $this->operation_posts( $create['operation_ref'] );
+		$this->assertCount( 1, $posts );
+		$target = (int) $posts[0]->ID;
+		$before = get_post( $target );
+
+		// The category exists already, so the refusal below cannot reach it and that write lands; the
+		// tag slug is new, so the refusal ends the operation on the very next write.
+		$update                       = $this->unchanged_update_payload( '123e4567-e89b-42d3-a456-426614174648', 'Unchanged durable terms' );
+		$update['mode']               = 'update';
+		$update['target_post_id']     = $target;
+		$update['expected_revision']  = $first['post_revision'];
+		$update['post']['categories'] = array( 'taxonomy-witness-category' );
+		$update['post']['tags']       = array( 'taxonomy-witness-refused-tag' );
+		$update['content_digest']     = hash( 'sha256', wp_json_encode( array( $update['post'], $update['randomization'] ) ) );
+
+		$close = static function () use ( $wpdb ) {
+			$wpdb->query( 'SET autocommit = 1' );
+		};
+		$pin     = $this->same_second_pin( $target, $before );
+		$unstamp = static function ( $check, $object_id, $meta_key ) {
+			return '_mainwp_child_content_operation_v2' === $meta_key ? false : $check;
+		};
+		$refuse = static function () {
+			return new \WP_Error( 'fixture_term_refused', 'Term creation refused.' );
+		};
+		add_action( 'mainwp_before_post_update', $close );
+		add_filter( 'wp_insert_post_data', $pin, 10, 2 );
+		add_filter( 'update_post_metadata', $unstamp, 10, 3 );
+		add_filter( 'pre_insert_term', $refuse );
+		$result = $this->request( 'post_plus_newpost_v2', $update );
+		remove_filter( 'pre_insert_term', $refuse );
+		remove_filter( 'update_post_metadata', $unstamp, 10 );
+		remove_filter( 'wp_insert_post_data', $pin, 10 );
+		remove_action( 'mainwp_before_post_update', $close );
+
+		clean_post_cache( $target );
+		$durable    = get_post( $target );
+		$stamp      = get_post_meta( $target, '_mainwp_child_content_operation_v2', true );
+		$categories = array_map( 'intval', wp_get_object_terms( $target, 'category', array( 'fields' => 'ids' ) ) );
+		if ( $durable instanceof \WP_Post ) {
+			wp_delete_post( $target, true );
+		}
+		$wpdb->query( 'SET autocommit = 0' );
+
+		$this->assertInstanceOf( \WP_Post::class, $durable, 'The fixture must leave a durable post or it is not exercising this hazard.' );
+		$this->assertSame( $this->post_columns( $before ), $this->post_columns( $durable ), 'The fixture must leave every post column equal or the column comparison was never fooled.' );
+		$this->assertSame( $create['operation_ref'], $stamp, 'The target must still carry the earlier operation stamp or the stamp check, not the terms, is what caught this.' );
+		$this->assertSame( array( $category_id ), $categories, 'The fixture must leave the attached category durable or it is not exercising this hazard.' );
+		$this->assertSame( 'outcome_unknown', $result['code'], 'mutation_failed asserts the site is untouched, and this term write survived.' );
+	}
+
 	public function test_full_ledger_evicts_only_the_receipts_that_can_no_longer_be_replayed() {
 		update_option( 'mainwp_child_post_plus_operations_v2', $this->aged_ledger( 'applied' ), false );
 		$payload = $this->delivery_payload( '123e4567-e89b-42d3-a456-426614174623', 'Ledger eviction' );
@@ -851,6 +987,82 @@ class Test_Post_Plus_Child_V2 extends WP_UnitTestCase {
 			'post'              => $post,
 			'randomization'     => $randomization,
 		);
+	}
+
+	/**
+	 * Build a delivery payload whose choices are the same on every operation_ref.
+	 *
+	 * The frozen random choices are seeded from the operation_ref, so the stock payload gives a
+	 * create and the update that follows it a different author and a different post date - which is
+	 * a changed column, and a changed column is a trace the witness is already able to see. An empty
+	 * role list pins the author to the current user and an absent date range leaves post_date alone,
+	 * so the two operations agree on everything the row stores.
+	 */
+	private function unchanged_update_payload( $operation_ref, $title ) {
+		$payload                  = $this->delivery_payload( $operation_ref, $title );
+		$payload['randomization'] = array(
+			'roles'           => array(),
+			'random_category' => false,
+			'date_from'       => null,
+			'date_to'         => null,
+			'timezone'        => 'UTC',
+		);
+		$payload['content_digest'] = hash( 'sha256', wp_json_encode( array( $payload['post'], $payload['randomization'] ) ) );
+		return $payload;
+	}
+
+	/**
+	 * Hold an update's four date columns at the values the row already carries.
+	 *
+	 * wp_insert_post() restamps post_date and post_modified from the clock on every update, so an
+	 * update that stores no change still differs from its snapshot unless it lands inside the same
+	 * second. That is a race, not a difference, and pinning the four columns is how the case gets
+	 * tested without one.
+	 */
+	private function same_second_pin( $target, $before ) {
+		return static function ( $data, $postarr ) use ( $target, $before ) {
+			if ( isset( $postarr['ID'] ) && $target === (int) $postarr['ID'] ) {
+				$data['post_date']         = $before->post_date;
+				$data['post_date_gmt']     = $before->post_date_gmt;
+				$data['post_modified']     = $before->post_modified;
+				$data['post_modified_gmt'] = $before->post_modified_gmt;
+			}
+			return $data;
+		};
+	}
+
+	/**
+	 * Read every post column wp_insert_post() writes, so "no column changed" is an assertion.
+	 */
+	private function post_columns( $post ) {
+		$columns = array(
+			'post_author',
+			'post_date',
+			'post_date_gmt',
+			'post_content',
+			'post_content_filtered',
+			'post_title',
+			'post_excerpt',
+			'post_status',
+			'post_type',
+			'comment_status',
+			'ping_status',
+			'post_password',
+			'post_name',
+			'to_ping',
+			'pinged',
+			'post_modified',
+			'post_modified_gmt',
+			'post_parent',
+			'menu_order',
+			'post_mime_type',
+			'guid',
+		);
+		$values  = array();
+		foreach ( $columns as $column ) {
+			$values[ $column ] = (string) $post->$column;
+		}
+		return $values;
 	}
 
 	private function identity( $payload ) {

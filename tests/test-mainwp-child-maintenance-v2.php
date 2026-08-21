@@ -927,6 +927,63 @@ class Test_MainWP_Child_Maintenance_V2 extends WP_UnitTestCase {
 		);
 	}
 
+	/**
+	 * The read that picks the batch is the part of an iteration that can take unbounded time, and it
+	 * hands back a valid batch either way. Checking the clock only at the top of the loop lets a slow
+	 * read spend the whole budget and the 500-row delete run anyway, on the margin reserved for
+	 * settling the record. The sweep has to stop on the completed read, with nothing destroyed.
+	 */
+	public function test_revision_sweep_stops_when_the_batch_read_itself_consumes_the_budget() {
+		global $wpdb, $timestart;
+		$parent_id = self::factory()->post->create();
+		$this->insert_revisions( $parent_id, 503 );
+
+		$original_limit     = ini_get( 'max_execution_time' );
+		$original_timestart = $timestart;
+		ini_set( 'max_execution_time', MainWP_Child_Maintenance::ABILITIES_V2_REVISION_SWEEP_MARGIN + 2 );
+		$timestart = microtime( true );
+		// Burn the budget inside the batch's own ID query and let it complete normally, so the sweep
+		// holds a valid batch of 500 IDs and no time left to delete them in.
+		$stall = static function ( $query ) {
+			static $stalled = false;
+			if ( ! $stalled && 1 === preg_match( '/^\s*SELECT\s+ID\s+FROM\s+\S*posts\b.*post_parent\s*=/is', $query ) ) {
+				$stalled = true;
+				$until   = time() + 2;
+				while ( time() < $until ) {
+					usleep( 50000 );
+				}
+			}
+			return $query;
+		};
+
+		add_filter( 'query', $stall );
+		try {
+			list( , $result ) = $this->real_execute( $this->real_subject(), array( 'revisions' ), 2, '123e4567-e89b-42d3-a456-426614174523' );
+		} finally {
+			remove_filter( 'query', $stall );
+			ini_set( 'max_execution_time', $original_limit );
+			$timestart = $original_timestart;
+		}
+
+		$this->assertTrue( $result['ok'] );
+		$this->assertSame( 'unknown', $result['status'] );
+		$this->assertSame(
+			array(
+				'action'     => 'revisions',
+				'status'     => 'unknown',
+				'affected'   => 0,
+				'error_code' => 'outcome_unknown',
+			),
+			$result['outcomes'][0],
+			'A read that ate the budget has destroyed nothing, and the outcome has to say so.'
+		);
+		$this->assertSame(
+			'503',
+			$wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM $wpdb->posts WHERE post_type = 'revision' AND post_parent = %d", $parent_id ) ),
+			'The batch the read returned must not be deleted on a budget that is already gone.'
+		);
+	}
+
 	/** Fill one parent with revisions cheaply; the sweep only ever reads them through SQL. */
 	private function insert_revisions( $parent_id, $count ) {
 		global $wpdb;

@@ -1066,6 +1066,19 @@ class MainWP_Child_Maintenance {
                     'error_code' => null,
                 );
             }
+            // The page query is the unbounded half of an iteration: it groups the whole revision set
+            // on a site large enough to need paging, so it can eat the rest of the budget on its own
+            // and hand back a perfectly valid page. Checking only at the top of the loop would spend
+            // that page on deletes the margin no longer covers, which is the fatal-with-an-unsettled
+            // -record this bound exists to prevent. A read is free to abandon - nothing was destroyed,
+            // so the count already gathered stays true.
+            if ( time() >= $deadline ) {
+                return array(
+                    'status'     => 'unknown',
+                    'affected'   => $affected,
+                    'error_code' => 'outcome_unknown',
+                );
+            }
             $page_affected = 0;
             foreach ( $parents as $parent ) {
                 if ( ! is_numeric( $parent ) ) {
@@ -1121,6 +1134,16 @@ class MainWP_Child_Maintenance {
                 return array(
                     'deleted' => $deleted,
                     'status'  => 'completed',
+                );
+            }
+            // Same reason the pages re-check after their read: an ORDER BY over one parent's
+            // revisions can outlast whatever budget was left and still return its batch, and the
+            // delete underneath is what must not start without margin to settle the record. Stopping
+            // on a completed read destroys nothing, so $deleted is still exactly what left the table.
+            if ( time() >= $deadline ) {
+                return array(
+                    'deleted' => $deleted,
+                    'status'  => 'out_of_time',
                 );
             }
             foreach ( $ids as $id ) {

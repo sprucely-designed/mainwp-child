@@ -1007,6 +1007,10 @@ class MainWP_Child_Posts { //phpcs:ignore -- NOSONAR - multi methods.
         }
         $old_post   = 'update' === $normalized['mode'] ? get_post( $normalized['target_post_id'] ) : null;
         $old_status = $old_post instanceof \WP_Post ? $old_post->post_status : '';
+        // Taken here because this is the last moment before the operation writes anything; the term
+        // IDs content_v2_rollback() collects for its cache purge are read after the writes and cannot
+        // stand in for it.
+        $old_terms = $old_post instanceof \WP_Post ? $this->content_v2_term_snapshot( $old_post->ID ) : null;
         if ( false === $wpdb->query( 'START TRANSACTION' ) ) { // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
             return $this->content_v2_error( $protocol, $operation, 'storage_unavailable' );
         }
@@ -1052,35 +1056,35 @@ class MainWP_Child_Posts { //phpcs:ignore -- NOSONAR - multi methods.
 
         $post_id = wp_insert_post( wp_slash( $postarr ), true );
         if ( is_wp_error( $post_id ) || ! is_int( $post_id ) || 1 > $post_id ) {
-            $rolled_back = $this->content_v2_rollback( null, $normalized, $old_post );
+            $rolled_back = $this->content_v2_rollback( null, $normalized, $old_post, $old_terms );
             return $this->content_v2_error( $protocol, $operation, $this->content_v2_failure_code( $rolled_back ) );
         }
         if ( ! empty( $normalized['post']['categories'] ) ) {
             $category_ids = $this->content_v2_category_ids( $normalized['post']['categories'] );
             $terms        = false === $category_ids ? false : wp_set_post_categories( $post_id, $category_ids, false );
             if ( false === $terms || is_wp_error( $terms ) ) {
-                $rolled_back = $this->content_v2_rollback( $post_id, $normalized, $old_post );
+                $rolled_back = $this->content_v2_rollback( $post_id, $normalized, $old_post, $old_terms );
                 return $this->content_v2_error( $protocol, $operation, $this->content_v2_failure_code( $rolled_back ) );
             }
         }
         if ( null !== $choices['category_id'] ) {
             $terms = wp_set_post_categories( $post_id, array( $choices['category_id'] ), true );
             if ( is_wp_error( $terms ) ) {
-                $rolled_back = $this->content_v2_rollback( $post_id, $normalized, $old_post );
+                $rolled_back = $this->content_v2_rollback( $post_id, $normalized, $old_post, $old_terms );
                 return $this->content_v2_error( $protocol, $operation, $this->content_v2_failure_code( $rolled_back ) );
             }
         }
         if ( ! empty( $normalized['post']['tags'] ) ) {
             $terms = wp_set_post_terms( $post_id, $normalized['post']['tags'], 'post_tag', false );
             if ( is_wp_error( $terms ) ) {
-                $rolled_back = $this->content_v2_rollback( $post_id, $normalized, $old_post );
+                $rolled_back = $this->content_v2_rollback( $post_id, $normalized, $old_post, $old_terms );
                 return $this->content_v2_error( $protocol, $operation, $this->content_v2_failure_code( $rolled_back ) );
             }
         }
 
         $revision = $this->content_v2_post_revision( $post_id );
         if ( false === $revision ) {
-            $this->content_v2_rollback( $post_id, $normalized, $old_post );
+            $this->content_v2_rollback( $post_id, $normalized, $old_post, $old_terms );
             return $this->content_v2_error( $protocol, $operation, 'outcome_unknown' );
         }
         $record['post_id']                   = $post_id;
@@ -1090,7 +1094,7 @@ class MainWP_Child_Posts { //phpcs:ignore -- NOSONAR - multi methods.
         $record['updated_at']                = time();
         $records[ $record['operation_ref'] ] = $record;
         if ( ! $this->content_v2_write_records( $protocol, $records ) || false === $wpdb->query( 'COMMIT' ) ) { // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
-            $this->content_v2_rollback( $post_id, $normalized, $old_post );
+            $this->content_v2_rollback( $post_id, $normalized, $old_post, $old_terms );
             wp_cache_delete( $this->content_v2_option( $protocol ), 'options' );
             return $this->content_v2_error( $protocol, $operation, 'outcome_unknown' );
         }
@@ -1133,9 +1137,10 @@ class MainWP_Child_Posts { //phpcs:ignore -- NOSONAR - multi methods.
      * @param int|null      $post_id    Post touched inside the transaction, when one exists.
      * @param array         $normalized Valid normalized mutation.
      * @param \WP_Post|null $old_post   Update target as it stood before the transaction opened.
+     * @param array|null    $old_terms  Update target's terms before the transaction opened, or null.
      * @return bool True when no trace of this operation survived, false when one did.
      */
-    private function content_v2_rollback( $post_id, $normalized, $old_post ) {
+    private function content_v2_rollback( $post_id, $normalized, $old_post, $old_terms ) {
         global $wpdb;
 
         $touched = array_values(
@@ -1169,10 +1174,11 @@ class MainWP_Child_Posts { //phpcs:ignore -- NOSONAR - multi methods.
         // Whether the ROLLBACK landed is not knowable from its return value once a hook listener may
         // have closed the transaction under it, so the answer comes from storage instead. Only the
         // purge above makes that re-read honest - before it, the in-transaction row is still cached.
-        // The operation stamp cannot be that witness: wp_insert_post() drops what update_post_meta()
-        // returns, so a post the implicit commit made durable can be carrying no stamp at all, and
-        // an update target carries an earlier operation's stamp either way. Only the post row can
-        // say what is stored.
+        // Every check below may only convict, never acquit: any one of them finding a trace is the
+        // answer, and reaching the end without one is the only way to report a landed rollback. That
+        // is why the operation stamp appears among them but never clears anything - wp_insert_post()
+        // drops what update_post_meta() returns, so a post the implicit commit made durable can be
+        // carrying no stamp at all.
         foreach ( $touched as $id ) {
             $post = get_post( $id );
             if ( ! $post instanceof \WP_Post ) {
@@ -1189,6 +1195,16 @@ class MainWP_Child_Posts { //phpcs:ignore -- NOSONAR - multi methods.
                 // to retry a write that may already be durable.
                 return false;
             }
+            if ( get_post_meta( $id, '_mainwp_child_content_operation_v2', true ) === $normalized['operation_ref'] ) {
+                // Positive evidence only, which is not the check that was taken out of here. What was
+                // wrong was reading a *missing* stamp as proof the rollback landed: wp_insert_post()
+                // throws away what update_post_meta() returns, so a durable row can carry no stamp at
+                // all. Finding this operation's own ref stored has no such hole - the stamp is written
+                // inside the transaction and nothing outside this operation writes that value - so it
+                // is the write itself outliving the ROLLBACK. An update target that was not restamped
+                // still carries some earlier operation's ref, which never equals this one.
+                return false;
+            }
             // The question is whether the row is what it was before this operation, never whether
             // what the operation meant to write is there. Anything on wp_insert_post()'s own path -
             // wp_insert_post_data above all - may rewrite a field between the payload and storage,
@@ -1198,10 +1214,10 @@ class MainWP_Child_Posts { //phpcs:ignore -- NOSONAR - multi methods.
             // and post_modified_gmt is among them because the update path restamps it even when the
             // content it stored was unchanged.
             //
-            // Honest edge: an update that stored exactly what was already there leaves the two
-            // states identical (down to a restamp inside the same second), and calling that a
-            // landed rollback is right - nothing changed either way, so mutation_failed still
-            // describes the post truthfully.
+            // Equal columns end nothing on their own: an update that stored the values the row
+            // already held leaves them all equal (down to a restamp inside the same second) while
+            // the meta and term writes this operation also makes may be sitting there durable, so
+            // the checks around this one are what answer for the rest of the write.
             $columns = array(
                 'post_author',
                 'post_date',
@@ -1230,8 +1246,38 @@ class MainWP_Child_Posts { //phpcs:ignore -- NOSONAR - multi methods.
                     return false;
                 }
             }
+            // The categories and tags are written after the row and are the rest of what a closed
+            // transaction can leave behind, so the same question has to be put to them: is the
+            // taxonomy what it was before this operation ran? Sets of IDs, sorted, because the order
+            // wp_get_object_terms() returns is not a change. An unreadable state on either side is
+            // a state that cannot be cleared, which is outcome_unknown for the same reason a missing
+            // post snapshot is.
+            $new_terms = $this->content_v2_term_snapshot( $id );
+            if ( null === $old_terms || null === $new_terms || $old_terms !== $new_terms ) {
+                return false;
+            }
         }
         return true;
+    }
+
+    /**
+     * Read one post's category and tag membership as a comparable set of term IDs.
+     *
+     * @param int $post_id Positive post ID.
+     * @return array|null Sorted term IDs per taxonomy, or null when a taxonomy could not be read.
+     */
+    private function content_v2_term_snapshot( $post_id ) {
+        $snapshot = array();
+        foreach ( array( 'category', 'post_tag' ) as $taxonomy ) {
+            $ids = wp_get_object_terms( $post_id, $taxonomy, array( 'fields' => 'ids' ) );
+            if ( ! is_array( $ids ) ) {
+                return null;
+            }
+            $ids = array_map( 'intval', $ids );
+            sort( $ids, SORT_NUMERIC );
+            $snapshot[ $taxonomy ] = $ids;
+        }
+        return $snapshot;
     }
 
     /**

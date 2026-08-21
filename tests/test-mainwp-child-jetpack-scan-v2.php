@@ -51,6 +51,7 @@ class Test_MainWP_Child_Jetpack_Scan_V2 extends WP_UnitTestCase {
 	public function test_visibility_get_normalizes_hidden_missing_and_malformed_state() {
 		$this->subject->is_plugin_installed = true;
 		update_option( 'mainwp_child_jetpack_scan_hide_plugin', 'hide' );
+		update_option( 'mainwp_child_jetpack_protect_hide_plugin', 'hide' );
 		$hidden = $this->request( 'visibility_get', array() );
 		$this->assertSame( 'hidden', $hidden['visibility'] );
 
@@ -91,7 +92,7 @@ class Test_MainWP_Child_Jetpack_Scan_V2 extends WP_UnitTestCase {
 		$this->assertTrue( $result['changed'] );
 		$this->assertSame( 'hidden', $result['visibility'] );
 		$this->assertSame( 'hide', get_option( 'mainwp_child_jetpack_scan_hide_plugin' ) );
-		$this->assertSame( hash( 'sha256', 'active|hidden' ), $result['revision'] );
+		$this->assertSame( hash( 'sha256', 'active|hidden|hide|hide' ), $result['revision'] );
 
 		$replay = $this->request(
 			'visibility_set',
@@ -249,32 +250,90 @@ class Test_MainWP_Child_Jetpack_Scan_V2 extends WP_UnitTestCase {
 	}
 
 	/**
-	 * The protect class's own legacy set_showhide() writes only the protect option, so a site
-	 * can be hiding the plugin with the scan option clear. Reading the scan option alone would
-	 * report visible for a plugin the admin cannot see.
+	 * The two options hide different plugin rows (scan hides 'jetpack', protect hides
+	 * 'jetpack-protect'), so no single row's state follows from one option. Visibility reports
+	 * the toggle pair the legacy set_showhide() flips as one switch, and refuses a definite
+	 * answer on a pair it cannot attest: mixed or malformed is unknown, never a guess a plugin
+	 * row contradicts.
 	 */
-	public function test_visibility_get_reports_hidden_when_either_hide_option_is_set() {
+	public function test_visibility_get_reports_only_the_toggle_pair_it_can_attest() {
 		$this->subject->is_plugin_installed = true;
 
 		update_option( 'mainwp_child_jetpack_scan_hide_plugin', 'show' );
 		update_option( 'mainwp_child_jetpack_protect_hide_plugin', 'hide' );
-		$divergent = $this->request( 'visibility_get', array() );
-		$this->assertSame( 'hidden', $divergent['visibility'] );
+		$mixed = $this->request( 'visibility_get', array() );
+		$this->assertSame( 'unknown', $mixed['visibility'] );
 
-		// A malformed value beside a live 'hide' does not soften the answer: the hide fires anyway.
 		update_option( 'mainwp_child_jetpack_scan_hide_plugin', 'hide' );
-		update_option( 'mainwp_child_jetpack_protect_hide_plugin', array( 'hide' ) );
-		$still_hidden = $this->request( 'visibility_get', array() );
-		$this->assertSame( 'hidden', $still_hidden['visibility'] );
+		$both_hidden = $this->request( 'visibility_get', array() );
+		$this->assertSame( 'hidden', $both_hidden['visibility'] );
 
-		// A malformed value with nothing hiding is not visible; it is unknown.
-		update_option( 'mainwp_child_jetpack_scan_hide_plugin', 'show' );
+		update_option( 'mainwp_child_jetpack_protect_hide_plugin', array( 'hide' ) );
 		$malformed = $this->request( 'visibility_get', array() );
 		$this->assertSame( 'unknown', $malformed['visibility'] );
 
+		update_option( 'mainwp_child_jetpack_scan_hide_plugin', 'show' );
 		delete_option( 'mainwp_child_jetpack_protect_hide_plugin' );
 		$clean = $this->request( 'visibility_get', array() );
 		$this->assertSame( 'visible', $clean['visibility'] );
+	}
+
+	/**
+	 * The revision must cover both raw toggles, not only the derived visibility: other writers
+	 * (the legacy actions, the protect class's own ability) can move the pair to a different
+	 * state with the same derived string, and a set holding the older revision would silently
+	 * erase those newer writes.
+	 */
+	public function test_visibility_set_rejects_a_revision_from_before_another_writers_change() {
+		$this->subject->is_plugin_installed = true;
+		update_option( 'mainwp_child_jetpack_scan_hide_plugin', 'hide' );
+		update_option( 'mainwp_child_jetpack_protect_hide_plugin', 'show' );
+		$before = $this->request( 'visibility_get', array() );
+		$this->assertSame( 'unknown', $before['visibility'] );
+
+		// Another writer swaps the pair; the derived visibility is still 'unknown'.
+		update_option( 'mainwp_child_jetpack_scan_hide_plugin', 'show' );
+		update_option( 'mainwp_child_jetpack_protect_hide_plugin', 'hide' );
+
+		$stale = $this->request(
+			'visibility_set',
+			array(
+				'desired_state' => 'visible',
+				'if_match'      => $before['revision'],
+			)
+		);
+
+		$this->assertFalse( $stale['ok'] );
+		$this->assertSame( 'stale_revision', $stale['code'] );
+		$this->assertSame( 'show', get_option( 'mainwp_child_jetpack_scan_hide_plugin' ) );
+		$this->assertSame( 'hide', get_option( 'mainwp_child_jetpack_protect_hide_plugin' ) );
+	}
+
+	/**
+	 * A mixed pair is a state the legacy actions can produce, and the converging write is the
+	 * only escape this ability offers from it: refusing 'unknown' outright would leave the
+	 * Dashboard no move but the legacy action the mixed state came from.
+	 */
+	public function test_visibility_set_recovers_a_mixed_toggle_pair() {
+		$this->subject->is_plugin_installed = true;
+		update_option( 'mainwp_child_jetpack_scan_hide_plugin', 'show' );
+		update_option( 'mainwp_child_jetpack_protect_hide_plugin', 'hide' );
+		$mixed = $this->request( 'visibility_get', array() );
+		$this->assertSame( 'unknown', $mixed['visibility'] );
+
+		$result = $this->request(
+			'visibility_set',
+			array(
+				'desired_state' => 'hidden',
+				'if_match'      => $mixed['revision'],
+			)
+		);
+
+		$this->assertTrue( $result['ok'] );
+		$this->assertTrue( $result['changed'] );
+		$this->assertSame( 'hidden', $result['visibility'] );
+		$this->assertSame( 'hide', get_option( 'mainwp_child_jetpack_scan_hide_plugin' ) );
+		$this->assertSame( 'hide', get_option( 'mainwp_child_jetpack_protect_hide_plugin' ) );
 	}
 
 	public function test_malformed_unknown_and_uuid_alias_requests_fail_closed() {

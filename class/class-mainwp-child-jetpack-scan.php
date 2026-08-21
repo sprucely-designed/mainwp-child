@@ -187,7 +187,13 @@ class MainWP_Child_Jetpack_Scan {
     }
 
     /**
-     * Return the current closed Jetpack Scan visibility state.
+     * Return the closed state of the Jetpack Scan hide-toggle pair.
+     *
+     * The two options hide different plugin rows: this class removes the 'jetpack' row on the
+     * scan option, MainWP_Child_Jetpack_Protect removes 'jetpack-protect' on the protect option,
+     * and the legacy set_showhide() flips both as one switch. Visibility reports that switch:
+     * hidden only when both toggles hide, visible only when neither does, and unknown for a
+     * mixed or malformed pair rather than a definite answer some plugin row contradicts.
      *
      * @return array<string,mixed> Closed visibility response.
      */
@@ -200,15 +206,11 @@ class MainWP_Child_Jetpack_Scan {
             $plugin_state = file_exists( $protect_file ) || file_exists( $jetpack_file ) ? 'inactive' : 'missing';
         }
 
-        $visibility = 'unknown';
+        $scan_option    = get_option( 'mainwp_child_jetpack_scan_hide_plugin', false );
+        $protect_option = get_option( 'mainwp_child_jetpack_protect_hide_plugin', false );
+        $visibility     = 'unknown';
         if ( 'active' === $plugin_state ) {
-            // The plugin is hidden when EITHER option fires: this class hides on the scan option
-            // and MainWP_Child_Jetpack_Protect hides on the protect option, each behind its own
-            // all_plugins filter. Reading one would report visible for a plugin the admin cannot
-            // see, e.g. after the protect class's legacy set_showhide() which writes only its own.
-            $scan_option    = get_option( 'mainwp_child_jetpack_scan_hide_plugin', false );
-            $protect_option = get_option( 'mainwp_child_jetpack_protect_hide_plugin', false );
-            if ( 'hide' === $scan_option || 'hide' === $protect_option ) {
+            if ( 'hide' === $scan_option && 'hide' === $protect_option ) {
                 $visibility = 'hidden';
             } elseif ( $this->abilities_v2_option_shows( $scan_option ) && $this->abilities_v2_option_shows( $protect_option ) ) {
                 $visibility = 'visible';
@@ -221,7 +223,10 @@ class MainWP_Child_Jetpack_Scan {
             'ok'           => true,
             'plugin_state' => $plugin_state,
             'visibility'   => $visibility,
-            'revision'     => hash( 'sha256', $plugin_state . '|' . $visibility ),
+            // Both raw toggles are in the hash, not only the derived visibility: a protect-side
+            // write can change one toggle while the derived string stays the same, and a set
+            // holding the older revision would silently erase that newer write.
+            'revision'     => hash( 'sha256', $plugin_state . '|' . $visibility . '|' . $this->abilities_v2_option_norm( $scan_option ) . '|' . $this->abilities_v2_option_norm( $protect_option ) ),
             'observed_at'  => gmdate( 'Y-m-d\TH:i:s\Z' ),
         );
     }
@@ -235,7 +240,10 @@ class MainWP_Child_Jetpack_Scan {
      */
     private function abilities_v2_replace_visibility( $desired_state, $if_match ) {
         $current = $this->abilities_v2_visibility();
-        if ( 'active' !== $current['plugin_state'] || 'unknown' === $current['visibility'] ) {
+        // Only an inactive plugin refuses. A mixed or malformed pair still accepts the write:
+        // the converging write is the only escape this ability offers from a state the legacy
+        // actions can produce, and the revision binds the exact pair being replaced.
+        if ( 'active' !== $current['plugin_state'] ) {
             return $this->abilities_v2_error( 'visibility_set', 'unsupported_version' );
         }
         if ( ! hash_equals( $current['revision'], $if_match ) ) {
@@ -289,6 +297,19 @@ class MainWP_Child_Jetpack_Scan {
      */
     private function abilities_v2_option_shows( $value ) {
         return false === $value || '' === $value || 'show' === $value;
+    }
+
+    /**
+     * Normalize one hide-option value to the behavior class the revision binds.
+     *
+     * @param mixed $value Raw option value.
+     * @return string
+     */
+    private function abilities_v2_option_norm( $value ) {
+        if ( 'hide' === $value ) {
+            return 'hide';
+        }
+        return $this->abilities_v2_option_shows( $value ) ? 'show' : 'malformed';
     }
 
     /**

@@ -1533,9 +1533,15 @@ class MainWP_Child_Back_WP_Up { //phpcs:ignore -- NOSONAR - multi methods.
     /**
      * Resolve the current provider archive location for one exact hidden target.
      *
-     * Only the FOLDER destination keeps archives under the site's own web root,
-     * which is the one shape the Dashboard can turn back into a managed-site
-     * content URL. Every other destination fails closed here.
+     * Only the FOLDER destination is redeemable: every remote one answers with a remote
+     * location - an FTP host and port, an S3 bucket URL - which the Dashboard cannot turn
+     * back into a managed-site content URL, and which the Child should not be handing out
+     * on the strength of a consumer's strictness it cannot assume. They fail closed here,
+     * before the provider is consulted.
+     *
+     * FOLDER is necessary but not sufficient: BackWPup's local backup directory is
+     * admin-configurable and need not sit under the web root. Binding it there is a paired
+     * change with the Dashboard extension, which today is what rejects such a folder.
      *
      * @param array $target Internal target.
      * @return array|WP_Error

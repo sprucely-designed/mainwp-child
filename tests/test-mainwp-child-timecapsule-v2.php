@@ -38,8 +38,11 @@ class Timecapsule_V2_Factory {
 	}
 }
 
-// A real Time Capsule install, or another suite's stub, may already own the global name; aliasing over it is a fatal.
-if ( ! class_exists( 'WPTC_Factory', false ) ) {
+// A real Time Capsule install, or another suite's stub, may already own the global name;
+// aliasing over it is a fatal. Autoloading stays on: a real WPTC_Factory that is loadable but
+// not yet loaded should win the name, rather than being shadowed for the rest of the run by a
+// stub that claimed it first.
+if ( ! class_exists( 'WPTC_Factory' ) ) {
 	class_alias( __NAMESPACE__ . '\\Timecapsule_V2_Factory', 'WPTC_Factory' );
 }
 

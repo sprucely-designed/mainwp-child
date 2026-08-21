@@ -747,18 +747,14 @@ class Test_MainWP_Child_Staging_V2 extends WP_UnitTestCase {
 	}
 
 	/** An entry no retry can be answered from is given up before any receipt still inside the horizon. */
-	public function test_unreadable_and_future_stamped_entries_are_evicted_before_live_receipts() {
+	public function test_an_unreadable_entry_is_evicted_before_live_receipts() {
 		$this->staging->operation_results['create_clone'] = $this->queued_clone_result();
-		$receipts                                         = $this->fill_receipts( 98, time() );
-		// The two-key shape an earlier build of this branch wrote, and a stamp from a clock that jumped.
-		$receipts['123e4567-e89b-42d3-a456-4266141749b0'] = array(
+		$receipts                                         = $this->fill_receipts( 99, time() );
+		// The two-key shape an earlier build of this branch wrote.
+		$unreadable              = '123e4567-e89b-42d3-a456-4266141749b0';
+		$receipts[ $unreadable ] = array(
 			'effect_hash' => str_repeat( 'e', 64 ),
 			'response'    => array( 'ok' => true ),
-		);
-		$receipts['123e4567-e89b-42d3-a456-4266141749b1'] = array(
-			'effect_hash' => str_repeat( 'f', 64 ),
-			'response'    => array( 'ok' => true ),
-			'created_at'  => time() + YEAR_IN_SECONDS,
 		);
 		update_option( 'mainwp_staging_abilities_v2_operation_receipts', $receipts, false );
 
@@ -768,15 +764,33 @@ class Test_MainWP_Child_Staging_V2 extends WP_UnitTestCase {
 		$this->assertTrue( $result['ok'] );
 		$this->assertCount( 100, $stored );
 		$this->assertArrayHasKey( '123e4567-e89b-42d3-a456-426614174946', $stored );
+		$this->assertArrayNotHasKey( $unreadable, $stored );
+		foreach ( array_keys( $this->fill_receipts( 99, time() ) ) as $live ) {
+			$this->assertArrayHasKey( $live, $stored, 'a receipt still inside the horizon must outlive the unreadable entry' );
+		}
+	}
 
-		// Both disposable entries sort equal, and asort() is only stable from PHP 8.0, so which of
-		// the two goes is not the contract. That exactly one goes, and that no live receipt goes
-		// with it, is.
-		$disposable = array( '123e4567-e89b-42d3-a456-4266141749b0', '123e4567-e89b-42d3-a456-4266141749b1' );
-		$survivors  = array_values( array_intersect( $disposable, array_keys( $stored ) ) );
-		$this->assertCount( 1, $survivors, 'one slot is freed, and it comes from an entry no retry can be answered from' );
-		foreach ( array_keys( $this->fill_receipts( 98, time() ) ) as $live ) {
-			$this->assertArrayHasKey( $live, $stored, 'a receipt still inside the horizon must outlive both disposable entries' );
+	/**
+	 * A host clock that jumps backwards must not turn the whole store into spare capacity.
+	 *
+	 * Every stamp then reads as ahead of the clock, and a receipt that cannot be dated cannot be
+	 * shown to be past the retry horizon, so the store owes a refusal rather than someone else's
+	 * replay evidence.
+	 */
+	public function test_a_backwards_clock_jump_refuses_rather_than_dropping_undatable_receipts() {
+		$this->staging->operation_results['create_clone'] = $this->queued_clone_result();
+		$ahead                                            = time() + ( 2 * DAY_IN_SECONDS );
+		update_option( 'mainwp_staging_abilities_v2_operation_receipts', $this->fill_receipts( 100, $ahead ), false );
+
+		$result = $this->staging->abilities_v2( $this->clone_request( '123e4567-e89b-42d3-a456-426614174947' ) );
+		$stored = get_option( 'mainwp_staging_abilities_v2_operation_receipts', array() );
+
+		$this->assertFalse( $result['ok'] );
+		$this->assertSame( 'storage_unavailable', $result['error_code'] );
+		$this->assertSame( array(), $this->staging->operation_calls, 'no clone job may run behind a refusal' );
+		$this->assertCount( 100, $stored, 'not one receipt is given up to make room' );
+		foreach ( array_keys( $this->fill_receipts( 100, $ahead ) ) as $reference ) {
+			$this->assertArrayHasKey( $reference, $stored );
 		}
 	}
 

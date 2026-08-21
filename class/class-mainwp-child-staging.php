@@ -682,14 +682,17 @@ class MainWP_Child_Staging { //phpcs:ignore -- NOSONAR - multi methods.
         $horizon   = $now - ( DAY_IN_SECONDS + 60 );
         $evictable = array();
         foreach ( $receipts as $reference => $receipt ) {
-            if ( ! $this->abilities_v2_valid_receipt( $receipt ) || $receipt['created_at'] > $now + self::ABILITIES_V2_CLOCK_SKEW ) {
-                // An entry that cannot be read, or that carries a stamp from the future no horizon
-                // will ever pass, answers no retry. Giving those up first is what stops a store
-                // written by an older build, or by a host whose clock jumped, from wedging shut.
+            if ( ! $this->abilities_v2_valid_receipt( $receipt ) ) {
+                // An entry that cannot be read answers no retry, so it is the first thing given up
+                // and the reason a store written by an older build cannot wedge itself shut.
                 $evictable[ $reference ] = 0;
                 continue;
             }
-            if ( $receipt['created_at'] < $horizon ) {
+            // A stamp from ahead of this clock cannot be dated, and a receipt that cannot be dated
+            // cannot be shown to be outside the retry horizon. A host whose clock jumped backwards
+            // would otherwise make every receipt in the store disposable at once, so the store
+            // refuses new mutations until the clock catches up rather than dropping live evidence.
+            if ( $receipt['created_at'] < $horizon && $receipt['created_at'] <= $now + self::ABILITIES_V2_CLOCK_SKEW ) {
                 $evictable[ $reference ] = $receipt['created_at'];
             }
         }

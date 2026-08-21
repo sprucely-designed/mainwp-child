@@ -418,7 +418,11 @@ class MainWP_Child_Timecapsule { //phpcs:ignore -- NOSONAR - multi methods.
         // The receipt check, the provider effect and the operation-row write have to be one
         // atomic step: without it two concurrent starts both read in_progress=false, both start
         // a backup, and the second read-modify-write of the operations option loses the first row.
-        if ( ! $this->abilities_v2_begin_mutation_lock() ) {
+        $lock = $this->abilities_v2_begin_mutation_lock();
+        if ( null === $lock ) {
+            return $this->abilities_v2_error( $operation, 'storage_unavailable' );
+        }
+        if ( true !== $lock ) {
             return $this->abilities_v2_error( $operation, 'lock_busy' );
         }
         try {
@@ -450,7 +454,22 @@ class MainWP_Child_Timecapsule { //phpcs:ignore -- NOSONAR - multi methods.
                 if ( ! $this->abilities_v2_valid_receipt( $receipt ) ) {
                     return $this->abilities_v2_error( $operation, 'storage_unavailable' );
                 }
-                return hash_equals( $receipt['effect_hash'], $effect_hash ) ? $receipt['response'] : $this->abilities_v2_error( $operation, 'request_conflict' );
+                if ( ! hash_equals( $receipt['effect_hash'], $effect_hash ) ) {
+                    return $this->abilities_v2_error( $operation, 'request_conflict' );
+                }
+                if ( 'dispatching' !== $receipt['state'] ) {
+                    return $receipt['response'];
+                }
+                // A reservation nobody settled belongs to a request that died between the backup
+                // starting and its outcome reaching the store. That backup may still be running,
+                // so starting it again would run it twice and the outcome is unknown.
+                if ( $this->abilities_v2_reservation_is_live( $receipt['created_at'] ) ) {
+                    return $this->abilities_v2_error( $operation, 'outcome_unknown' );
+                }
+                // Past the horizon the reservation proves nothing: no Dashboard retry of it is
+                // still expected, and a reference that can only ever answer outcome_unknown is
+                // worse than a second backup. Retire it and let this request dispatch.
+                unset( $receipts[ $request_ref ] );
             }
 
             // Room has to exist before the provider is touched. A backup or restore this Child
@@ -459,8 +478,46 @@ class MainWP_Child_Timecapsule { //phpcs:ignore -- NOSONAR - multi methods.
             if ( false === $receipts ) {
                 return $this->abilities_v2_error( $operation, 'storage_unavailable' );
             }
+
+            // The reservation is durable before the provider runs, not after it. A request that
+            // dies with the backup already started - or one whose settling write is refused - has
+            // to leave its retry something to land on, or that retry starts a second backup.
+            $receipts[ $request_ref ] = array(
+                'effect_hash' => $effect_hash,
+                'state'       => 'dispatching',
+                'response'    => null,
+                'created_at'  => time(),
+            );
+            if ( ! $this->abilities_v2_store_receipts( $receipts ) ) {
+                return $this->abilities_v2_error( $operation, 'storage_unavailable' );
+            }
         }
 
+        $response = $this->abilities_v2_dispatch_result( $operation, $payload, $request_ref, $is_mutation );
+        if ( ! $is_mutation ) {
+            return $response;
+        }
+
+        // A refusal is settled too. Leaving it unsettled would answer every retry of this
+        // reference outcome_unknown for a full day over a provider that never touched anything.
+        $receipts[ $request_ref ]['state']    = 'settled';
+        $receipts[ $request_ref ]['response'] = $response;
+        if ( ! $this->abilities_v2_store_receipts( $receipts ) ) {
+            return $this->abilities_v2_error( $operation, 'outcome_unknown' );
+        }
+        return $response;
+    }
+
+    /**
+     * Call the provider once and close whatever it answers into a protocol response.
+     *
+     * @param string      $operation   Operation name.
+     * @param array       $payload     Validated payload.
+     * @param string|null $request_ref Folded request reference, or null for reads.
+     * @param bool        $is_mutation Whether the operation mutates.
+     * @return array Closed protocol response.
+     */
+    private function abilities_v2_dispatch_result( $operation, $payload, $request_ref, $is_mutation ) {
         try {
             $result = $this->abilities_v2_provider_call( $operation, $payload );
         } catch ( \Throwable $throwable ) {
@@ -473,8 +530,7 @@ class MainWP_Child_Timecapsule { //phpcs:ignore -- NOSONAR - multi methods.
         if ( ! $this->abilities_v2_valid_result( $operation, $result ) ) {
             return $this->abilities_v2_error( $operation, 'provider_schema_invalid' );
         }
-
-        $response = array_merge(
+        return array_merge(
             array(
                 'protocol'  => '2',
                 'operation' => $operation,
@@ -483,31 +539,67 @@ class MainWP_Child_Timecapsule { //phpcs:ignore -- NOSONAR - multi methods.
             $is_mutation ? array( 'request_ref' => $request_ref ) : array(),
             $result
         );
-        if ( $is_mutation ) {
-            $receipts[ $request_ref ] = array(
-                'effect_hash' => $effect_hash,
-                'response'    => $response,
-                'created_at'  => time(),
-            );
-            if ( ! update_option( 'mainwp_timecapsule_abilities_v2_receipts', $receipts, false ) && $receipts !== get_option( 'mainwp_timecapsule_abilities_v2_receipts', array() ) ) {
-                return $this->abilities_v2_error( $operation, 'outcome_unknown' );
-            }
-        }
-        return $response;
+    }
+
+    /**
+     * Persist the mutation receipt store.
+     *
+     * A false answer from update_option() means either a refused write or one that changed
+     * nothing, so the stored value decides which of the two happened.
+     *
+     * @param array $receipts Receipts to store.
+     * @return bool
+     */
+    private function abilities_v2_store_receipts( $receipts ) {
+        return update_option( 'mainwp_timecapsule_abilities_v2_receipts', $receipts, false ) || get_option( 'mainwp_timecapsule_abilities_v2_receipts', array() ) === $receipts;
+    }
+
+    /**
+     * The moment before which no Dashboard retry of a request is still expected.
+     *
+     * @return int
+     */
+    private function abilities_v2_retry_horizon() {
+        return time() - ( DAY_IN_SECONDS + 60 );
+    }
+
+    /**
+     * Whether a stored stamp still stands for work a retry could collide with.
+     *
+     * A stamp this clock cannot date cannot be shown to be past anything, so it holds its entry
+     * open rather than releasing it. wp-rocket reads an undatable stamp the other way and retires
+     * it; there the retired reference re-queues a cleanup, here it would start a second backup. A
+     * host clock that stepped backwards past the skew allowance would otherwise turn every entry
+     * in the store into spare capacity at once.
+     *
+     * @param int $created_at Stored stamp from a validated entry.
+     * @return bool
+     */
+    private function abilities_v2_reservation_is_live( $created_at ) {
+        return $created_at > time() + self::ABILITIES_V2_CLOCK_SKEW || $created_at >= $this->abilities_v2_retry_horizon();
     }
 
     /**
      * Validate one stored mutation receipt.
      *
+     * The store is a WordPress option, so every entry is untrusted input. An effect hash that is
+     * merely a string cannot be told apart from a hand-written placeholder, so the real shape is
+     * pinned here; entries written by an older build carry no state and are read as unreadable.
+     *
      * @param mixed $receipt Stored receipt.
      * @return bool
      */
     private function abilities_v2_valid_receipt( $receipt ) {
-        return is_array( $receipt )
-            && $this->abilities_v2_exact_keys( $receipt, array( 'effect_hash', 'response', 'created_at' ) )
-            && is_string( $receipt['effect_hash'] )
-            && is_array( $receipt['response'] )
-            && is_int( $receipt['created_at'] );
+        if ( ! is_array( $receipt ) || ! $this->abilities_v2_exact_keys( $receipt, array( 'effect_hash', 'state', 'response', 'created_at' ) ) ) {
+            return false;
+        }
+        if ( ! is_string( $receipt['effect_hash'] ) || 1 !== preg_match( '/^[0-9a-f]{64}$/D', $receipt['effect_hash'] ) || ! is_int( $receipt['created_at'] ) ) {
+            return false;
+        }
+        if ( 'dispatching' === $receipt['state'] ) {
+            return null === $receipt['response'];
+        }
+        return 'settled' === $receipt['state'] && is_array( $receipt['response'] );
     }
 
     /**
@@ -523,21 +615,24 @@ class MainWP_Child_Timecapsule { //phpcs:ignore -- NOSONAR - multi methods.
         if ( self::ABILITIES_V2_MAX_RECEIPTS > count( $receipts ) ) {
             return $receipts;
         }
-        $now       = time();
-        $horizon   = $now - ( DAY_IN_SECONDS + 60 );
+        $repaired  = false;
         $evictable = array();
         foreach ( $receipts as $reference => $receipt ) {
-            if ( ! $this->abilities_v2_valid_receipt( $receipt ) ) {
-                // An entry that cannot be read answers no retry, so it is the first thing given up
-                // and the reason a store written by an older build cannot wedge itself shut.
-                $evictable[ $reference ] = 0;
-                continue;
+            if ( ! $this->abilities_v2_valid_receipt( $receipt ) && ! $this->abilities_v2_tombstone( $receipt ) ) {
+                // An entry nobody can read is still evidence that something wrote a receipt for
+                // that reference, so its backup or restore may already have run. Giving it up to
+                // make room for an unrelated request is how a reference loses its only evidence
+                // and runs a second time on its next retry. Rebuilt as a tombstone it keeps
+                // failing the receipt check, so its own reference still answers
+                // storage_unavailable, while gaining a date this store can act on.
+                $receipt                = $this->abilities_v2_tombstone_record( $receipt );
+                $receipts[ $reference ] = $receipt;
+                $repaired               = true;
             }
-            // A stamp from ahead of this clock cannot be dated, and a receipt that cannot be dated
-            // cannot be shown to be outside the retry horizon. A host whose clock jumped backwards
-            // would otherwise make every receipt in the store disposable at once, so the store
-            // refuses new mutations until the clock catches up rather than dropping live evidence.
-            if ( $receipt['created_at'] < $horizon && $receipt['created_at'] <= $now + self::ABILITIES_V2_CLOCK_SKEW ) {
+            // Eviction may only give up an entry it can prove is past the retry horizon, which is
+            // the same question a replay asks of a reservation. Asking it once is what stops
+            // eviction from dropping an entry a retry would still have been answered from.
+            if ( ! $this->abilities_v2_reservation_is_live( $receipt['created_at'] ) ) {
                 $evictable[ $reference ] = $receipt['created_at'];
             }
         }
@@ -548,7 +643,49 @@ class MainWP_Child_Timecapsule { //phpcs:ignore -- NOSONAR - multi methods.
             }
             unset( $receipts[ $reference ] );
         }
+        // A tombstone is stamped at first observation, so a repair left unpersisted is stamped
+        // again on every request and can never grow old enough to be given up - a store of damaged
+        // entries would then refuse every mutation forever with no way out. Writing it here
+        // freezes those stamps and lets the entries cross the horizon on their own.
+        if ( $repaired && ! $this->abilities_v2_store_receipts( $receipts ) ) {
+            return false;
+        }
         return self::ABILITIES_V2_MAX_RECEIPTS > count( $receipts ) ? $receipts : false;
+    }
+
+    /**
+     * Whether an entry is already the dated tombstone of an unreadable receipt.
+     *
+     * @param mixed $receipt Stored entry.
+     * @return bool
+     */
+    private function abilities_v2_tombstone( $receipt ) {
+        return is_array( $receipt )
+            && $this->abilities_v2_exact_keys( $receipt, array( 'effect_hash', 'state', 'response', 'created_at' ) )
+            && 'unreadable' === $receipt['state']
+            && is_int( $receipt['created_at'] );
+    }
+
+    /**
+     * Rebuild one unreadable entry as a dated tombstone under the same reference.
+     *
+     * Keeping the reference is what stops its retry from starting a second backup. What the
+     * damaged entry no longer proves is the outcome, so nothing about the effect survives: no
+     * effect hash a request could match, and no response to replay. Its own stamp is kept where
+     * it still reads, so an entry written by an older build ages out on the date it was written
+     * rather than on the date this store first failed to read it.
+     *
+     * @param mixed $receipt Unreadable entry.
+     * @return array Dated tombstone.
+     */
+    private function abilities_v2_tombstone_record( $receipt ) {
+        $now = time();
+        return array(
+            'effect_hash' => str_repeat( '0', 64 ),
+            'state'       => 'unreadable',
+            'response'    => null,
+            'created_at'  => is_array( $receipt ) && isset( $receipt['created_at'] ) && is_int( $receipt['created_at'] ) && 0 < $receipt['created_at'] && $now >= $receipt['created_at'] ? $receipt['created_at'] : $now,
+        );
     }
 
     /**
@@ -576,16 +713,25 @@ class MainWP_Child_Timecapsule { //phpcs:ignore -- NOSONAR - multi methods.
     /**
      * Acquire the Child-wide Time Capsule mutation lock without waiting.
      *
-     * @return bool Whether the lock is held.
+     * @return bool|null True when acquired, false when another session holds it, null when the lock backend could not answer.
      */
     protected function abilities_v2_begin_mutation_lock() {
         global $wpdb;
         if ( ! is_object( $wpdb ) || ! is_callable( array( $wpdb, 'prepare' ) ) || ! is_callable( array( $wpdb, 'get_var' ) ) ) {
-            return false;
+            return null;
         }
         $wpdb->last_error = '';
         $locked           = $wpdb->get_var( $wpdb->prepare( 'SELECT GET_LOCK(%s,0)', $this->abilities_v2_lock_name() ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery -- Named lock is the serialization primitive.
-        return empty( $wpdb->last_error ) && '1' === (string) $locked;
+        if ( ! empty( $wpdb->last_error ) ) {
+            return null;
+        }
+        if ( '1' === (string) $locked ) {
+            return true;
+        }
+        // Only '0' means someone else holds it. GET_LOCK() answers NULL on an error or an
+        // interrupted wait, which says nothing about who holds the lock, so it is not reported
+        // as contention the Child never observed.
+        return '0' === (string) $locked ? false : null;
     }
 
     /**
@@ -598,9 +744,19 @@ class MainWP_Child_Timecapsule { //phpcs:ignore -- NOSONAR - multi methods.
         if ( ! is_object( $wpdb ) || ! is_callable( array( $wpdb, 'prepare' ) ) || ! is_callable( array( $wpdb, 'get_var' ) ) ) {
             return false;
         }
-        $wpdb->last_error = '';
-        $released         = $wpdb->get_var( $wpdb->prepare( 'SELECT RELEASE_LOCK(%s)', $this->abilities_v2_lock_name() ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery -- Named lock release must be checked.
-        return empty( $wpdb->last_error ) && '1' === (string) $released;
+        // A lock this session fails to give back outlives the request on a persistent connection
+        // and blocks every later mutation with no way for an operator to clear it, so one failed
+        // release earns a second attempt before it is given up on.
+        for ( $attempt = 0; $attempt < 2; $attempt++ ) {
+            $wpdb->last_error = '';
+            $released         = $wpdb->get_var( $wpdb->prepare( 'SELECT RELEASE_LOCK(%s)', $this->abilities_v2_lock_name() ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery -- Named lock release must be checked.
+            // RELEASE_LOCK() answers NULL when the named lock does not exist, which is the state
+            // the caller asked for.
+            if ( empty( $wpdb->last_error ) && ( null === $released || '1' === (string) $released ) ) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**

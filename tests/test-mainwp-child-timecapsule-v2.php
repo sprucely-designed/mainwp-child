@@ -48,9 +48,50 @@ class Timecapsule_V2_Protocol_Fixture extends MainWP_Child_Timecapsule {
 	/** @var array */
 	public $calls = array();
 
+	/** @var array Receipt store as it stood while the provider ran. */
+	public $receipts_during_call = array();
+
 	protected function abilities_v2_provider_call( $operation, $payload ) {
-		$this->calls[] = array( $operation, $payload );
+		$this->calls[]              = array( $operation, $payload );
+		$this->receipts_during_call = get_option( 'mainwp_timecapsule_abilities_v2_receipts', array() );
 		return isset( $this->results[ $operation ] ) ? $this->results[ $operation ] : new \WP_Error( 'provider_unavailable' );
+	}
+
+	public function lock_name() {
+		return $this->abilities_v2_lock_name();
+	}
+
+	public function end_mutation_lock() {
+		return $this->abilities_v2_end_mutation_lock();
+	}
+}
+
+/** Answers a named-lock query from a script, so each acquire or release attempt is observable. */
+class Timecapsule_Lock_Wpdb_Stub {
+
+	/** @var array Queries this substitute was asked to run. */
+	public $queries = array();
+
+	/** @var string */
+	public $last_error = '';
+
+	/** @var array One array( error, result ) per expected attempt. */
+	private $answers;
+
+	public function __construct( $answers ) {
+		$this->answers = $answers;
+	}
+
+	public function prepare( $query, ...$args ) {
+		unset( $args );
+		return $query;
+	}
+
+	public function get_var( $query ) {
+		$this->queries[]  = $query;
+		$answer           = array_shift( $this->answers );
+		$this->last_error = $answer[0];
+		return $answer[1];
 	}
 }
 
@@ -592,6 +633,284 @@ class Test_MainWP_Child_Timecapsule_V2 extends WP_UnitTestCase {
 		$this->assertArrayHasKey( '123e4567-e89b-42d3-a456-426614174972', $stored );
 	}
 
+	/**
+	 * The record a retry lands on exists before the backup starts, not after it returns.
+	 *
+	 * Between the provider being called and the outcome being written there is a window in which
+	 * the request can die outright. Without a reservation in the store the Dashboard's retry of
+	 * the same reference finds nothing and starts a second backup.
+	 */
+	public function test_a_reservation_is_durable_before_the_provider_runs() {
+		$fixture = $this->backup_fixture();
+		$request = $this->receipt_backup_request( '123e4567-e89b-42d3-a456-426614174973' );
+
+		$result = $fixture->abilities_v2( $request );
+
+		$this->assertTrue( $result['ok'] );
+		$this->assertArrayHasKey( $request['request_ref'], $fixture->receipts_during_call, 'the backup must not start before its reference is recorded' );
+		$reserved = $fixture->receipts_during_call[ $request['request_ref'] ];
+		$this->assertSame( 'dispatching', $reserved['state'] );
+		$this->assertNull( $reserved['response'] );
+		$this->assertSame( hash( 'sha256', wp_json_encode( array( 'start_backup', $request['payload'] ) ) ), $reserved['effect_hash'] );
+
+		$stored = get_option( 'mainwp_timecapsule_abilities_v2_receipts', array() );
+		$this->assertSame( 'settled', $stored[ $request['request_ref'] ]['state'] );
+		$this->assertSame( $result, $stored[ $request['request_ref'] ]['response'] );
+	}
+
+	/** A reservation nobody settled answers outcome_unknown and starts no second backup. */
+	public function test_an_unsettled_reservation_answers_outcome_unknown_without_dispatching() {
+		$fixture = $this->backup_fixture();
+		$request = $this->receipt_backup_request( '123e4567-e89b-42d3-a456-426614174974' );
+		update_option( 'mainwp_timecapsule_abilities_v2_receipts', array( $request['request_ref'] => $this->reservation( $request, time() ) ), false );
+
+		$result = $fixture->abilities_v2( $request );
+
+		$this->assertFalse( $result['ok'] );
+		$this->assertSame( 'outcome_unknown', $result['code'] );
+		$this->assertSame( array(), $fixture->calls, 'a backup that may still be running must not be started again' );
+	}
+
+	/**
+	 * A stamp this clock cannot date holds its reservation open instead of releasing it.
+	 *
+	 * A host clock that stepped backwards would otherwise retire every reservation in the store
+	 * at once, and each retired reference starts its backup a second time.
+	 */
+	public function test_an_undatable_reservation_is_not_retired_into_a_second_backup() {
+		$fixture = $this->backup_fixture();
+		$request = $this->receipt_backup_request( '123e4567-e89b-42d3-a456-426614174975' );
+		update_option( 'mainwp_timecapsule_abilities_v2_receipts', array( $request['request_ref'] => $this->reservation( $request, time() + ( 2 * DAY_IN_SECONDS ) ) ), false );
+
+		$result = $fixture->abilities_v2( $request );
+
+		$this->assertFalse( $result['ok'] );
+		$this->assertSame( 'outcome_unknown', $result['code'] );
+		$this->assertSame( array(), $fixture->calls );
+	}
+
+	/** Past the retry horizon a reservation proves nothing, so the reference dispatches again. */
+	public function test_a_reservation_past_the_retry_horizon_is_retired_and_dispatches() {
+		$fixture = $this->backup_fixture();
+		$request = $this->receipt_backup_request( '123e4567-e89b-42d3-a456-426614174976' );
+		update_option( 'mainwp_timecapsule_abilities_v2_receipts', array( $request['request_ref'] => $this->reservation( $request, time() - ( DAY_IN_SECONDS + 3600 ) ) ), false );
+
+		$result = $fixture->abilities_v2( $request );
+		$stored = get_option( 'mainwp_timecapsule_abilities_v2_receipts', array() );
+
+		$this->assertTrue( $result['ok'] );
+		$this->assertCount( 1, $fixture->calls );
+		$this->assertSame( 'settled', $stored[ $request['request_ref'] ]['state'] );
+	}
+
+	/** A provider refusal is recorded, so the same reference replays the refusal instead of re-running. */
+	public function test_a_refused_backup_settles_and_replays_rather_than_running_twice() {
+		$fixture                      = new Timecapsule_V2_Protocol_Fixture();
+		$fixture->is_plugin_installed = true;
+		$request                      = $this->receipt_backup_request( '123e4567-e89b-42d3-a456-426614174977' );
+
+		$refused = $fixture->abilities_v2( $request );
+		$replay  = $fixture->abilities_v2( $request );
+
+		$this->assertFalse( $refused['ok'] );
+		$this->assertSame( 'provider_unavailable', $refused['code'] );
+		$this->assertSame( $refused, $replay );
+		$this->assertCount( 1, $fixture->calls, 'a refusal already recorded must not reach the provider again' );
+	}
+
+	/**
+	 * An unreadable entry is not spare room for somebody else's backup.
+	 *
+	 * It is still evidence that a receipt was written for that reference, so dropping it lets the
+	 * reference run a second time on its next retry. It becomes a dated tombstone instead: the
+	 * stamp is written once, survives the request that wrote it, and is what lets the entry age
+	 * out later instead of holding the store shut.
+	 */
+	public function test_an_unreadable_entry_becomes_a_dated_tombstone_rather_than_someone_elses_room() {
+		$fixture  = $this->backup_fixture();
+		$receipts = $this->fill_receipts( 99, time() );
+		// The three-key shape an earlier build of this branch wrote, with no state to read.
+		$unreadable              = '123e4567-e89b-42d3-a456-4266141749d0';
+		$receipts[ $unreadable ] = array(
+			'effect_hash' => str_repeat( 'e', 64 ),
+			'response'    => array( 'ok' => true ),
+		);
+		update_option( 'mainwp_timecapsule_abilities_v2_receipts', $receipts, false );
+
+		$refused = $fixture->abilities_v2( $this->receipt_backup_request( '123e4567-e89b-42d3-a456-426614174978' ) );
+		$stored  = get_option( 'mainwp_timecapsule_abilities_v2_receipts', array() );
+
+		$this->assertFalse( $refused['ok'] );
+		$this->assertSame( 'storage_unavailable', $refused['code'] );
+		$this->assertSame( array(), $fixture->calls, 'no backup may run behind a refusal' );
+		$this->assertArrayHasKey( $unreadable, $stored, 'the damaged entry is still evidence that reference already ran' );
+		$this->assertSame( 'unreadable', $stored[ $unreadable ]['state'] );
+		$this->assertNull( $stored[ $unreadable ]['response'] );
+		$this->assertIsInt( $stored[ $unreadable ]['created_at'], 'the repair has to be persisted or it is re-stamped on every request' );
+		foreach ( array_keys( $this->fill_receipts( 99, time() ) ) as $live ) {
+			$this->assertArrayHasKey( $live, $stored );
+		}
+
+		// The reference behind the tombstone still refuses rather than backing up again.
+		$this->assertSame( 'storage_unavailable', $fixture->abilities_v2( $this->receipt_backup_request( $unreadable ) )['code'] );
+		$this->assertSame( array(), $fixture->calls );
+
+		// Only the clock changes: a tombstone past the horizon is given up like any other entry,
+		// which is only possible because its stamp was frozen rather than renewed on every read.
+		$stored[ $unreadable ]['created_at'] = time() - ( DAY_IN_SECONDS + 3600 );
+		update_option( 'mainwp_timecapsule_abilities_v2_receipts', $stored, false );
+
+		$accepted = $fixture->abilities_v2( $this->receipt_backup_request( '123e4567-e89b-42d3-a456-426614174979' ) );
+		$after    = get_option( 'mainwp_timecapsule_abilities_v2_receipts', array() );
+
+		$this->assertTrue( $accepted['ok'] );
+		$this->assertArrayNotHasKey( $unreadable, $after, 'the aged tombstone is the entry given up' );
+		$this->assertArrayHasKey( '123e4567-e89b-42d3-a456-426614174979', $after );
+	}
+
+	/**
+	 * A tombstone is stamped once, and a clock that moved backwards does not restart its clock.
+	 *
+	 * Re-observing an entry the store already tombstoned must leave the stamp alone. Rebuilding it
+	 * would refuse to salvage a stamp that now reads as future-dated and would write today's date
+	 * instead, so an entry on a drifting host would never grow old enough to be given up.
+	 */
+	public function test_an_existing_tombstone_is_not_restamped_when_the_clock_moves_backwards() {
+		$fixture                 = $this->backup_fixture();
+		$receipts                = $this->fill_receipts( 99, time() );
+		$tombstoned              = '123e4567-e89b-42d3-a456-4266141749e0';
+		$ahead                   = time() + ( 2 * DAY_IN_SECONDS );
+		$receipts[ $tombstoned ] = array(
+			'effect_hash' => str_repeat( '0', 64 ),
+			'state'       => 'unreadable',
+			'response'    => null,
+			'created_at'  => $ahead,
+		);
+		update_option( 'mainwp_timecapsule_abilities_v2_receipts', $receipts, false );
+
+		$refused = $fixture->abilities_v2( $this->receipt_backup_request( '123e4567-e89b-42d3-a456-42661417497b' ) );
+		$stored  = get_option( 'mainwp_timecapsule_abilities_v2_receipts', array() );
+
+		$this->assertFalse( $refused['ok'] );
+		$this->assertSame( 'storage_unavailable', $refused['code'] );
+		$this->assertSame( $ahead, $stored[ $tombstoned ]['created_at'], 'an entry already tombstoned keeps the stamp it was given' );
+	}
+
+	/** A hash the store cannot read is a corrupt store, not a different request. */
+	public function test_a_receipt_whose_effect_hash_is_not_a_hash_is_unreadable_rather_than_a_conflict() {
+		$fixture = $this->backup_fixture();
+		$request = $this->receipt_backup_request( '123e4567-e89b-42d3-a456-42661417497a' );
+		update_option(
+			'mainwp_timecapsule_abilities_v2_receipts',
+			array(
+				$request['request_ref'] => array(
+					'effect_hash' => 'not-a-sha256',
+					'state'       => 'settled',
+					'response'    => array( 'protocol' => '2', 'operation' => 'start_backup', 'ok' => true ),
+					'created_at'  => time(),
+				),
+			),
+			false
+		);
+
+		$result = $fixture->abilities_v2( $request );
+
+		$this->assertFalse( $result['ok'] );
+		$this->assertSame( 'storage_unavailable', $result['code'] );
+		$this->assertSame( array(), $fixture->calls );
+	}
+
+	/**
+	 * A lock backend that cannot answer is refused as a store failure, not as someone else's lock.
+	 *
+	 * GET_LOCK() answers NULL on a driver error or an interrupted wait, which says nothing about
+	 * who holds the lock. Reporting that as lock_busy tells the Dashboard to wait for a holder
+	 * this Child never observed.
+	 */
+	public function test_an_unusable_lock_backend_is_refused_apart_from_a_held_lock() {
+		$fixture = $this->backup_fixture();
+		// The lock name reads home_url(), so it is resolved while the real connection is still in place.
+		$name = $fixture->lock_name();
+
+		$backends = array(
+			'driver error'     => array( array( 'MySQL server has gone away', null ) ),
+			'GET_LOCK is NULL' => array( array( '', null ) ),
+		);
+		foreach ( $backends as $label => $answers ) {
+			$real            = $GLOBALS['wpdb'];
+			$GLOBALS['wpdb'] = new Timecapsule_Lock_Wpdb_Stub( $answers );
+			try {
+				$result = $fixture->abilities_v2( $this->receipt_backup_request( '123e4567-e89b-42d3-a456-42661417497c' ) );
+			} finally {
+				$GLOBALS['wpdb'] = $real;
+			}
+
+			$this->assertFalse( $result['ok'], $label );
+			$this->assertSame( 'storage_unavailable', $result['code'], $label );
+		}
+
+		$holder = $this->hold_lock_elsewhere( $name );
+		$held   = $fixture->abilities_v2( $this->receipt_backup_request( '123e4567-e89b-42d3-a456-42661417497d' ) );
+		$this->release_lock_elsewhere( $holder, $name );
+
+		$this->assertFalse( $held['ok'] );
+		$this->assertSame( 'lock_busy', $held['code'] );
+		$this->assertSame( array(), $fixture->calls );
+		$this->assertSame( array(), get_option( 'mainwp_timecapsule_abilities_v2_receipts', array() ) );
+	}
+
+	/**
+	 * A lock this session fails to give back blocks every later mutation with no operator escape,
+	 * so one failed release earns a second attempt, and an absent lock counts as released.
+	 */
+	public function test_release_reads_an_absent_lock_as_released_and_retries_a_failed_release_once() {
+		$fixture = new Timecapsule_V2_Protocol_Fixture();
+		// The lock name reads home_url(), so it is resolved while the real connection is still in place.
+		$fixture->lock_name();
+		$real = $GLOBALS['wpdb'];
+
+		try {
+			$absent          = new Timecapsule_Lock_Wpdb_Stub( array( array( '', null ) ) );
+			$GLOBALS['wpdb'] = $absent;
+			$this->assertTrue( $fixture->end_mutation_lock() );
+			$this->assertCount( 1, $absent->queries );
+
+			$retried         = new Timecapsule_Lock_Wpdb_Stub( array( array( 'MySQL server has gone away', null ), array( '', '1' ) ) );
+			$GLOBALS['wpdb'] = $retried;
+			$this->assertTrue( $fixture->end_mutation_lock() );
+			$this->assertCount( 2, $retried->queries );
+
+			$failing         = new Timecapsule_Lock_Wpdb_Stub( array( array( 'Lost connection', null ), array( 'Lost connection', null ) ) );
+			$GLOBALS['wpdb'] = $failing;
+			$this->assertFalse( $fixture->end_mutation_lock() );
+			$this->assertCount( 2, $failing->queries );
+		} finally {
+			$GLOBALS['wpdb'] = $real;
+		}
+	}
+
+	/** @return Timecapsule_V2_Protocol_Fixture */
+	private function backup_fixture() {
+		$fixture                          = new Timecapsule_V2_Protocol_Fixture();
+		$fixture->is_plugin_installed     = true;
+		$fixture->results['start_backup'] = array(
+			'operation_ref' => str_repeat( 'a', 64 ),
+			'state'         => 'queued',
+			'scope'         => 'full',
+		);
+		return $fixture;
+	}
+
+	/** @param array $request Backup request. @param int $created_at Stamp. @return array */
+	private function reservation( $request, $created_at ) {
+		return array(
+			'effect_hash' => hash( 'sha256', wp_json_encode( array( $request['operation'], $request['payload'] ) ) ),
+			'state'       => 'dispatching',
+			'response'    => null,
+			'created_at'  => $created_at,
+		);
+	}
+
 	/** @param int $count How many. @param int $created_at Stamp. @param string|null $first Reference of the first entry. @return array */
 	private function fill_receipts( $count, $created_at, $first = null ) {
 		$receipts = array();
@@ -599,6 +918,7 @@ class Test_MainWP_Child_Timecapsule_V2 extends WP_UnitTestCase {
 			$reference              = 0 === $index && null !== $first ? $first : sprintf( '123e4567-e89b-42d3-a456-4266141751%02d', $index );
 			$receipts[ $reference ] = array(
 				'effect_hash' => hash( 'sha256', $reference ),
+				'state'       => 'settled',
 				'response'    => array(
 					'protocol'    => '2',
 					'operation'   => 'start_backup',

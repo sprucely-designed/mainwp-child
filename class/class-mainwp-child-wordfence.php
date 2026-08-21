@@ -67,6 +67,24 @@ class MainWP_Child_Wordfence { //phpcs:ignore -- NOSONAR - multi methods.
     const BLOCK_TYPE_BLACKLIST   = 'blacklist';
 
     /**
+     * Receipt count at which a new request has to free a slot before it may run.
+     *
+     * @var int
+     */
+    const ABILITIES_V2_MAX_RECEIPTS = 100;
+
+    /**
+     * Seconds a stored stamp may lead the current time by and still be usable.
+     *
+     * Receipts come out of a WordPress option, so their stamps are untrusted input. A small
+     * allowance keeps a site whose clock drifted from calling its own recent receipts undatable,
+     * while anything further ahead is a moment this store never wrote.
+     *
+     * @var int
+     */
+    const ABILITIES_V2_CLOCK_SKEW = 300;
+
+    /**
      * Where the reason for a failed file operation belongs.
      *
      * Absolute server paths come back inside error_get_last(), and any plugin that installs an
@@ -887,13 +905,49 @@ class MainWP_Child_Wordfence { //phpcs:ignore -- NOSONAR - multi methods.
             }
             if ( isset( $receipts[ $request_ref ] ) ) {
                 $receipt = $receipts[ $request_ref ];
-                if ( ! is_array( $receipt ) || ! $this->abilities_v2_exact_keys( $receipt, array( 'effect_hash', 'response' ) ) || ! $this->abilities_v2_valid_hash( $receipt['effect_hash'] ) || ! $this->abilities_v2_valid_receipt_response( $operation, $request_ref, $receipt['response'] ) ) {
+                if ( ! $this->abilities_v2_valid_receipt( $operation, $request_ref, $receipt ) ) {
                     return $this->abilities_v2_error( $operation, 'storage_unavailable' );
                 }
-                return hash_equals( $receipt['effect_hash'], $effect_hash ) ? $receipt['response'] : $this->abilities_v2_error( $operation, 'request_conflict' );
+                if ( ! hash_equals( $receipt['effect_hash'], $effect_hash ) ) {
+                    return $this->abilities_v2_error( $operation, 'request_conflict' );
+                }
+                if ( 'dispatching' !== $receipt['state'] ) {
+                    return $receipt['response'];
+                }
+                // A reservation nobody settled belongs to a request that died between the scan or
+                // repair starting and its outcome reaching the store, or to one the provider
+                // refused after it had already run. Either way the effect may stand, so running it
+                // again is not on offer and the outcome is unknown.
+                if ( $this->abilities_v2_reservation_is_live( $receipt['created_at'] ) ) {
+                    return $this->abilities_v2_error( $operation, 'outcome_unknown' );
+                }
+                // Past the horizon the reservation proves nothing: no Dashboard retry of it is
+                // still expected, and a reference that can only ever answer outcome_unknown is
+                // worse than a second dispatch. Retire it and let this request run.
+                unset( $receipts[ $request_ref ] );
             }
             if ( ! $this->abilities_v2_provider_supports_mutation() ) {
                 return $this->abilities_v2_error( $operation, 'provider_unavailable' );
+            }
+
+            // Room has to exist before the provider is touched. A scan or repair this Child cannot
+            // record is one the Dashboard's next retry runs a second time.
+            $receipts = $this->abilities_v2_evict_receipts( $receipts );
+            if ( false === $receipts ) {
+                return $this->abilities_v2_error( $operation, 'storage_unavailable' );
+            }
+
+            // The reservation is durable before the provider runs, not after it. A request that
+            // dies with the effect already applied - or one whose settling write is refused - has
+            // to leave its retry something to land on, or that retry repairs the file twice.
+            $receipts[ $request_ref ] = array(
+                'effect_hash' => $effect_hash,
+                'state'       => 'dispatching',
+                'response'    => null,
+                'created_at'  => time(),
+            );
+            if ( ! $this->abilities_v2_store_receipts( $receipts ) ) {
+                return $this->abilities_v2_error( $operation, 'storage_unavailable' );
             }
         }
 
@@ -921,18 +975,177 @@ class MainWP_Child_Wordfence { //phpcs:ignore -- NOSONAR - multi methods.
             $result
         );
         if ( $is_mutation ) {
-            if ( 100 <= count( $receipts ) ) {
-                array_shift( $receipts );
-            }
-            $receipts[ $request_ref ] = array(
-                'effect_hash' => $effect_hash,
-                'response'    => $response,
-            );
-            if ( ! update_option( 'mainwp_wordfence_abilities_v2_receipts', $receipts, false ) && get_option( 'mainwp_wordfence_abilities_v2_receipts', array() ) !== $receipts ) {
+            $receipts[ $request_ref ]['state']    = 'settled';
+            $receipts[ $request_ref ]['response'] = $response;
+            if ( ! $this->abilities_v2_store_receipts( $receipts ) ) {
                 return $this->abilities_v2_error( $operation, 'outcome_unknown' );
             }
         }
         return $response;
+    }
+
+    /**
+     * Persist the mutation receipt store.
+     *
+     * A false answer from update_option() means either a refused write or one that changed
+     * nothing, so the stored value decides which of the two happened.
+     *
+     * @param array $receipts Receipts to store.
+     * @return bool
+     */
+    private function abilities_v2_store_receipts( $receipts ) {
+        return update_option( 'mainwp_wordfence_abilities_v2_receipts', $receipts, false ) || get_option( 'mainwp_wordfence_abilities_v2_receipts', array() ) === $receipts;
+    }
+
+    /**
+     * The moment before which no Dashboard retry of a request is still expected.
+     *
+     * @return int
+     */
+    private function abilities_v2_retry_horizon() {
+        return time() - ( DAY_IN_SECONDS + 60 );
+    }
+
+    /**
+     * Whether a stored stamp still stands for work a retry could collide with.
+     *
+     * A stamp this clock cannot date cannot be shown to be past anything, so it holds its entry
+     * open rather than releasing it. A host clock that stepped backwards past the skew allowance
+     * would otherwise turn every entry in the store into spare capacity at once, and each freed
+     * reference would repair or scan a second time on its next retry.
+     *
+     * @param int $created_at Stored stamp from a shape-valid entry.
+     * @return bool
+     */
+    private function abilities_v2_reservation_is_live( $created_at ) {
+        return $created_at > time() + self::ABILITIES_V2_CLOCK_SKEW || $created_at >= $this->abilities_v2_retry_horizon();
+    }
+
+    /**
+     * Free one receipt slot without discarding an outcome a retry could still ask for.
+     *
+     * @param array $receipts Current receipts.
+     * @return array|false Receipts with room for one more, or false when nothing can be given up.
+     */
+    private function abilities_v2_evict_receipts( $receipts ) {
+        if ( self::ABILITIES_V2_MAX_RECEIPTS > count( $receipts ) ) {
+            return $receipts;
+        }
+        $repaired  = false;
+        $evictable = array();
+        foreach ( $receipts as $reference => $receipt ) {
+            if ( ! $this->abilities_v2_receipt_shape( $receipt ) && ! $this->abilities_v2_tombstone( $receipt ) ) {
+                // An entry nobody can read is still evidence that something wrote a receipt for
+                // that reference, so its scan or repair may already have run. Giving it up to make
+                // room for an unrelated request is how a reference loses its only evidence and
+                // repairs a second time on its next retry. Rebuilt as a tombstone it keeps failing
+                // the receipt check, so its own reference still answers storage_unavailable, while
+                // gaining a date this store can act on.
+                $receipt                = $this->abilities_v2_tombstone_record( $receipt );
+                $receipts[ $reference ] = $receipt;
+                $repaired               = true;
+            }
+            // Eviction may only give up an entry it can prove is past the retry horizon, which is
+            // the same question a replay asks of a reservation. Asking it once is what stops
+            // eviction from dropping an entry a retry would still have been answered from.
+            if ( ! $this->abilities_v2_reservation_is_live( $receipt['created_at'] ) ) {
+                $evictable[ $reference ] = $receipt['created_at'];
+            }
+        }
+        asort( $evictable, SORT_NUMERIC );
+        foreach ( array_keys( $evictable ) as $reference ) {
+            if ( self::ABILITIES_V2_MAX_RECEIPTS > count( $receipts ) ) {
+                break;
+            }
+            unset( $receipts[ $reference ] );
+        }
+        // A tombstone is stamped at first observation, so a repair left unpersisted is stamped
+        // again on every request and can never grow old enough to be given up - a store of damaged
+        // entries would then refuse every mutation forever with no way out. Writing it here
+        // freezes those stamps and lets the entries cross the horizon on their own.
+        if ( $repaired && ! $this->abilities_v2_store_receipts( $receipts ) ) {
+            return false;
+        }
+        return self::ABILITIES_V2_MAX_RECEIPTS > count( $receipts ) ? $receipts : false;
+    }
+
+    /**
+     * Whether an entry is already the dated tombstone of an unreadable receipt.
+     *
+     * @param mixed $receipt Stored entry.
+     * @return bool
+     */
+    private function abilities_v2_tombstone( $receipt ) {
+        return is_array( $receipt )
+            && $this->abilities_v2_exact_keys( $receipt, array( 'effect_hash', 'state', 'response', 'created_at' ) )
+            && 'unreadable' === $receipt['state']
+            && is_int( $receipt['created_at'] );
+    }
+
+    /**
+     * Rebuild one unreadable entry as a dated tombstone under the same reference.
+     *
+     * Keeping the reference is what stops its retry from dispatching a second time. What the
+     * damaged entry no longer proves is the outcome, so nothing about the effect survives: no
+     * effect hash a request could match, and no response to replay. Its own stamp is kept where
+     * it still reads, so an entry written by an older build ages out on the date it was written
+     * rather than on the date this store first failed to read it.
+     *
+     * @param mixed $receipt Unreadable entry.
+     * @return array Dated tombstone.
+     */
+    private function abilities_v2_tombstone_record( $receipt ) {
+        $now = time();
+        return array(
+            'effect_hash' => str_repeat( '0', 64 ),
+            'state'       => 'unreadable',
+            'response'    => null,
+            'created_at'  => is_array( $receipt ) && isset( $receipt['created_at'] ) && is_int( $receipt['created_at'] ) && 0 < $receipt['created_at'] && $now >= $receipt['created_at'] ? $receipt['created_at'] : $now,
+        );
+    }
+
+    /**
+     * Validate the shape of one stored entry without judging it against a request.
+     *
+     * Eviction walks entries belonging to other references and operations, so it can only ask
+     * whether an entry is readable at all - whether its stored response answers the request that
+     * wrote it is a question only that request can ask.
+     *
+     * @param mixed $receipt Stored entry.
+     * @return bool
+     */
+    private function abilities_v2_receipt_shape( $receipt ) {
+        if ( ! is_array( $receipt ) || ! $this->abilities_v2_exact_keys( $receipt, array( 'effect_hash', 'state', 'response', 'created_at' ) ) ) {
+            return false;
+        }
+        if ( ! $this->abilities_v2_valid_hash( $receipt['effect_hash'] ) || ! is_int( $receipt['created_at'] ) ) {
+            return false;
+        }
+        if ( 'dispatching' === $receipt['state'] ) {
+            return null === $receipt['response'];
+        }
+        return 'settled' === $receipt['state'] && is_array( $receipt['response'] );
+    }
+
+    /**
+     * Validate one stored receipt against the request replaying it.
+     *
+     * A settled receipt has to carry a response this operation and reference can be answered
+     * with; only a request that knows both can establish that, which is why eviction uses the
+     * shape check instead. A refusal is never settled here for the same reason: this store can
+     * only prove a success, so a refused mutation leaves its reservation standing and answers
+     * outcome_unknown until the horizon retires it.
+     *
+     * @param string $operation   Operation name.
+     * @param string $request_ref Request reference.
+     * @param mixed  $receipt     Stored receipt.
+     * @return bool
+     */
+    private function abilities_v2_valid_receipt( $operation, $request_ref, $receipt ) {
+        if ( ! $this->abilities_v2_receipt_shape( $receipt ) ) {
+            return false;
+        }
+        return 'dispatching' === $receipt['state'] || $this->abilities_v2_valid_receipt_response( $operation, $request_ref, $receipt['response'] );
     }
 
     /**

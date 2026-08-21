@@ -21,6 +21,9 @@ class Wordfence_V2_Protocol_Fixture extends MainWP_Child_Wordfence {
 	/** @var string|null IS_FREE_LOCK() observed while the provider ran. */
 	public $lock_free_during_dispatch = null;
 
+	/** @var array Receipt store as it stood while the provider ran. */
+	public $receipts_during_dispatch = array();
+
 	protected function abilities_v2_provider_supports_mutation() {
 		return true;
 	}
@@ -29,6 +32,7 @@ class Wordfence_V2_Protocol_Fixture extends MainWP_Child_Wordfence {
 		global $wpdb;
 		$this->calls[]                   = array( $operation, $payload, $request_ref );
 		$this->lock_free_during_dispatch = $wpdb->get_var( $wpdb->prepare( 'SELECT IS_FREE_LOCK(%s)', $this->abilities_v2_lock_name() ) );
+		$this->receipts_during_dispatch  = get_option( 'mainwp_wordfence_abilities_v2_receipts', array() );
 		return isset( $this->results[ $operation ] ) ? $this->results[ $operation ] : new \WP_Error( 'provider_unavailable' );
 	}
 
@@ -215,6 +219,129 @@ class Test_MainWP_Child_Wordfence_V2 extends WP_UnitTestCase {
 		unset( $request['request_ref'] );
 		$request['request_id'] = '123e4567-e89b-42d3-a456-426614174602';
 		$this->assertSame( 'invalid_request', $fixture->abilities_v2( $request )['code'] );
+	}
+
+	/**
+	 * The record a retry lands on exists before the provider runs, not after it returns.
+	 *
+	 * Between dispatch and the outcome being written there is a window in which the request can
+	 * die outright. Without a reservation in the store the Dashboard's retry of the same
+	 * reference finds nothing and repairs or blocks a second time.
+	 */
+	public function test_a_reservation_is_durable_before_the_provider_runs() {
+		$fixture = $this->blocks_fixture();
+		$request = $this->blocks_request( '123e4567-e89b-42d3-a456-426614174610' );
+
+		$result = $fixture->abilities_v2( $request );
+
+		$this->assertTrue( $result['ok'] );
+		$this->assertArrayHasKey( $request['request_ref'], $fixture->receipts_during_dispatch, 'the provider must not run before its reference is recorded' );
+		$reserved = $fixture->receipts_during_dispatch[ $request['request_ref'] ];
+		$this->assertSame( 'dispatching', $reserved['state'] );
+		$this->assertNull( $reserved['response'] );
+		$this->assertSame( hash( 'sha256', wp_json_encode( array( 'blocks_v2_replace', $request['payload'] ) ) ), $reserved['effect_hash'] );
+
+		$stored = get_option( 'mainwp_wordfence_abilities_v2_receipts', array() );
+		$this->assertSame( 'settled', $stored[ $request['request_ref'] ]['state'] );
+		$this->assertSame( $result, $stored[ $request['request_ref'] ]['response'] );
+	}
+
+	/**
+	 * A full receipt store refuses rather than forgetting an outcome a retry still needs, and it
+	 * comes back on its own once the oldest entry ages past the retry horizon.
+	 *
+	 * The store used to make room with a bare array_shift(), which gives up whatever happens to
+	 * sit first regardless of age - including a receipt whose reference is still being retried.
+	 */
+	public function test_a_full_receipt_store_refuses_before_the_provider_and_self_clears_past_the_horizon() {
+		$fixture = $this->blocks_fixture();
+		$oldest  = '123e4567-e89b-42d3-a456-4266141746a0';
+		update_option( 'mainwp_wordfence_abilities_v2_receipts', $this->fill_receipts( 100, time(), $oldest ), false );
+
+		$refused = $fixture->abilities_v2( $this->blocks_request( '123e4567-e89b-42d3-a456-426614174611' ) );
+
+		$this->assertFalse( $refused['ok'] );
+		$this->assertSame( 'storage_unavailable', $refused['code'] );
+		$this->assertSame( array(), $fixture->calls, 'the provider must not run when the outcome cannot be recorded' );
+		$this->assertCount( 100, get_option( 'mainwp_wordfence_abilities_v2_receipts', array() ) );
+
+		// Only the clock changes: the oldest receipt is now past the horizon and nothing else is.
+		$receipts                          = get_option( 'mainwp_wordfence_abilities_v2_receipts', array() );
+		$receipts[ $oldest ]['created_at'] = time() - ( DAY_IN_SECONDS + 3600 );
+		update_option( 'mainwp_wordfence_abilities_v2_receipts', $receipts, false );
+
+		$accepted = $fixture->abilities_v2( $this->blocks_request( '123e4567-e89b-42d3-a456-426614174612' ) );
+		$stored   = get_option( 'mainwp_wordfence_abilities_v2_receipts', array() );
+
+		$this->assertTrue( $accepted['ok'] );
+		$this->assertCount( 1, $fixture->calls );
+		$this->assertCount( 100, $stored );
+		$this->assertArrayNotHasKey( $oldest, $stored, 'the aged receipt is the one given up' );
+		$this->assertArrayHasKey( '123e4567-e89b-42d3-a456-426614174612', $stored );
+	}
+
+	/** An unreadable entry is kept as a dated tombstone rather than freed for an unrelated request. */
+	public function test_an_unreadable_entry_becomes_a_dated_tombstone_rather_than_someone_elses_room() {
+		$fixture                 = $this->blocks_fixture();
+		$receipts                = $this->fill_receipts( 99, time() );
+		$unreadable              = '123e4567-e89b-42d3-a456-4266141746b0';
+		$receipts[ $unreadable ] = array(
+			'effect_hash' => str_repeat( 'e', 64 ),
+			'response'    => array( 'ok' => true ),
+		);
+		update_option( 'mainwp_wordfence_abilities_v2_receipts', $receipts, false );
+
+		$refused = $fixture->abilities_v2( $this->blocks_request( '123e4567-e89b-42d3-a456-426614174613' ) );
+		$stored  = get_option( 'mainwp_wordfence_abilities_v2_receipts', array() );
+
+		$this->assertFalse( $refused['ok'] );
+		$this->assertSame( 'storage_unavailable', $refused['code'] );
+		$this->assertSame( array(), $fixture->calls );
+		$this->assertArrayHasKey( $unreadable, $stored, 'the damaged entry is still evidence that reference already ran' );
+		$this->assertSame( 'unreadable', $stored[ $unreadable ]['state'] );
+		$this->assertIsInt( $stored[ $unreadable ]['created_at'], 'the repair has to be persisted or it is re-stamped on every request' );
+		$this->assertSame( 'storage_unavailable', $fixture->abilities_v2( $this->blocks_request( $unreadable ) )['code'] );
+	}
+
+	/** A reservation nobody settled answers outcome_unknown and dispatches nothing. */
+	public function test_an_unsettled_reservation_answers_outcome_unknown_without_dispatching() {
+		$fixture = $this->blocks_fixture();
+		$request = $this->blocks_request( '123e4567-e89b-42d3-a456-426614174614' );
+		update_option( 'mainwp_wordfence_abilities_v2_receipts', array( $request['request_ref'] => $this->reservation( $request, time() ) ), false );
+
+		$result = $fixture->abilities_v2( $request );
+
+		$this->assertFalse( $result['ok'] );
+		$this->assertSame( 'outcome_unknown', $result['code'] );
+		$this->assertSame( array(), $fixture->calls, 'work that may already stand must not be dispatched again' );
+	}
+
+	/**
+	 * A stamp this clock cannot date holds its reservation open instead of releasing it.
+	 *
+	 * A host clock that stepped backwards would otherwise retire every reservation in the store
+	 * at once, and each retired reference would repair or block a second time.
+	 */
+	public function test_an_undatable_reservation_is_not_retired_into_a_second_dispatch() {
+		$fixture = $this->blocks_fixture();
+		$request = $this->blocks_request( '123e4567-e89b-42d3-a456-426614174615' );
+		update_option( 'mainwp_wordfence_abilities_v2_receipts', array( $request['request_ref'] => $this->reservation( $request, time() + ( 2 * DAY_IN_SECONDS ) ) ), false );
+
+		$result = $fixture->abilities_v2( $request );
+
+		$this->assertFalse( $result['ok'] );
+		$this->assertSame( 'outcome_unknown', $result['code'] );
+		$this->assertSame( array(), $fixture->calls );
+	}
+
+	/** @param array $request Blocks request. @param int $created_at Stamp. @return array */
+	private function reservation( $request, $created_at ) {
+		return array(
+			'effect_hash' => hash( 'sha256', wp_json_encode( array( $request['operation'], $request['payload'] ) ) ),
+			'state'       => 'dispatching',
+			'response'    => null,
+			'created_at'  => $created_at,
+		);
 	}
 
 	public function test_read_results_are_closed_and_malformed_provider_data_fails() {
@@ -503,6 +630,26 @@ class Test_MainWP_Child_Wordfence_V2 extends WP_UnitTestCase {
 		$this->assertStringContainsString( self::STALE_MARKER, $last['message'] );
 	}
 
+	/** @param int $count How many. @param int $created_at Stamp. @param string|null $first Reference of the first entry. @return array */
+	private function fill_receipts( $count, $created_at, $first = null ) {
+		$receipts = array();
+		for ( $index = 0; $index < $count; $index++ ) {
+			$reference              = 0 === $index && null !== $first ? $first : sprintf( '123e4567-e89b-42d3-a456-4266141752%02d', $index );
+			$receipts[ $reference ] = array(
+				'effect_hash' => hash( 'sha256', $reference ),
+				'state'       => 'settled',
+				'response'    => array(
+					'protocol'    => '2',
+					'operation'   => 'blocks_v2_replace',
+					'ok'          => true,
+					'request_ref' => $reference,
+				),
+				'created_at'  => $created_at,
+			);
+		}
+		return $receipts;
+	}
+
 	private function blocks_fixture() {
 		$fixture                               = new Wordfence_V2_Protocol_Fixture();
 		$fixture->results['blocks_v2_replace'] = array(
@@ -516,11 +663,12 @@ class Test_MainWP_Child_Wordfence_V2 extends WP_UnitTestCase {
 		return $fixture;
 	}
 
-	private function blocks_request() {
+	/** @param string $request_ref Reference. @return array */
+	private function blocks_request( $request_ref = '123e4567-e89b-42d3-a456-426614174603' ) {
 		return array(
 			'protocol'    => '2',
 			'operation'   => 'blocks_v2_replace',
-			'request_ref' => '123e4567-e89b-42d3-a456-426614174603',
+			'request_ref' => $request_ref,
 			'payload'     => array(
 				'if_match' => str_repeat( 'c', 64 ),
 				'blocks'   => array(

@@ -42,6 +42,9 @@ class Test_MainWP_Child_Staging_V2_Fixture extends MainWP_Child_Staging {
 	/** @var string|null IS_FREE_LOCK() observed while the provider ran. */
 	public $lock_free_during_dispatch = null;
 
+	/** @var array Receipt store as it stood while the provider ran. */
+	public $receipts_during_dispatch = array();
+
 	/** Avoid installed-plugin lookup. */
 	public function __construct() {
 		$this->is_plugin_installed = true;
@@ -98,6 +101,7 @@ class Test_MainWP_Child_Staging_V2_Fixture extends MainWP_Child_Staging {
 		global $wpdb;
 		$this->operation_calls[]         = array( $operation, $payload );
 		$this->lock_free_during_dispatch = $wpdb->get_var( $wpdb->prepare( 'SELECT IS_FREE_LOCK(%s)', $this->abilities_v2_lock_name() ) );
+		$this->receipts_during_dispatch  = get_option( 'mainwp_staging_abilities_v2_operation_receipts', array() );
 		return isset( $this->operation_results[ $operation ] ) ? $this->operation_results[ $operation ] : new WP_Error( 'provider_unavailable' );
 	}
 
@@ -746,11 +750,18 @@ class Test_MainWP_Child_Staging_V2 extends WP_UnitTestCase {
 		$this->assertArrayHasKey( '123e4567-e89b-42d3-a456-426614174945', $stored );
 	}
 
-	/** An entry no retry can be answered from is given up before any receipt still inside the horizon. */
-	public function test_an_unreadable_entry_is_evicted_before_live_receipts() {
+	/**
+	 * An unreadable entry is not spare room for somebody else's clone job.
+	 *
+	 * It is still evidence that a receipt was written for that reference, so dropping it lets the
+	 * reference clone a second time on its next retry. It becomes a dated tombstone instead: the
+	 * stamp is written once, survives the request that wrote it, and is what lets the entry age
+	 * out later instead of holding the store shut.
+	 */
+	public function test_an_unreadable_entry_becomes_a_dated_tombstone_rather_than_someone_elses_room() {
 		$this->staging->operation_results['create_clone'] = $this->queued_clone_result();
 		$receipts                                         = $this->fill_receipts( 99, time() );
-		// The two-key shape an earlier build of this branch wrote.
+		// The three-key shape an earlier build of this branch wrote, with no state to read.
 		$unreadable              = '123e4567-e89b-42d3-a456-4266141749b0';
 		$receipts[ $unreadable ] = array(
 			'effect_hash' => str_repeat( 'e', 64 ),
@@ -758,16 +769,87 @@ class Test_MainWP_Child_Staging_V2 extends WP_UnitTestCase {
 		);
 		update_option( 'mainwp_staging_abilities_v2_operation_receipts', $receipts, false );
 
-		$result = $this->staging->abilities_v2( $this->clone_request( '123e4567-e89b-42d3-a456-426614174946' ) );
-		$stored = get_option( 'mainwp_staging_abilities_v2_operation_receipts', array() );
+		$refused = $this->staging->abilities_v2( $this->clone_request( '123e4567-e89b-42d3-a456-426614174946' ) );
+		$stored  = get_option( 'mainwp_staging_abilities_v2_operation_receipts', array() );
 
-		$this->assertTrue( $result['ok'] );
-		$this->assertCount( 100, $stored );
-		$this->assertArrayHasKey( '123e4567-e89b-42d3-a456-426614174946', $stored );
-		$this->assertArrayNotHasKey( $unreadable, $stored );
+		$this->assertFalse( $refused['ok'] );
+		$this->assertSame( 'storage_unavailable', $refused['error_code'] );
+		$this->assertSame( array(), $this->staging->operation_calls, 'no clone job may run behind a refusal' );
+		$this->assertArrayHasKey( $unreadable, $stored, 'the damaged entry is still evidence that reference already ran' );
+		$this->assertSame( 'unreadable', $stored[ $unreadable ]['state'] );
+		$this->assertNull( $stored[ $unreadable ]['response'] );
+		$this->assertIsInt( $stored[ $unreadable ]['created_at'], 'the repair has to be persisted or it is re-stamped on every request' );
 		foreach ( array_keys( $this->fill_receipts( 99, time() ) ) as $live ) {
-			$this->assertArrayHasKey( $live, $stored, 'a receipt still inside the horizon must outlive the unreadable entry' );
+			$this->assertArrayHasKey( $live, $stored );
 		}
+
+		// The reference behind the tombstone still refuses rather than cloning again.
+		$this->assertSame( 'storage_unavailable', $this->staging->abilities_v2( $this->clone_request( $unreadable ) )['error_code'] );
+		$this->assertSame( array(), $this->staging->operation_calls );
+
+		// Only the clock changes: a tombstone past the horizon is given up like any other entry,
+		// which is only possible because its stamp was frozen rather than renewed on every read.
+		$stored[ $unreadable ]['created_at'] = time() - ( DAY_IN_SECONDS + 3600 );
+		update_option( 'mainwp_staging_abilities_v2_operation_receipts', $stored, false );
+
+		$accepted = $this->staging->abilities_v2( $this->clone_request( '123e4567-e89b-42d3-a456-426614174950' ) );
+		$after    = get_option( 'mainwp_staging_abilities_v2_operation_receipts', array() );
+
+		$this->assertTrue( $accepted['ok'] );
+		$this->assertArrayNotHasKey( $unreadable, $after, 'the aged tombstone is the entry given up' );
+		$this->assertArrayHasKey( '123e4567-e89b-42d3-a456-426614174950', $after );
+	}
+
+	/**
+	 * A tombstone is stamped once, and a clock that moved backwards does not restart its clock.
+	 *
+	 * Re-observing an entry the store already tombstoned must leave the stamp alone. Rebuilding it
+	 * would refuse to salvage a stamp that now reads as future-dated and would write today's date
+	 * instead, so an entry on a drifting host would never grow old enough to be given up.
+	 */
+	public function test_an_existing_tombstone_is_not_restamped_when_the_clock_moves_backwards() {
+		$this->staging->operation_results['create_clone'] = $this->queued_clone_result();
+		$receipts                                         = $this->fill_receipts( 99, time() );
+		$tombstoned                                       = '123e4567-e89b-42d3-a456-4266141749c0';
+		$ahead                                            = time() + ( 2 * DAY_IN_SECONDS );
+		$receipts[ $tombstoned ]                          = array(
+			'effect_hash' => str_repeat( '0', 64 ),
+			'state'       => 'unreadable',
+			'response'    => null,
+			'created_at'  => $ahead,
+		);
+		update_option( 'mainwp_staging_abilities_v2_operation_receipts', $receipts, false );
+
+		$refused = $this->staging->abilities_v2( $this->clone_request( '123e4567-e89b-42d3-a456-426614174952' ) );
+		$stored  = get_option( 'mainwp_staging_abilities_v2_operation_receipts', array() );
+
+		$this->assertFalse( $refused['ok'] );
+		$this->assertSame( 'storage_unavailable', $refused['error_code'] );
+		$this->assertSame( $ahead, $stored[ $tombstoned ]['created_at'], 'an entry already tombstoned keeps the stamp it was given' );
+	}
+
+	/** A hash the store cannot read is a corrupt store, not a different request. */
+	public function test_a_receipt_whose_effect_hash_is_not_a_hash_is_unreadable_rather_than_a_conflict() {
+		$this->staging->operation_results['create_clone'] = $this->queued_clone_result();
+		$request                                          = $this->clone_request( '123e4567-e89b-42d3-a456-426614174951' );
+		update_option(
+			'mainwp_staging_abilities_v2_operation_receipts',
+			array(
+				$request['request_ref'] => array(
+					'effect_hash' => 'not-a-sha256',
+					'state'       => 'settled',
+					'response'    => array( 'protocol' => '2', 'operation' => 'create_clone', 'ok' => true ),
+					'created_at'  => time(),
+				),
+			),
+			false
+		);
+
+		$result = $this->staging->abilities_v2( $request );
+
+		$this->assertFalse( $result['ok'] );
+		$this->assertSame( 'storage_unavailable', $result['error_code'] );
+		$this->assertSame( array(), $this->staging->operation_calls );
 	}
 
 	/**
@@ -794,6 +876,100 @@ class Test_MainWP_Child_Staging_V2 extends WP_UnitTestCase {
 		}
 	}
 
+	/**
+	 * The record a retry lands on exists before the clone job starts, not after it returns.
+	 *
+	 * Between dispatch and the outcome being written there is a window in which the request can
+	 * die outright. Without a reservation in the store the Dashboard's retry of the same
+	 * reference finds nothing and clones a second time.
+	 */
+	public function test_a_reservation_is_durable_before_the_clone_job_runs() {
+		$this->staging->operation_results['create_clone'] = $this->queued_clone_result();
+		$request                                          = $this->clone_request( '123e4567-e89b-42d3-a456-426614174948' );
+
+		$result = $this->staging->abilities_v2( $request );
+
+		$this->assertTrue( $result['ok'] );
+		$this->assertArrayHasKey( $request['request_ref'], $this->staging->receipts_during_dispatch, 'the clone job must not run before its reference is recorded' );
+		$reserved = $this->staging->receipts_during_dispatch[ $request['request_ref'] ];
+		$this->assertSame( 'dispatching', $reserved['state'] );
+		$this->assertNull( $reserved['response'] );
+		$this->assertSame( hash( 'sha256', wp_json_encode( array( 'create_clone', $request['payload'] ) ) ), $reserved['effect_hash'] );
+
+		$stored = get_option( 'mainwp_staging_abilities_v2_operation_receipts', array() );
+		$this->assertSame( 'settled', $stored[ $request['request_ref'] ]['state'] );
+		$this->assertSame( $result, $stored[ $request['request_ref'] ]['response'] );
+	}
+
+	/** A reservation nobody settled answers outcome_unknown and starts no second clone job. */
+	public function test_an_unsettled_reservation_answers_outcome_unknown_without_dispatching() {
+		$this->staging->operation_results['create_clone'] = $this->queued_clone_result();
+		$request                                          = $this->clone_request( '123e4567-e89b-42d3-a456-426614174949' );
+		update_option( 'mainwp_staging_abilities_v2_operation_receipts', array( $request['request_ref'] => $this->reservation( $request, time() ) ), false );
+
+		$result = $this->staging->abilities_v2( $request );
+
+		$this->assertFalse( $result['ok'] );
+		$this->assertSame( 'outcome_unknown', $result['error_code'] );
+		$this->assertSame( array(), $this->staging->operation_calls, 'a clone job that may still be running must not be started again' );
+	}
+
+	/**
+	 * A stamp this clock cannot date holds its reservation open instead of releasing it.
+	 *
+	 * A host clock that stepped backwards would otherwise retire every reservation in the store
+	 * at once, and each retired reference starts its clone job a second time.
+	 */
+	public function test_an_undatable_reservation_is_not_retired_into_a_second_clone_job() {
+		$this->staging->operation_results['create_clone'] = $this->queued_clone_result();
+		$request                                          = $this->clone_request( '123e4567-e89b-42d3-a456-42661417494a' );
+		update_option( 'mainwp_staging_abilities_v2_operation_receipts', array( $request['request_ref'] => $this->reservation( $request, time() + ( 2 * DAY_IN_SECONDS ) ) ), false );
+
+		$result = $this->staging->abilities_v2( $request );
+
+		$this->assertFalse( $result['ok'] );
+		$this->assertSame( 'outcome_unknown', $result['error_code'] );
+		$this->assertSame( array(), $this->staging->operation_calls );
+	}
+
+	/** Past the retry horizon a reservation proves nothing, so the reference dispatches again. */
+	public function test_a_reservation_past_the_retry_horizon_is_retired_and_dispatches() {
+		$this->staging->operation_results['create_clone'] = $this->queued_clone_result();
+		$request                                          = $this->clone_request( '123e4567-e89b-42d3-a456-42661417494b' );
+		update_option( 'mainwp_staging_abilities_v2_operation_receipts', array( $request['request_ref'] => $this->reservation( $request, time() - ( DAY_IN_SECONDS + 3600 ) ) ), false );
+
+		$result = $this->staging->abilities_v2( $request );
+		$stored = get_option( 'mainwp_staging_abilities_v2_operation_receipts', array() );
+
+		$this->assertTrue( $result['ok'] );
+		$this->assertCount( 1, $this->staging->operation_calls );
+		$this->assertSame( 'settled', $stored[ $request['request_ref'] ]['state'] );
+	}
+
+	/** A provider refusal is recorded, so the same reference replays the refusal instead of re-running. */
+	public function test_a_refused_clone_job_settles_and_replays_rather_than_running_twice() {
+		$this->staging->operation_results['create_clone'] = new WP_Error( 'state_conflict' );
+		$request                                          = $this->clone_request( '123e4567-e89b-42d3-a456-42661417494c' );
+
+		$refused = $this->staging->abilities_v2( $request );
+		$replay  = $this->staging->abilities_v2( $request );
+
+		$this->assertFalse( $refused['ok'] );
+		$this->assertSame( 'state_conflict', $refused['error_code'] );
+		$this->assertSame( $refused, $replay );
+		$this->assertCount( 1, $this->staging->operation_calls, 'a refusal already recorded must not reach the provider again' );
+	}
+
+	/** @param array $request Clone request. @param int $created_at Stamp. @return array */
+	private function reservation( $request, $created_at ) {
+		return array(
+			'effect_hash' => hash( 'sha256', wp_json_encode( array( $request['operation'], $request['payload'] ) ) ),
+			'state'       => 'dispatching',
+			'response'    => null,
+			'created_at'  => $created_at,
+		);
+	}
+
 	/** @param int $count How many. @param int $created_at Stamp. @param string|null $first Reference of the first entry. @return array */
 	private function fill_receipts( $count, $created_at, $first = null ) {
 		$receipts = array();
@@ -801,6 +977,7 @@ class Test_MainWP_Child_Staging_V2 extends WP_UnitTestCase {
 			$reference = 0 === $index && null !== $first ? $first : sprintf( '123e4567-e89b-42d3-a456-4266141750%02d', $index );
 			$receipts[ $reference ] = array(
 				'effect_hash' => hash( 'sha256', $reference ),
+				'state'       => 'settled',
 				'response'    => array(
 					'protocol'    => '2',
 					'operation'   => 'create_clone',

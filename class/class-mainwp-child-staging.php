@@ -623,7 +623,22 @@ class MainWP_Child_Staging { //phpcs:ignore -- NOSONAR - multi methods.
             if ( ! $this->abilities_v2_valid_receipt( $receipt ) ) {
                 return $this->abilities_v2_error( $operation, 'storage_unavailable' );
             }
-            return hash_equals( $receipt['effect_hash'], $effect_hash ) ? $receipt['response'] : $this->abilities_v2_error( $operation, 'request_conflict' );
+            if ( ! hash_equals( $receipt['effect_hash'], $effect_hash ) ) {
+                return $this->abilities_v2_error( $operation, 'request_conflict' );
+            }
+            if ( 'dispatching' !== $receipt['state'] ) {
+                return $receipt['response'];
+            }
+            // A reservation nobody settled belongs to a request that died between the clone job
+            // starting and its outcome reaching the store. That job may still be running, so
+            // starting it again would clone twice and the outcome is the only honest answer.
+            if ( $this->abilities_v2_reservation_is_live( $receipt['created_at'] ) ) {
+                return $this->abilities_v2_error( $operation, 'outcome_unknown' );
+            }
+            // Past the horizon the reservation proves nothing: no Dashboard retry of it is still
+            // expected, and a reference that can only ever answer outcome_unknown is worse than a
+            // second clone job. Retire it and let this request dispatch.
+            unset( $receipts[ $request['request_ref'] ] );
         }
 
         // Room has to exist before the provider is touched. A clone job this Child cannot record
@@ -633,36 +648,94 @@ class MainWP_Child_Staging { //phpcs:ignore -- NOSONAR - multi methods.
             return $this->abilities_v2_error( $operation, 'storage_unavailable' );
         }
 
-        $result = $this->abilities_v2_provider_result( $operation, $request['payload'] );
-        if ( empty( $result['ok'] ) ) {
-            return $result;
-        }
-        $result['request_ref'] = $request['request_ref'];
-        $result                = array_merge( array_intersect_key( $result, array( 'protocol' => true, 'operation' => true, 'ok' => true ) ), array( 'request_ref' => $request['request_ref'] ), array_diff_key( $result, array( 'protocol' => true, 'operation' => true, 'ok' => true, 'request_ref' => true ) ) );
-
+        // The reservation is durable before the clone job starts, not after it. A request that
+        // dies with the job already running - or one whose settling write is refused - has to
+        // leave its retry something to land on, or that retry clones a second time.
         $receipts[ $request['request_ref'] ] = array(
             'effect_hash' => $effect_hash,
-            'response'    => $result,
+            'state'       => 'dispatching',
+            'response'    => null,
             'created_at'  => time(),
         );
-        if ( ! update_option( 'mainwp_staging_abilities_v2_operation_receipts', $receipts, false ) && $receipts !== get_option( 'mainwp_staging_abilities_v2_operation_receipts', array() ) ) {
+        if ( ! $this->abilities_v2_store_receipts( $receipts ) ) {
+            return $this->abilities_v2_error( $operation, 'storage_unavailable' );
+        }
+
+        $result = $this->abilities_v2_provider_result( $operation, $request['payload'] );
+        if ( ! empty( $result['ok'] ) ) {
+            $result['request_ref'] = $request['request_ref'];
+            $result                = array_merge( array_intersect_key( $result, array( 'protocol' => true, 'operation' => true, 'ok' => true ) ), array( 'request_ref' => $request['request_ref'] ), array_diff_key( $result, array( 'protocol' => true, 'operation' => true, 'ok' => true, 'request_ref' => true ) ) );
+        }
+
+        // A refusal is settled too. Leaving it unsettled would answer every retry of this
+        // reference outcome_unknown for a full day over a provider that never touched anything.
+        $receipts[ $request['request_ref'] ]['state']    = 'settled';
+        $receipts[ $request['request_ref'] ]['response'] = $result;
+        if ( ! $this->abilities_v2_store_receipts( $receipts ) ) {
             return $this->abilities_v2_error( $operation, 'outcome_unknown' );
         }
         return $result;
     }
 
     /**
+     * Persist the clone-mutation receipt store.
+     *
+     * A false answer from update_option() means either a refused write or one that changed
+     * nothing, so the stored value decides which of the two happened.
+     *
+     * @param array $receipts Receipts to store.
+     * @return bool
+     */
+    private function abilities_v2_store_receipts( $receipts ) {
+        return update_option( 'mainwp_staging_abilities_v2_operation_receipts', $receipts, false ) || get_option( 'mainwp_staging_abilities_v2_operation_receipts', array() ) === $receipts;
+    }
+
+    /**
+     * The moment before which no Dashboard retry of a request is still expected.
+     *
+     * @return int
+     */
+    private function abilities_v2_retry_horizon() {
+        return time() - ( DAY_IN_SECONDS + 60 );
+    }
+
+    /**
+     * Whether a stored stamp still stands for work a retry could collide with.
+     *
+     * A stamp this clock cannot date cannot be shown to be past anything, so it holds its entry
+     * open rather than releasing it. wp-rocket reads an undatable stamp the other way and retires
+     * it; there the retired reference re-queues a cleanup, here it would start a second clone. A
+     * host clock that stepped backwards past the skew allowance would otherwise turn every entry
+     * in the store into spare capacity at once.
+     *
+     * @param int $created_at Stored stamp from a validated entry.
+     * @return bool
+     */
+    private function abilities_v2_reservation_is_live( $created_at ) {
+        return $created_at > time() + self::ABILITIES_V2_CLOCK_SKEW || $created_at >= $this->abilities_v2_retry_horizon();
+    }
+
+    /**
      * Validate one stored clone-mutation receipt.
+     *
+     * The store is a WordPress option, so every entry is untrusted input. An effect hash that is
+     * merely a string cannot be told apart from a hand-written placeholder, so the real shape is
+     * pinned here; entries written by an older build carry no state and are read as unreadable.
      *
      * @param mixed $receipt Stored receipt.
      * @return bool
      */
     private function abilities_v2_valid_receipt( $receipt ) {
-        return is_array( $receipt )
-            && $this->abilities_v2_exact_keys( $receipt, array( 'effect_hash', 'response', 'created_at' ) )
-            && is_string( $receipt['effect_hash'] )
-            && is_array( $receipt['response'] )
-            && is_int( $receipt['created_at'] );
+        if ( ! is_array( $receipt ) || ! $this->abilities_v2_exact_keys( $receipt, array( 'effect_hash', 'state', 'response', 'created_at' ) ) ) {
+            return false;
+        }
+        if ( ! is_string( $receipt['effect_hash'] ) || 1 !== preg_match( '/^[0-9a-f]{64}$/D', $receipt['effect_hash'] ) || ! is_int( $receipt['created_at'] ) ) {
+            return false;
+        }
+        if ( 'dispatching' === $receipt['state'] ) {
+            return null === $receipt['response'];
+        }
+        return 'settled' === $receipt['state'] && is_array( $receipt['response'] );
     }
 
     /**
@@ -678,21 +751,24 @@ class MainWP_Child_Staging { //phpcs:ignore -- NOSONAR - multi methods.
         if ( self::ABILITIES_V2_MAX_RECEIPTS > count( $receipts ) ) {
             return $receipts;
         }
-        $now       = time();
-        $horizon   = $now - ( DAY_IN_SECONDS + 60 );
+        $repaired  = false;
         $evictable = array();
         foreach ( $receipts as $reference => $receipt ) {
-            if ( ! $this->abilities_v2_valid_receipt( $receipt ) ) {
-                // An entry that cannot be read answers no retry, so it is the first thing given up
-                // and the reason a store written by an older build cannot wedge itself shut.
-                $evictable[ $reference ] = 0;
-                continue;
+            if ( ! $this->abilities_v2_valid_receipt( $receipt ) && ! $this->abilities_v2_tombstone( $receipt ) ) {
+                // An entry nobody can read is still evidence that something wrote a receipt for
+                // that reference, so its clone job may already have run. Giving it up to make room
+                // for an unrelated request is how a reference loses its only evidence and clones a
+                // second time on its next retry. Rebuilt as a tombstone it keeps failing the
+                // receipt check, so its own reference still answers storage_unavailable, while
+                // gaining a date this store can act on.
+                $receipt                = $this->abilities_v2_tombstone_record( $receipt );
+                $receipts[ $reference ] = $receipt;
+                $repaired               = true;
             }
-            // A stamp from ahead of this clock cannot be dated, and a receipt that cannot be dated
-            // cannot be shown to be outside the retry horizon. A host whose clock jumped backwards
-            // would otherwise make every receipt in the store disposable at once, so the store
-            // refuses new mutations until the clock catches up rather than dropping live evidence.
-            if ( $receipt['created_at'] < $horizon && $receipt['created_at'] <= $now + self::ABILITIES_V2_CLOCK_SKEW ) {
+            // Eviction may only give up an entry it can prove is past the retry horizon, which is
+            // the same question a replay asks of a reservation. Asking it once is what stops
+            // eviction from dropping an entry a retry would still have been answered from.
+            if ( ! $this->abilities_v2_reservation_is_live( $receipt['created_at'] ) ) {
                 $evictable[ $reference ] = $receipt['created_at'];
             }
         }
@@ -703,7 +779,49 @@ class MainWP_Child_Staging { //phpcs:ignore -- NOSONAR - multi methods.
             }
             unset( $receipts[ $reference ] );
         }
+        // A tombstone is stamped at first observation, so a repair left unpersisted is stamped
+        // again on every request and can never grow old enough to be given up - a store of damaged
+        // entries would then refuse every clone mutation forever with no way out. Writing it here
+        // freezes those stamps and lets the entries cross the horizon on their own.
+        if ( $repaired && ! $this->abilities_v2_store_receipts( $receipts ) ) {
+            return false;
+        }
         return self::ABILITIES_V2_MAX_RECEIPTS > count( $receipts ) ? $receipts : false;
+    }
+
+    /**
+     * Whether an entry is already the dated tombstone of an unreadable receipt.
+     *
+     * @param mixed $receipt Stored entry.
+     * @return bool
+     */
+    private function abilities_v2_tombstone( $receipt ) {
+        return is_array( $receipt )
+            && $this->abilities_v2_exact_keys( $receipt, array( 'effect_hash', 'state', 'response', 'created_at' ) )
+            && 'unreadable' === $receipt['state']
+            && is_int( $receipt['created_at'] );
+    }
+
+    /**
+     * Rebuild one unreadable entry as a dated tombstone under the same reference.
+     *
+     * Keeping the reference is what stops its retry from starting a second clone job. What the
+     * damaged entry no longer proves is the outcome, so nothing about the effect survives: no
+     * effect hash a request could match, and no response to replay. Its own stamp is kept where
+     * it still reads, so an entry written by an older build ages out on the date it was written
+     * rather than on the date this store first failed to read it.
+     *
+     * @param mixed $receipt Unreadable entry.
+     * @return array Dated tombstone.
+     */
+    private function abilities_v2_tombstone_record( $receipt ) {
+        $now = time();
+        return array(
+            'effect_hash' => str_repeat( '0', 64 ),
+            'state'       => 'unreadable',
+            'response'    => null,
+            'created_at'  => is_array( $receipt ) && isset( $receipt['created_at'] ) && is_int( $receipt['created_at'] ) && 0 < $receipt['created_at'] && $now >= $receipt['created_at'] ? $receipt['created_at'] : $now,
+        );
     }
 
     /**

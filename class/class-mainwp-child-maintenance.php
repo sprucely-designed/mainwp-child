@@ -53,6 +53,13 @@ class MainWP_Child_Maintenance {
     private $abilities_v2_lock_owner = '';
 
     /**
+     * Instant this request has to stop destructive work at, once something pinned it.
+     *
+     * @var int|null
+     */
+    private $abilities_v2_deadline = null;
+
+    /**
      * Public static variable to hold the single instance of the class.
      *
      * @var mixed Default null
@@ -504,6 +511,10 @@ class MainWP_Child_Maintenance {
             return $this->abilities_v2_error( $operation, 'storage_unavailable' );
         }
 
+        // Pinned before the first action rather than at the first stop that consults it, because an
+        // action list that opens with something other than the sweep would otherwise fix the instant
+        // only after that action already spent part of the request on it.
+        $this->abilities_v2_deadline();
         $successful = array();
         foreach ( $actions as $action ) {
             // The margin the sweep's deadline reserves settles this record and releases the lock,
@@ -913,6 +924,15 @@ class MainWP_Child_Maintenance {
         if ( null !== $record['finished_at'] && ( ! is_int( $record['finished_at'] ) || $record['finished_at'] < $record['accepted_at'] ) ) {
             return false;
         }
+        // This store is untrusted input - a hand-edited option or a partial restore reaches here -
+        // and nothing else pins the outcome keys down. The loop below matches each outcome against
+        // actions[$index] by its own key, so a list that starts at 1 or skips an index passes it
+        // while every reader treats the outcome count as a prefix of the action list: the short
+        // terminal record allowed below then projects one action dropped, another duplicated, and
+        // integer keys that encode as a JSON object instead of an array. Refused, not repaired.
+        if ( 0 < count( $record['outcomes'] ) && array_keys( $record['outcomes'] ) !== range( 0, count( $record['outcomes'] ) - 1 ) ) {
+            return false;
+        }
         foreach ( $record['outcomes'] as $index => $outcome ) {
             if ( ! is_array( $outcome ) || ! $this->abilities_v2_exact_keys( $outcome, array( 'action', 'status', 'affected', 'error_code' ) ) || ! isset( $record['actions'][ $index ] ) || $outcome['action'] !== $record['actions'][ $index ] || ! $this->abilities_v2_valid_action_outcome(
                 array(
@@ -1033,15 +1053,32 @@ class MainWP_Child_Maintenance {
     }
 
     /**
+     * The instant this request stops destructive work at, fixed the first time it is asked for.
+     *
+     * @return int Unix timestamp.
+     */
+    private function abilities_v2_deadline() {
+        // The arithmetic above answers "what is left of the request from here", so re-deriving it
+        // after an action hands that action's own spending back: the stop slides forward by however
+        // long the work took and never arrives. With no execution limit it slides by the whole
+        // budget every time, so a caller that re-derives can never see the budget as spent at all.
+        // Pinned once and shared, so the sweep's internal checks and the operation-level stop are
+        // the same instant instead of two that drift apart. Reached through a getter rather than a
+        // parameter because the sweep hangs off an action dispatch whose signature subclasses
+        // override, and because the sweep is also entered directly, without an action loop above it.
+        if ( null === $this->abilities_v2_deadline ) {
+            $this->abilities_v2_deadline = $this->abilities_v2_revision_sweep_deadline();
+        }
+        return $this->abilities_v2_deadline;
+    }
+
+    /**
      * Whether the request has nothing left to spend on destructive work.
      *
      * @return bool
      */
     private function abilities_v2_budget_spent() {
-        // Asked instead of hoisting the deadline up to the operation: both levels stop on the same
-        // instant, the arithmetic above stays the only place that computes it, and the action
-        // dispatch keeps the signature its subclasses override.
-        return time() >= $this->abilities_v2_revision_sweep_deadline();
+        return time() >= $this->abilities_v2_deadline();
     }
 
     /**
@@ -1052,7 +1089,7 @@ class MainWP_Child_Maintenance {
      */
     private function abilities_v2_delete_revisions( $revision_retention ) {
         global $wpdb;
-        $deadline = $this->abilities_v2_revision_sweep_deadline();
+        $deadline = $this->abilities_v2_deadline();
         // Decided ahead of the retention-zero path below, which is one DELETE over every revision on
         // the site and the largest statement in this file. Nothing can interrupt a statement once it
         // is issued, so declining to start it is the only bound there is: a request with nothing

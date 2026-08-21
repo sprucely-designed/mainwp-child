@@ -1064,6 +1064,96 @@ class Test_MainWP_Child_Maintenance_V2 extends WP_UnitTestCase {
 	}
 
 	/**
+	 * With no execution limit the deadline arithmetic answers "now plus the whole budget" every time
+	 * it is asked, so an operation-level stop that asks again after each action is handed a fresh two
+	 * minutes and never fires: the later action runs on the margin the sweep gave up to settle the
+	 * record. The instant has to be pinned once for the request and consulted, not re-derived.
+	 */
+	public function test_operation_stops_starting_actions_under_an_unlimited_execution_limit() {
+		global $wpdb;
+		$parent_id = self::factory()->post->create();
+		$this->insert_revisions( $parent_id, 10 );
+		self::factory()->post->create( array( 'post_status' => 'auto-draft' ) );
+		self::factory()->post->create( array( 'post_status' => 'auto-draft' ) );
+		$auto_drafts = "SELECT COUNT(*) FROM $wpdb->posts WHERE post_status = 'auto-draft'";
+		$before      = (int) $wpdb->get_var( $auto_drafts );
+		$this->assertGreaterThan( 0, $before );
+
+		$subject        = $this->real_subject();
+		$original_limit = ini_get( 'max_execution_time' );
+		// CLI and explicitly unlimited requests take the branch that grants the full 120s budget, and
+		// no request clock can shorten it. Waiting two minutes out is not a test, so the request's
+		// deadline is pinned two seconds ahead and the first action is stalled past it: the state the
+		// operation reaches on its own once the sweep has spent the budget.
+		ini_set( 'max_execution_time', 0 );
+		$deadline = new \ReflectionProperty( MainWP_Child_Maintenance::class, 'abilities_v2_deadline' );
+		$deadline->setAccessible( true );
+		$stall = static function ( $query ) {
+			static $stalled = false;
+			if ( ! $stalled && 1 === preg_match( '/^\s*DELETE\s+FROM\s+\S*posts\b/i', $query ) ) {
+				$stalled = true;
+				$until   = time() + 3;
+				while ( time() < $until ) {
+					usleep( 50000 );
+				}
+			}
+			return $query;
+		};
+
+		$preview = $this->real_request(
+			$subject,
+			'ability_maintenance_preview_v2',
+			array(
+				'actions'            => array( 'revisions', 'autodraft' ),
+				'revision_retention' => 2,
+			)
+		);
+		$this->assertTrue( $preview['ok'] );
+		$deadline->setValue( $subject, time() + 2 );
+
+		add_filter( 'query', $stall );
+		try {
+			$result = $this->real_request(
+				$subject,
+				'ability_maintenance_execute_v2',
+				array(
+					'operation_ref'      => '123e4567-e89b-42d3-a456-426614174526',
+					'actions'            => array( 'revisions', 'autodraft' ),
+					'revision_retention' => 2,
+					'snapshot_revision'  => $preview['snapshot_revision'],
+					'action_hash'        => hash( 'sha256', wp_json_encode( array( array( 'revisions', 'autodraft' ), 2 ) ) ),
+				)
+			);
+		} finally {
+			remove_filter( 'query', $stall );
+			ini_set( 'max_execution_time', $original_limit );
+		}
+
+		$this->assertSame(
+			$before,
+			(int) $wpdb->get_var( $auto_drafts ),
+			'An unlimited execution limit is not an unlimited request: the action after the stop must not have started, and its rows are the evidence.'
+		);
+		$this->assertSame(
+			'2',
+			$wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM $wpdb->posts WHERE post_type = 'revision' AND post_parent = %d", $parent_id ) ),
+			'The sweep itself still ran its first batch before the pinned deadline passed.'
+		);
+		$stored = get_option( MainWP_Child_Maintenance::ABILITIES_V2_OPERATIONS_OPTION, array() );
+		$this->assertSame(
+			array( 'revisions' ),
+			array_column( $stored['123e4567-e89b-42d3-a456-426614174526']['outcomes'], 'action' ),
+			'The record holds an outcome for what ran and none for what was never started.'
+		);
+		$this->assertSame( 8, $stored['123e4567-e89b-42d3-a456-426614174526']['outcomes'][0]['affected'] );
+		$this->assertSame( 'unknown', $stored['123e4567-e89b-42d3-a456-426614174526']['status'] );
+		$this->assertNull( get_option( MainWP_Child_Maintenance::ABILITIES_V2_LOCK_OPTION, null ), 'The margin the stop preserved is what releases the lock.' );
+		$this->assertTrue( $result['ok'] );
+		$this->assertSame( 'unknown', $result['status'] );
+		$this->assertSame( array( 'revisions', 'autodraft' ), array_column( $result['outcomes'], 'action' ) );
+	}
+
+	/**
 	 * Retention zero deletes every revision on the site in one statement, and nothing can interrupt a
 	 * statement once it is issued, so a request with no budget left has to decline to start it. The
 	 * operation-level stop above never reaches this: it lets the first action run, which is what makes
@@ -1100,6 +1190,69 @@ class Test_MainWP_Child_Maintenance_V2 extends WP_UnitTestCase {
 			'An exhausted budget reports the same unknown the paged path reports, with nothing destroyed.'
 		);
 		$this->assertSame( '5', $wpdb->get_var( $revisions ), 'The single bulk delete must not be issued on a budget that is already gone.' );
+	}
+
+	/**
+	 * A terminal unknown record may hold fewer outcomes than actions, and every reader treats the
+	 * ones it holds as a prefix of the action list. The option behind it is untrusted - a hand edit
+	 * or a partial restore lands here - so a list keyed [1] rather than [0] pins its outcome to the
+	 * second action while the readers count it against the first: the projection then drops one
+	 * action, repeats another, and hands back integer keys that encode as a JSON object.
+	 */
+	public function test_a_record_whose_outcome_keys_skip_an_index_is_refused_instead_of_projected() {
+		$operation_ref = '123e4567-e89b-42d3-a456-426614174527';
+		$actions       = array( 'revisions', 'autodraft' );
+		$retention     = 5;
+		$snapshot      = str_repeat( 'a', 64 );
+		$action_hash   = hash( 'sha256', wp_json_encode( array( $actions, $retention ) ) );
+		$at            = time() - 60;
+		$record        = array(
+			'operation_ref'      => $operation_ref,
+			'effect_hash'        => hash( 'sha256', wp_json_encode( array( $operation_ref, $actions, $retention, $snapshot, $action_hash ) ) ),
+			'action_hash'        => $action_hash,
+			'snapshot_revision'  => $snapshot,
+			'actions'            => $actions,
+			'revision_retention' => $retention,
+			'status'             => 'unknown',
+			'outcomes'           => array(
+				1 => array(
+					'action'     => 'autodraft',
+					'status'     => 'succeeded',
+					'affected'   => 1,
+					'error_code' => null,
+				),
+			),
+			'accepted_at'        => $at,
+			'finished_at'        => $at,
+			'retryable'          => false,
+			'report_emitted'     => false,
+			'updated_at'         => $at,
+		);
+		$validator     = new \ReflectionMethod( MainWP_Child_Maintenance::class, 'abilities_v2_valid_operation_record' );
+		$validator->setAccessible( true );
+		$subject = $this->real_subject();
+
+		$this->assertFalse( $validator->invoke( $subject, $record ), 'Outcome keys that skip an index are a damaged row, not a short one.' );
+
+		// The same short list keyed from zero is what a run that stopped between actions really
+		// writes, and refusing that would refuse every stopped run in the store.
+		$contiguous             = $record;
+		$contiguous['outcomes'] = array(
+			array(
+				'action'     => 'revisions',
+				'status'     => 'succeeded',
+				'affected'   => 3,
+				'error_code' => null,
+			),
+		);
+		$this->assertTrue( $validator->invoke( $subject, $contiguous ) );
+
+		update_option( MainWP_Child_Maintenance::ABILITIES_V2_OPERATIONS_OPTION, array( $operation_ref => $record ), false );
+		$result = $this->real_request( $subject, 'ability_maintenance_operation_v2', array( 'operation_ref' => $operation_ref ) );
+
+		$this->assertFalse( $result['ok'] );
+		$this->assertSame( 'storage_unavailable', $result['code'] );
+		$this->assertArrayNotHasKey( 'outcomes', $result, 'A damaged row is refused, not projected into a response.' );
 	}
 
 	/** Fill one parent with revisions cheaply; the sweep only ever reads them through SQL. */

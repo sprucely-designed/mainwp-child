@@ -1017,20 +1017,22 @@ class MainWP_Child_Maintenance {
     }
 
     /**
-     * Return the outcome of a destructive action that declined to start on a spent budget.
+     * Return the outcome of a destructive action the budget stopped.
      *
-     * Nothing can interrupt a DELETE, an OPTIMIZE TABLE or a term loop once it is issued, so
-     * declining to start is the only bound those actions have. A request with nothing left of its
-     * limit would spend the settle margin inside one and die with the record running and the lock
-     * held. Nothing was destroyed, which is what the zero affected count says, and what the action
-     * would have removed is not known, which is what the status says.
+     * Nothing can interrupt a single DELETE or one OPTIMIZE TABLE once it is issued, so declining
+     * to start is the only bound at the entry: a request with nothing left of its limit would spend
+     * the settle margin inside one and die with the record running and the lock held. The loops are
+     * interruptible between iterations, and stopping there is the same stop with a different count,
+     * so both report through here. What the action already destroyed travels back, because stopping
+     * does not put it back; what it had not reached yet is not known, which is what the status says.
      *
+     * @param int $affected Rows, terms or entries this run destroyed before it stopped.
      * @return array<string,int|string|null>
      */
-    private function abilities_v2_budget_declined_outcome() {
+    private function abilities_v2_budget_declined_outcome( $affected = 0 ) {
         return array(
             'status'     => 'unknown',
-            'affected'   => 0,
+            'affected'   => $affected,
             'error_code' => 'outcome_unknown',
         );
     }
@@ -1341,6 +1343,12 @@ class MainWP_Child_Maintenance {
             if ( 0 !== (int) $term->count || ( 'category' === $taxonomy && $default_category === (int) $term->term_id ) ) {
                 continue;
             }
+            // A taxonomy with thousands of empty terms outlasts the request on its own, and every
+            // wp_delete_term() is a write. Checked here rather than at the top of the iteration so
+            // the terms this run skips cost it nothing.
+            if ( $this->abilities_v2_budget_spent() ) {
+                return $this->abilities_v2_budget_declined_outcome( $affected );
+            }
             $deleted = wp_delete_term( (int) $term->term_id, $taxonomy );
             if ( false === $deleted || is_wp_error( $deleted ) ) {
                 return $this->abilities_v2_failed_outcome( 'mutation_failed', $affected );
@@ -1373,6 +1381,12 @@ class MainWP_Child_Maintenance {
             }
             if ( 0 !== strpos( $table['Name'], $wpdb->prefix ) ) {
                 continue;
+            }
+            // One OPTIMIZE TABLE cannot be interrupted, but the series can be, and a site's prefixed
+            // tables are enough of them to outlast the request. Checked per table, after the prefix
+            // filter, so tables this run never touches cost it nothing.
+            if ( $this->abilities_v2_budget_spent() ) {
+                return $this->abilities_v2_budget_declined_outcome( $affected );
             }
             $identifier       = str_replace( '`', '``', $table['Name'] );
             $wpdb->last_error = '';
@@ -1412,6 +1426,11 @@ class MainWP_Child_Maintenance {
         );
         foreach ( $scopes as $scope => $site ) {
             foreach ( $names[ $scope ] as $name ) {
+                // Every name is at least one option write and the list is as long as the site made
+                // it, so the walk is bounded per name rather than only at its start.
+                if ( $this->abilities_v2_budget_spent() ) {
+                    return $this->abilities_v2_budget_declined_outcome( $affected );
+                }
                 if ( $site ? delete_site_transient( $name ) : delete_transient( $name ) ) {
                     ++$affected;
                     continue;

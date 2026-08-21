@@ -1263,6 +1263,154 @@ class Test_MainWP_Child_Maintenance_V2 extends WP_UnitTestCase {
 	}
 
 	/**
+	 * The entry guard bounds a run that arrives with nothing left, but a taxonomy of empty terms is
+	 * spent inside the loop, one wp_delete_term at a time. A stop between terms leaves terms really
+	 * deleted, so the outcome carries the count: the zero an entry decline reports would tell the
+	 * Dashboard the taxonomy is untouched while the tags are gone.
+	 */
+	public function test_term_delete_reports_the_terms_it_destroyed_when_the_budget_runs_out_mid_loop() {
+		global $wpdb;
+		$seeded = 5;
+		for ( $index = 0; $index < $seeded; $index++ ) {
+			self::factory()->term->create(
+				array(
+					'taxonomy' => 'post_tag',
+					'name'     => 'mwp-budget-tag-' . $index,
+				)
+			);
+		}
+		$tags = $wpdb->prepare( "SELECT COUNT(*) FROM $wpdb->term_taxonomy WHERE taxonomy = %s", 'post_tag' );
+		$this->assertSame( $seeded, (int) $wpdb->get_var( $tags ) );
+
+		$subject  = $this->real_subject();
+		$deadline = $this->deadline_property();
+		// The clock is moved rather than waited out: a stall long enough to expire a real deadline
+		// costs the suite seconds per test and still leaves which iteration it lands on to chance.
+		// delete_term fires once per term the loop actually removed, which is where the request runs
+		// out here.
+		$stop = static function () use ( $subject, $deadline ) {
+			static $deleted = 0;
+			++$deleted;
+			if ( 2 === $deleted ) {
+				$deadline->setValue( $subject, time() - 1 );
+			}
+		};
+
+		add_action( 'delete_term', $stop );
+		try {
+			$outcome = $this->mid_loop_execute( $subject, 'tags', '123e4567-e89b-42d3-a456-426614174532' );
+		} finally {
+			remove_action( 'delete_term', $stop );
+		}
+
+		$this->assertSame( 'unknown', $outcome['status'] );
+		$this->assertSame( 'outcome_unknown', $outcome['error_code'] );
+		$this->assertGreaterThan( 0, $outcome['affected'], 'The run deleted terms before it stopped, and an entry decline is not what happened.' );
+		$this->assertLessThan( $seeded, $outcome['affected'], 'A run that reached the end of the taxonomy is not the stop this pins.' );
+		$this->assertSame(
+			$seeded - $outcome['affected'],
+			(int) $wpdb->get_var( $tags ),
+			'The terms missing from the taxonomy are exactly the ones the outcome claims.'
+		);
+	}
+
+	/**
+	 * One OPTIMIZE TABLE cannot be interrupted, but the series over a site's prefixed tables can. The
+	 * tables the run rebuilt stay rebuilt, so the count it reports is what the Dashboard reconciles
+	 * against, and it has to be the tables it issued rather than none or all of them.
+	 */
+	public function test_table_optimize_reports_the_tables_it_rebuilt_when_the_budget_runs_out_mid_loop() {
+		global $wpdb;
+		$prefixed = 0;
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- The action's own table list, read the same way.
+		foreach ( $wpdb->get_results( 'SHOW TABLE STATUS FROM `' . esc_sql( DB_NAME ) . '`', ARRAY_A ) as $table ) {
+			if ( 0 === strpos( $table['Name'], $wpdb->prefix ) ) {
+				++$prefixed;
+			}
+		}
+		$this->assertGreaterThan( 2, $prefixed, 'The site needs more prefixed tables than the run is allowed to reach.' );
+
+		$subject   = $this->real_subject();
+		$deadline  = $this->deadline_property();
+		$optimizes = array();
+		// OPTIMIZE TABLE commits implicitly, which would take the harness transaction and every
+		// fixture in it, so the statement is answered instead of run. What is under test is the count
+		// the loop reports against the statements it issued, and the spy sees every one of those.
+		$spy = static function ( $query ) use ( $subject, $deadline, &$optimizes ) {
+			if ( 1 !== preg_match( '/^\s*OPTIMIZE\s+TABLE\b/i', $query ) ) {
+				return $query;
+			}
+			$optimizes[] = $query;
+			if ( 2 === count( $optimizes ) ) {
+				$deadline->setValue( $subject, time() - 1 );
+			}
+			return 'SELECT 1';
+		};
+
+		add_filter( 'query', $spy );
+		try {
+			$outcome = $this->mid_loop_execute( $subject, 'optimize', '123e4567-e89b-42d3-a456-426614174533' );
+		} finally {
+			remove_filter( 'query', $spy );
+		}
+
+		$this->assertSame( 'unknown', $outcome['status'] );
+		$this->assertSame( 'outcome_unknown', $outcome['error_code'] );
+		$this->assertSame( count( $optimizes ), $outcome['affected'], 'The outcome counts the tables the run rebuilt, not the ones it listed.' );
+		$this->assertGreaterThan( 0, $outcome['affected'] );
+		$this->assertLessThan( $prefixed, $outcome['affected'], 'A run that reached every prefixed table is not the stop this pins.' );
+	}
+
+	/**
+	 * A delete-all run walks every name the site made, and the walk outlasts the request rather than
+	 * any single delete inside it. The transients it already removed are gone from the options table,
+	 * so the stop reports them instead of the zero an entry decline reports.
+	 */
+	public function test_transient_delete_reports_the_entries_it_removed_when_the_budget_runs_out_mid_loop() {
+		if ( wp_using_ext_object_cache() ) {
+			$this->markTestSkipped( 'Transient maintenance reports unsupported behind an external object cache.' );
+		}
+		global $wpdb;
+		$this->clear_transients();
+		$seeded = 5;
+		for ( $index = 0; $index < $seeded; $index++ ) {
+			set_transient( 'mwp_budget_walk_' . $index, 'value-' . $index, HOUR_IN_SECONDS );
+		}
+		$values = $wpdb->prepare( "SELECT COUNT(*) FROM $wpdb->options WHERE option_name LIKE %s AND option_name NOT LIKE %s", $wpdb->esc_like( '_transient_' ) . '%', $wpdb->esc_like( '_transient_timeout_' ) . '%' );
+		$this->assertSame( $seeded, (int) $wpdb->get_var( $values ) );
+
+		$subject  = $this->real_subject();
+		$deadline = $this->deadline_property();
+		// deleted_transient fires once per name the walk really removed, which is the same event the
+		// loop counts, so the request runs out between two of them rather than at some point the
+		// wall clock happens to land on.
+		$stop = static function () use ( $subject, $deadline ) {
+			static $deleted = 0;
+			++$deleted;
+			if ( 2 === $deleted ) {
+				$deadline->setValue( $subject, time() - 1 );
+			}
+		};
+
+		add_action( 'deleted_transient', $stop );
+		try {
+			$outcome = $this->mid_loop_execute( $subject, 'transients_all', '123e4567-e89b-42d3-a456-426614174534' );
+		} finally {
+			remove_action( 'deleted_transient', $stop );
+		}
+
+		$this->assertSame( 'unknown', $outcome['status'] );
+		$this->assertSame( 'outcome_unknown', $outcome['error_code'] );
+		$this->assertGreaterThan( 0, $outcome['affected'], 'The walk removed transients before it stopped, and an entry decline is not what happened.' );
+		$this->assertLessThan( $seeded, $outcome['affected'], 'A walk that reached the end of the list is not the stop this pins.' );
+		$this->assertSame(
+			$seeded - $outcome['affected'],
+			(int) $wpdb->get_var( $values ),
+			'The transients missing from the options table are exactly the ones the outcome claims.'
+		);
+	}
+
+	/**
 	 * A terminal unknown record may hold fewer outcomes than actions, and every reader treats the
 	 * ones it holds as a prefix of the action list. The option behind it is untrusted - a hand edit
 	 * or a partial restore lands here - so a list keyed [1] rather than [0] pins its outcome to the
@@ -1416,6 +1564,53 @@ class Test_MainWP_Child_Maintenance_V2 extends WP_UnitTestCase {
 			)
 		);
 		return array( $preview, $result );
+	}
+
+	/** The instant this request stops at, reachable so a test can pin it or move it as the clock would. */
+	private function deadline_property() {
+		$deadline = new \ReflectionProperty( MainWP_Child_Maintenance::class, 'abilities_v2_deadline' );
+		$deadline->setAccessible( true );
+		return $deadline;
+	}
+
+	/**
+	 * Preview then execute one action on a request whose budget outlives the entry check.
+	 *
+	 * The deadline is pinned ahead of the run rather than behind it, so the action starts its loop
+	 * and only the caller's own trigger ends it. Pinned behind, this would be the entry guard again.
+	 *
+	 * @return array Durable outcome the run left for the action.
+	 */
+	private function mid_loop_execute( $subject, $action, $operation_ref ) {
+		$preview = $this->real_request(
+			$subject,
+			'ability_maintenance_preview_v2',
+			array(
+				'actions'            => array( $action ),
+				'revision_retention' => 5,
+			)
+		);
+		$this->assertTrue( $preview['ok'] );
+		$this->deadline_property()->setValue( $subject, time() + 60 );
+
+		$result = $this->real_request(
+			$subject,
+			'ability_maintenance_execute_v2',
+			array(
+				'operation_ref'      => $operation_ref,
+				'actions'            => array( $action ),
+				'revision_retention' => 5,
+				'snapshot_revision'  => $preview['snapshot_revision'],
+				'action_hash'        => hash( 'sha256', wp_json_encode( array( array( $action ), 5 ) ) ),
+			)
+		);
+
+		$this->assertTrue( $result['ok'] );
+		$this->assertSame( 'unknown', $result['status'] );
+		$stored = get_option( MainWP_Child_Maintenance::ABILITIES_V2_OPERATIONS_OPTION, array() );
+		$this->assertSame( 'unknown', $stored[ $operation_ref ]['status'] );
+		$this->assertSame( $action, $stored[ $operation_ref ]['outcomes'][0]['action'] );
+		return $stored[ $operation_ref ]['outcomes'][0];
 	}
 
 	/**

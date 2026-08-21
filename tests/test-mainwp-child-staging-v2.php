@@ -1045,6 +1045,38 @@ class Test_MainWP_Child_Staging_V2 extends WP_UnitTestCase {
 		$this->assertArrayHasKey( '123e4567-e89b-42d3-a456-426614174956', $stored );
 	}
 
+	/**
+	 * A store whose stamps this clock cannot date is re-dated once, so it still ages out.
+	 *
+	 * Nothing is given up: every receipt is still there and still replays. What changes is that
+	 * the store now holds dates it can act on, so it is no longer a store that refuses every
+	 * later clone mutation with no way out.
+	 */
+	public function test_a_store_of_undatable_stamps_is_redated_once_and_then_ages_out() {
+		$this->staging->operation_results['create_clone'] = $this->queued_clone_result();
+		$ahead                                            = time() + ( 2 * DAY_IN_SECONDS );
+		update_option( 'mainwp_staging_abilities_v2_operation_receipts', $this->fill_receipts( 100, $ahead ), false );
+
+		$refused = $this->staging->abilities_v2( $this->clone_request( '123e4567-e89b-42d3-a456-426614174957' ) );
+		$stored  = get_option( 'mainwp_staging_abilities_v2_operation_receipts', array() );
+
+		$this->assertFalse( $refused['ok'], 'a full store still refuses rather than dropping evidence' );
+		$this->assertSame( array(), $this->staging->operation_calls );
+		$this->assertCount( 100, $stored, 'not one receipt is given up to make room' );
+		foreach ( $stored as $reference => $receipt ) {
+			$this->assertLessThanOrEqual( time(), $receipt['created_at'], $reference );
+			$this->assertSame( 'settled', $receipt['state'], $reference );
+		}
+
+		// Only the clock changes: what was undatable now ages out like any other receipt.
+		foreach ( $stored as $reference => $receipt ) {
+			$stored[ $reference ]['created_at'] = time() - ( DAY_IN_SECONDS + 3600 );
+		}
+		update_option( 'mainwp_staging_abilities_v2_operation_receipts', $stored, false );
+
+		$this->assertTrue( $this->staging->abilities_v2( $this->clone_request( '123e4567-e89b-42d3-a456-426614174958' ) )['ok'] );
+	}
+
 	/** @param array $request Clone request. @param int $created_at Stamp. @return array */
 	private function reservation( $request, $created_at ) {
 		return array(

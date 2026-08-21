@@ -648,6 +648,17 @@ class MainWP_Child_Timecapsule { //phpcs:ignore -- NOSONAR - multi methods.
                 }
                 $receipt = $rebuilt;
             }
+            // A stamp ahead of this clock can never be shown to be past the horizon, so an entry
+            // carrying one would sit here forever and, once the store is full, refuse every later
+            // mutation from then on. It is re-dated rather than dropped or held: dropping it
+            // would lose evidence a retry still needs, while re-dating only ever extends the
+            // window it is protected for. It happens once, because the write below leaves a stamp
+            // this clock can date.
+            if ( $receipt['created_at'] > time() + self::ABILITIES_V2_CLOCK_SKEW ) {
+                $receipt['created_at']  = time();
+                $receipts[ $reference ] = $receipt;
+                $repaired               = true;
+            }
             // Eviction may only give up an entry it can prove is past the retry horizon, which is
             // the same question a replay asks of a reservation. Asking it once is what stops
             // eviction from dropping an entry a retry would still have been answered from.

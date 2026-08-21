@@ -1001,6 +1001,36 @@ class Test_MainWP_Child_Timecapsule_V2 extends WP_UnitTestCase {
 		$this->assertArrayHasKey( '123e4567-e89b-42d3-a456-426614174982', $stored );
 	}
 
+	/**
+	 * A store whose stamps this clock cannot date is re-dated once, so it still ages out.
+	 *
+	 * Nothing is given up: every receipt is still there and still replays. What changes is that
+	 * the store now holds dates it can act on.
+	 */
+	public function test_a_store_of_undatable_stamps_is_redated_once_and_then_ages_out() {
+		$fixture = $this->backup_fixture();
+		$ahead   = time() + ( 2 * DAY_IN_SECONDS );
+		update_option( 'mainwp_timecapsule_abilities_v2_receipts', $this->fill_receipts( 100, $ahead ), false );
+
+		$refused = $fixture->abilities_v2( $this->receipt_backup_request( '123e4567-e89b-42d3-a456-426614174983' ) );
+		$stored  = get_option( 'mainwp_timecapsule_abilities_v2_receipts', array() );
+
+		$this->assertFalse( $refused['ok'], 'a full store still refuses rather than dropping evidence' );
+		$this->assertSame( array(), $fixture->calls );
+		$this->assertCount( 100, $stored, 'not one receipt is given up to make room' );
+		foreach ( $stored as $reference => $receipt ) {
+			$this->assertLessThanOrEqual( time(), $receipt['created_at'], $reference );
+			$this->assertSame( 'settled', $receipt['state'], $reference );
+		}
+
+		foreach ( $stored as $reference => $receipt ) {
+			$stored[ $reference ]['created_at'] = time() - ( DAY_IN_SECONDS + 3600 );
+		}
+		update_option( 'mainwp_timecapsule_abilities_v2_receipts', $stored, false );
+
+		$this->assertTrue( $fixture->abilities_v2( $this->receipt_backup_request( '123e4567-e89b-42d3-a456-426614174984' ) )['ok'] );
+	}
+
 	/** @return Timecapsule_V2_Protocol_Fixture */
 	private function backup_fixture() {
 		$fixture                          = new Timecapsule_V2_Protocol_Fixture();

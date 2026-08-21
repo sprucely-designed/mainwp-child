@@ -563,6 +563,57 @@ class Test_MainWP_Child_Wordfence_V2 extends WP_UnitTestCase {
 		$this->assertArrayHasKey( '123e4567-e89b-42d3-a456-426614174626', $stored );
 	}
 
+	/**
+	 * A settled entry whose stored hash and response name different operations still ages out.
+	 *
+	 * Nothing here can bind an effect hash to a response operation, so such an entry cannot be
+	 * told from a sound one. What it must not do is sit undatable forever, and re-dating is what
+	 * stops a full store of them refusing every later mutation.
+	 */
+	public function test_a_full_store_of_cross_operation_receipts_is_redated_and_self_clears() {
+		$fixture  = $this->blocks_fixture();
+		$receipts = array();
+		for ( $index = 0; $index < 100; $index++ ) {
+			$reference              = sprintf( '123e4567-e89b-42d3-a456-4266141760%02d', $index );
+			$receipts[ $reference ] = array(
+				// The hash of some other mutation entirely, so no request can ever match it.
+				'effect_hash' => hash( 'sha256', 'scan_v2_start:' . $reference ),
+				'state'       => 'settled',
+				'response'    => array(
+					'protocol'         => '2',
+					'operation'        => 'blocks_v2_replace',
+					'ok'               => true,
+					'request_ref'      => $reference,
+					'operation_ref'    => str_repeat( 'a', 64 ),
+					'state'            => 'completed',
+					'added'            => 1,
+					'removed'          => 0,
+					'management_probe' => 'safe',
+					'generation'       => str_repeat( 'b', 64 ),
+				),
+				'created_at'  => PHP_INT_MAX,
+			);
+		}
+		update_option( 'mainwp_wordfence_abilities_v2_receipts', $receipts, false );
+
+		$refused = $fixture->abilities_v2( $this->blocks_request( '123e4567-e89b-42d3-a456-426614174627' ) );
+		$stored  = get_option( 'mainwp_wordfence_abilities_v2_receipts', array() );
+
+		$this->assertFalse( $refused['ok'] );
+		$this->assertSame( array(), $fixture->calls );
+		$this->assertCount( 100, $stored, 'evidence a reference could still be answered from is not given up' );
+		foreach ( $stored as $reference => $entry ) {
+			$this->assertLessThanOrEqual( time(), $entry['created_at'], $reference );
+		}
+
+		foreach ( $stored as $reference => $entry ) {
+			$stored[ $reference ]['created_at'] = time() - ( DAY_IN_SECONDS + 3600 );
+		}
+		update_option( 'mainwp_wordfence_abilities_v2_receipts', $stored, false );
+
+		$this->assertTrue( $fixture->abilities_v2( $this->blocks_request( '123e4567-e89b-42d3-a456-426614174628' ) )['ok'] );
+	}
+
 	/** @param array $request Blocks request. @param int $created_at Stamp. @return array */
 	private function reservation( $request, $created_at ) {
 		return array(

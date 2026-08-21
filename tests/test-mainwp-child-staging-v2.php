@@ -1011,6 +1011,40 @@ class Test_MainWP_Child_Staging_V2 extends WP_UnitTestCase {
 		$this->assertCount( 1, $this->staging->operation_calls, 'a refusal already recorded must not reach the provider again' );
 	}
 
+	/**
+	 * An entry filed under a key no request could present is not evidence for anybody.
+	 *
+	 * References are validated before the store is consulted, so nothing can ever come back for
+	 * such an entry. Keeping it would let a store of junk keys hold every later clone mutation
+	 * shut, and PHP array keys are not always strings, so one can also be compared as one.
+	 */
+	public function test_entries_under_keys_no_request_can_present_are_given_up() {
+		$this->staging->operation_results['create_clone'] = $this->queued_clone_result();
+		$receipts                                         = array();
+		for ( $index = 0; $index < 99; $index++ ) {
+			$receipts[ 'invalid-ref-' . $index ] = array(
+				'effect_hash' => hash( 'sha256', (string) $index ),
+				'state'       => 'settled',
+				'response'    => array( 'ok' => true ),
+				'created_at'  => PHP_INT_MAX,
+			);
+		}
+		// An integer key: PHP turns a numeric string key into one, and it is not a reference.
+		$receipts[0] = array(
+			'effect_hash' => hash( 'sha256', 'numeric' ),
+			'state'       => 'settled',
+			'response'    => array( 'ok' => true ),
+			'created_at'  => PHP_INT_MAX,
+		);
+		update_option( 'mainwp_staging_abilities_v2_operation_receipts', $receipts, false );
+
+		$result = $this->staging->abilities_v2( $this->clone_request( '123e4567-e89b-42d3-a456-426614174956' ) );
+		$stored = get_option( 'mainwp_staging_abilities_v2_operation_receipts', array() );
+
+		$this->assertTrue( $result['ok'], 'a store nothing can ever replay must not refuse forever' );
+		$this->assertArrayHasKey( '123e4567-e89b-42d3-a456-426614174956', $stored );
+	}
+
 	/** @param array $request Clone request. @param int $created_at Stamp. @return array */
 	private function reservation( $request, $created_at ) {
 		return array(

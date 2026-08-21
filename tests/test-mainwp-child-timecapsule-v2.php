@@ -940,6 +940,40 @@ class Test_MainWP_Child_Timecapsule_V2 extends WP_UnitTestCase {
 		}
 	}
 
+	/**
+	 * An entry filed under a key no request could present is not evidence for anybody.
+	 *
+	 * References are validated before the store is consulted, so nothing can ever come back for
+	 * such an entry. Keeping it would let a store of junk keys hold every later mutation shut,
+	 * and PHP array keys are not always strings, so one can also be compared as one.
+	 */
+	public function test_entries_under_keys_no_request_can_present_are_given_up() {
+		$fixture  = $this->backup_fixture();
+		$receipts = array();
+		for ( $index = 0; $index < 99; $index++ ) {
+			$receipts[ 'invalid-ref-' . $index ] = array(
+				'effect_hash' => hash( 'sha256', (string) $index ),
+				'state'       => 'settled',
+				'response'    => array( 'ok' => true ),
+				'created_at'  => PHP_INT_MAX,
+			);
+		}
+		// An integer key: PHP turns a numeric string key into one, and it is not a reference.
+		$receipts[0] = array(
+			'effect_hash' => hash( 'sha256', 'numeric' ),
+			'state'       => 'settled',
+			'response'    => array( 'ok' => true ),
+			'created_at'  => PHP_INT_MAX,
+		);
+		update_option( 'mainwp_timecapsule_abilities_v2_receipts', $receipts, false );
+
+		$result = $fixture->abilities_v2( $this->receipt_backup_request( '123e4567-e89b-42d3-a456-426614174981' ) );
+		$stored = get_option( 'mainwp_timecapsule_abilities_v2_receipts', array() );
+
+		$this->assertTrue( $result['ok'], 'a store nothing can ever replay must not refuse forever' );
+		$this->assertArrayHasKey( '123e4567-e89b-42d3-a456-426614174981', $stored );
+	}
+
 	/** @return Timecapsule_V2_Protocol_Fixture */
 	private function backup_fixture() {
 		$fixture                          = new Timecapsule_V2_Protocol_Fixture();

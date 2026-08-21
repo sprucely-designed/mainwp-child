@@ -85,6 +85,17 @@ class MainWP_Child_Wordfence { //phpcs:ignore -- NOSONAR - multi methods.
     const ABILITIES_V2_CLOCK_SKEW = 300;
 
     /**
+     * Key count past which a stored response is refused before it is examined.
+     *
+     * The widest response this protocol defines carries fifteen result keys plus four envelope
+     * keys. Anything beyond this bound cannot match a schema, so rejecting it on the count alone
+     * is what stops an oversized option value from being copied and sorted first.
+     *
+     * @var int
+     */
+    const ABILITIES_V2_MAX_RESPONSE_KEYS = 32;
+
+    /**
      * Where the reason for a failed file operation belongs.
      *
      * Absolute server paths come back inside error_get_last(), and any plugin that installs an
@@ -838,7 +849,7 @@ class MainWP_Child_Wordfence { //phpcs:ignore -- NOSONAR - multi methods.
         $operation     = is_array( $request ) && isset( $request['operation'] ) && is_string( $request['operation'] ) ? $request['operation'] : 'unknown';
         $reads         = array( 'site_v2', 'scan_v2_status', 'findings_v2', 'firewall_v2_get', 'blocks_v2_list', 'operation_v2_status' );
         $bound_reads   = array( 'file_v2_prepare' );
-        $mutations     = array( 'scan_v2_start', 'scan_v2_cancel', 'finding_v2_classify', 'file_v2_repair', 'firewall_v2_replace', 'blocks_v2_replace' );
+        $mutations     = $this->abilities_v2_mutations();
         $request_bound = in_array( $operation, array_merge( $bound_reads, $mutations ), true );
         $root_keys     = $request_bound ? array( 'protocol', 'operation', 'request_ref', 'payload' ) : array( 'protocol', 'operation', 'payload' );
 
@@ -1036,6 +1047,14 @@ class MainWP_Child_Wordfence { //phpcs:ignore -- NOSONAR - multi methods.
         $repaired  = false;
         $evictable = array();
         foreach ( $receipts as $reference => $receipt ) {
+            if ( ! $this->abilities_v2_valid_request_ref( $reference ) ) {
+                // No request can present a reference this store would refuse, so nothing will ever
+                // come back for this entry. It is evidence for nobody, and dropping it is what
+                // keeps a store of junk keys from holding every later mutation shut. Array keys are
+                // not always strings either, so this is also what stops one being compared as one.
+                $evictable[ $reference ] = 0;
+                continue;
+            }
             if ( ! $this->abilities_v2_receipt_readable( $reference, $receipt ) ) {
                 // An entry nobody can read is still evidence that something wrote a receipt for
                 // that reference, so its scan or repair may already have run. Giving it up to make
@@ -1123,9 +1142,22 @@ class MainWP_Child_Wordfence { //phpcs:ignore -- NOSONAR - multi methods.
         if ( 'dispatching' === $receipt['state'] ) {
             return true;
         }
+        // Only mutations are ever written here, and only a mutation consults the store on replay.
+        // A settled response naming a read is therefore something no request can ever come back
+        // for, and holding it is how a store of them refuses every later mutation.
         return isset( $receipt['response']['operation'] )
             && is_string( $receipt['response']['operation'] )
+            && in_array( $receipt['response']['operation'], $this->abilities_v2_mutations(), true )
             && $this->abilities_v2_valid_receipt_response( $receipt['response']['operation'], $reference, $receipt['response'] );
+    }
+
+    /**
+     * The operations that mutate, and so the only ones a receipt can ever have been written for.
+     *
+     * @return array Mutation operation names.
+     */
+    private function abilities_v2_mutations() {
+        return array( 'scan_v2_start', 'scan_v2_cancel', 'finding_v2_classify', 'file_v2_repair', 'firewall_v2_replace', 'blocks_v2_replace' );
     }
 
     /**
@@ -1177,7 +1209,13 @@ class MainWP_Child_Wordfence { //phpcs:ignore -- NOSONAR - multi methods.
      * @return bool
      */
     private function abilities_v2_valid_receipt_response( $operation, $request_ref, $response ) {
-        if ( ! is_array( $response ) || ! isset( $response['protocol'], $response['operation'], $response['ok'], $response['request_ref'] ) || '2' !== $response['protocol'] || ! is_string( $response['operation'] ) || ! hash_equals( $operation, $response['operation'] ) || true !== $response['ok'] || ! is_string( $response['request_ref'] ) || ! hash_equals( $request_ref, strtolower( $response['request_ref'] ) ) ) {
+        // The response comes out of an option, so its size is not this Child's to trust. The widest
+        // schema here is well inside this bound, and checking it first keeps a stored value nobody
+        // could ever replay from being copied and key-sorted before it is rejected.
+        if ( ! is_array( $response ) || self::ABILITIES_V2_MAX_RESPONSE_KEYS < count( $response ) ) {
+            return false;
+        }
+        if ( ! isset( $response['protocol'], $response['operation'], $response['ok'], $response['request_ref'] ) || '2' !== $response['protocol'] || ! is_string( $response['operation'] ) || ! hash_equals( $operation, $response['operation'] ) || true !== $response['ok'] || ! is_string( $response['request_ref'] ) || ! hash_equals( $request_ref, strtolower( $response['request_ref'] ) ) ) {
             return false;
         }
         $result = $response;

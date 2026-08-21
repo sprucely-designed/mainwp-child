@@ -309,28 +309,34 @@ class Test_Post_Plus_Child_V2 extends WP_UnitTestCase {
 		$refuse = static function () {
 			return new \WP_Error( 'fixture_term_refused', 'Term creation refused.' );
 		};
-		add_action( 'mainwp_before_post_update', $close );
-		add_action( 'wp_insert_post', $capture );
-		add_filter( 'pre_insert_term', $refuse );
-		$result = $this->request( 'post_plus_newpost_v2', $payload );
-		remove_filter( 'pre_insert_term', $refuse );
-		remove_action( 'wp_insert_post', $capture );
-		remove_action( 'mainwp_before_post_update', $close );
+		$result  = null;
+		$durable = null;
+		$stamp   = null;
+		try {
+			add_action( 'mainwp_before_post_update', $close );
+			add_action( 'wp_insert_post', $capture );
+			add_filter( 'pre_insert_term', $refuse );
+			$result = $this->request( 'post_plus_newpost_v2', $payload );
+
+			clean_post_cache( $captured );
+			$durable = get_post( $captured );
+			$stamp   = get_post_meta( $captured, '_mainwp_child_content_operation_v2', true );
+			// The commit moved this row outside the transaction the suite rolls back, so it is only gone
+			// if this test removes it - and it has to go before the first assertion that can fail.
+			if ( $durable instanceof \WP_Post ) {
+				wp_delete_post( $captured, true );
+			}
+		} finally {
+			remove_filter( 'pre_insert_term', $refuse );
+			remove_action( 'wp_insert_post', $capture );
+			remove_action( 'mainwp_before_post_update', $close );
+			// The delete above has to be durable too, so autocommit goes back only once it has run.
+			// Everything this test writes from here is inside the suite's transaction again, which is
+			// what stops one fixture from making the rest of the case durable for the next test.
+			$wpdb->query( 'SET autocommit = 0' );
+		}
 
 		$this->assertGreaterThan( 0, $captured );
-		clean_post_cache( $captured );
-		$durable = get_post( $captured );
-		$stamp   = get_post_meta( $captured, '_mainwp_child_content_operation_v2', true );
-		// The commit moved this row outside the transaction the suite rolls back, so it is only gone
-		// if this test removes it - and it has to go before the first assertion that can fail.
-		if ( $durable instanceof \WP_Post ) {
-			wp_delete_post( $captured, true );
-		}
-		// The delete above has to be durable too, so autocommit goes back only once it has run.
-		// Everything this test writes from here is inside the suite's transaction again, which is
-		// what stops one fixture from making the rest of the case durable for the next test.
-		$wpdb->query( 'SET autocommit = 0' );
-
 		$this->assertInstanceOf( \WP_Post::class, $durable, 'The fixture must leave a durable post or it is not exercising this hazard.' );
 		$this->assertSame( $payload['operation_ref'], $stamp );
 		$this->assertSame( 'outcome_unknown', $result['code'], 'mutation_failed asserts the site is untouched, and this post survived.' );
@@ -364,25 +370,31 @@ class Test_Post_Plus_Child_V2 extends WP_UnitTestCase {
 		$refuse = static function () {
 			return new \WP_Error( 'fixture_term_refused', 'Term creation refused.' );
 		};
-		add_action( 'mainwp_before_post_update', $close );
-		add_action( 'wp_insert_post', $capture );
-		add_filter( 'update_post_metadata', $unstamp, 10, 3 );
-		add_filter( 'pre_insert_term', $refuse );
-		$result = $this->request( 'post_plus_newpost_v2', $payload );
-		remove_filter( 'pre_insert_term', $refuse );
-		remove_filter( 'update_post_metadata', $unstamp, 10 );
-		remove_action( 'wp_insert_post', $capture );
-		remove_action( 'mainwp_before_post_update', $close );
+		$result  = null;
+		$durable = null;
+		$stamp   = null;
+		try {
+			add_action( 'mainwp_before_post_update', $close );
+			add_action( 'wp_insert_post', $capture );
+			add_filter( 'update_post_metadata', $unstamp, 10, 3 );
+			add_filter( 'pre_insert_term', $refuse );
+			$result = $this->request( 'post_plus_newpost_v2', $payload );
+
+			clean_post_cache( $captured );
+			$durable = get_post( $captured );
+			$stamp   = get_post_meta( $captured, '_mainwp_child_content_operation_v2', true );
+			if ( $durable instanceof \WP_Post ) {
+				wp_delete_post( $captured, true );
+			}
+		} finally {
+			remove_filter( 'pre_insert_term', $refuse );
+			remove_filter( 'update_post_metadata', $unstamp, 10 );
+			remove_action( 'wp_insert_post', $capture );
+			remove_action( 'mainwp_before_post_update', $close );
+			$wpdb->query( 'SET autocommit = 0' );
+		}
 
 		$this->assertGreaterThan( 0, $captured );
-		clean_post_cache( $captured );
-		$durable = get_post( $captured );
-		$stamp   = get_post_meta( $captured, '_mainwp_child_content_operation_v2', true );
-		if ( $durable instanceof \WP_Post ) {
-			wp_delete_post( $captured, true );
-		}
-		$wpdb->query( 'SET autocommit = 0' );
-
 		$this->assertInstanceOf( \WP_Post::class, $durable, 'The fixture must leave a durable post or it is not exercising this hazard.' );
 		$this->assertSame( '', $stamp, 'The fixture must leave that post unstamped or it proves nothing about the stamp.' );
 		$this->assertSame( 'outcome_unknown', $result['code'], 'mutation_failed asserts the site is untouched, and this post survived.' );
@@ -420,21 +432,27 @@ class Test_Post_Plus_Child_V2 extends WP_UnitTestCase {
 		$refuse = static function () {
 			return new \WP_Error( 'fixture_term_refused', 'Term creation refused.' );
 		};
-		add_action( 'mainwp_before_post_update', $close );
-		add_filter( 'update_post_metadata', $unstamp, 10, 3 );
-		add_filter( 'pre_insert_term', $refuse );
-		$result = $this->request( 'post_plus_newpost_v2', $update );
-		remove_filter( 'pre_insert_term', $refuse );
-		remove_filter( 'update_post_metadata', $unstamp, 10 );
-		remove_action( 'mainwp_before_post_update', $close );
+		$result  = null;
+		$durable = null;
+		$stamp   = null;
+		try {
+			add_action( 'mainwp_before_post_update', $close );
+			add_filter( 'update_post_metadata', $unstamp, 10, 3 );
+			add_filter( 'pre_insert_term', $refuse );
+			$result = $this->request( 'post_plus_newpost_v2', $update );
 
-		clean_post_cache( $target );
-		$durable = get_post( $target );
-		$stamp   = get_post_meta( $target, '_mainwp_child_content_operation_v2', true );
-		if ( $durable instanceof \WP_Post ) {
-			wp_delete_post( $target, true );
+			clean_post_cache( $target );
+			$durable = get_post( $target );
+			$stamp   = get_post_meta( $target, '_mainwp_child_content_operation_v2', true );
+			if ( $durable instanceof \WP_Post ) {
+				wp_delete_post( $target, true );
+			}
+		} finally {
+			remove_filter( 'pre_insert_term', $refuse );
+			remove_filter( 'update_post_metadata', $unstamp, 10 );
+			remove_action( 'mainwp_before_post_update', $close );
+			$wpdb->query( 'SET autocommit = 0' );
 		}
-		$wpdb->query( 'SET autocommit = 0' );
 
 		$this->assertInstanceOf( \WP_Post::class, $durable );
 		$this->assertSame( 'After durable update', $durable->post_title, 'The fixture must leave the changed title durable or it is not exercising this hazard.' );
@@ -480,20 +498,25 @@ class Test_Post_Plus_Child_V2 extends WP_UnitTestCase {
 		$refuse = static function () {
 			return new \WP_Error( 'fixture_term_refused', 'Term creation refused.' );
 		};
-		add_action( 'mainwp_before_post_update', $close );
-		add_filter( 'wp_insert_post_data', $rewrite );
-		add_filter( 'pre_insert_term', $refuse );
-		$result = $this->request( 'post_plus_newpost_v2', $update );
-		remove_filter( 'pre_insert_term', $refuse );
-		remove_filter( 'wp_insert_post_data', $rewrite );
-		remove_action( 'mainwp_before_post_update', $close );
+		$result  = null;
+		$durable = null;
+		try {
+			add_action( 'mainwp_before_post_update', $close );
+			add_filter( 'wp_insert_post_data', $rewrite );
+			add_filter( 'pre_insert_term', $refuse );
+			$result = $this->request( 'post_plus_newpost_v2', $update );
 
-		clean_post_cache( $target );
-		$durable = get_post( $target );
-		if ( $durable instanceof \WP_Post ) {
-			wp_delete_post( $target, true );
+			clean_post_cache( $target );
+			$durable = get_post( $target );
+			if ( $durable instanceof \WP_Post ) {
+				wp_delete_post( $target, true );
+			}
+		} finally {
+			remove_filter( 'pre_insert_term', $refuse );
+			remove_filter( 'wp_insert_post_data', $rewrite );
+			remove_action( 'mainwp_before_post_update', $close );
+			$wpdb->query( 'SET autocommit = 0' );
 		}
-		$wpdb->query( 'SET autocommit = 0' );
 
 		$this->assertInstanceOf( \WP_Post::class, $durable );
 		$this->assertSame( 'Rewritten by a site filter', $durable->post_title, 'The fixture must leave the rewritten title durable or it is not exercising this hazard.' );
@@ -539,23 +562,31 @@ class Test_Post_Plus_Child_V2 extends WP_UnitTestCase {
 		$refuse = static function () {
 			return new \WP_Error( 'fixture_term_refused', 'Term creation refused.' );
 		};
-		add_action( 'mainwp_before_post_update', $close );
-		add_filter( 'wp_insert_post_data', $pin, 10, 2 );
-		add_filter( 'pre_insert_term', $refuse );
-		$result = $this->request( 'post_plus_newpost_v2', $update );
-		remove_filter( 'pre_insert_term', $refuse );
-		remove_filter( 'wp_insert_post_data', $pin, 10 );
-		remove_action( 'mainwp_before_post_update', $close );
+		$result     = null;
+		$durable    = null;
+		$stamp      = null;
+		$categories = array();
+		$tags       = array();
+		try {
+			add_action( 'mainwp_before_post_update', $close );
+			add_filter( 'wp_insert_post_data', $pin, 10, 2 );
+			add_filter( 'pre_insert_term', $refuse );
+			$result = $this->request( 'post_plus_newpost_v2', $update );
 
-		clean_post_cache( $target );
-		$durable    = get_post( $target );
-		$stamp      = get_post_meta( $target, '_mainwp_child_content_operation_v2', true );
-		$categories = array_map( 'intval', wp_get_object_terms( $target, 'category', array( 'fields' => 'ids' ) ) );
-		$tags       = array_map( 'intval', wp_get_object_terms( $target, 'post_tag', array( 'fields' => 'ids' ) ) );
-		if ( $durable instanceof \WP_Post ) {
-			wp_delete_post( $target, true );
+			clean_post_cache( $target );
+			$durable    = get_post( $target );
+			$stamp      = get_post_meta( $target, '_mainwp_child_content_operation_v2', true );
+			$categories = array_map( 'intval', wp_get_object_terms( $target, 'category', array( 'fields' => 'ids' ) ) );
+			$tags       = array_map( 'intval', wp_get_object_terms( $target, 'post_tag', array( 'fields' => 'ids' ) ) );
+			if ( $durable instanceof \WP_Post ) {
+				wp_delete_post( $target, true );
+			}
+		} finally {
+			remove_filter( 'pre_insert_term', $refuse );
+			remove_filter( 'wp_insert_post_data', $pin, 10 );
+			remove_action( 'mainwp_before_post_update', $close );
+			$wpdb->query( 'SET autocommit = 0' );
 		}
-		$wpdb->query( 'SET autocommit = 0' );
 
 		$this->assertInstanceOf( \WP_Post::class, $durable, 'The fixture must leave a durable post or it is not exercising this hazard.' );
 		$this->assertSame( $this->post_columns( $before ), $this->post_columns( $durable ), 'The fixture must leave every post column equal or the column comparison was never fooled.' );
@@ -611,24 +642,31 @@ class Test_Post_Plus_Child_V2 extends WP_UnitTestCase {
 		$refuse = static function () {
 			return new \WP_Error( 'fixture_term_refused', 'Term creation refused.' );
 		};
-		add_action( 'mainwp_before_post_update', $close );
-		add_filter( 'wp_insert_post_data', $pin, 10, 2 );
-		add_filter( 'update_post_metadata', $unstamp, 10, 3 );
-		add_filter( 'pre_insert_term', $refuse );
-		$result = $this->request( 'post_plus_newpost_v2', $update );
-		remove_filter( 'pre_insert_term', $refuse );
-		remove_filter( 'update_post_metadata', $unstamp, 10 );
-		remove_filter( 'wp_insert_post_data', $pin, 10 );
-		remove_action( 'mainwp_before_post_update', $close );
+		$result     = null;
+		$durable    = null;
+		$stamp      = null;
+		$categories = array();
+		try {
+			add_action( 'mainwp_before_post_update', $close );
+			add_filter( 'wp_insert_post_data', $pin, 10, 2 );
+			add_filter( 'update_post_metadata', $unstamp, 10, 3 );
+			add_filter( 'pre_insert_term', $refuse );
+			$result = $this->request( 'post_plus_newpost_v2', $update );
 
-		clean_post_cache( $target );
-		$durable    = get_post( $target );
-		$stamp      = get_post_meta( $target, '_mainwp_child_content_operation_v2', true );
-		$categories = array_map( 'intval', wp_get_object_terms( $target, 'category', array( 'fields' => 'ids' ) ) );
-		if ( $durable instanceof \WP_Post ) {
-			wp_delete_post( $target, true );
+			clean_post_cache( $target );
+			$durable    = get_post( $target );
+			$stamp      = get_post_meta( $target, '_mainwp_child_content_operation_v2', true );
+			$categories = array_map( 'intval', wp_get_object_terms( $target, 'category', array( 'fields' => 'ids' ) ) );
+			if ( $durable instanceof \WP_Post ) {
+				wp_delete_post( $target, true );
+			}
+		} finally {
+			remove_filter( 'pre_insert_term', $refuse );
+			remove_filter( 'update_post_metadata', $unstamp, 10 );
+			remove_filter( 'wp_insert_post_data', $pin, 10 );
+			remove_action( 'mainwp_before_post_update', $close );
+			$wpdb->query( 'SET autocommit = 0' );
 		}
-		$wpdb->query( 'SET autocommit = 0' );
 
 		$this->assertInstanceOf( \WP_Post::class, $durable, 'The fixture must leave a durable post or it is not exercising this hazard.' );
 		$this->assertSame( $this->post_columns( $before ), $this->post_columns( $durable ), 'The fixture must leave every post column equal or the column comparison was never fooled.' );
@@ -687,26 +725,35 @@ class Test_Post_Plus_Child_V2 extends WP_UnitTestCase {
 		$refuse  = static function () {
 			return new \WP_Error( 'fixture_term_refused', 'Term creation refused.' );
 		};
-		add_action( 'mainwp_before_post_update', $close );
-		add_filter( 'wp_insert_post_data', $restore, 10, 2 );
-		add_filter( 'update_post_metadata', $unstamp, 10, 3 );
-		add_filter( 'pre_insert_term', $refuse );
-		$result = $this->request( 'post_plus_newpost_v2', $update );
-		remove_filter( 'pre_insert_term', $refuse );
-		remove_filter( 'update_post_metadata', $unstamp, 10 );
-		remove_filter( 'wp_insert_post_data', $restore, 10 );
-		remove_action( 'mainwp_before_post_update', $close );
+		$result     = null;
+		$durable    = null;
+		$stamp      = null;
+		$digest     = null;
+		$categories = array();
+		$tags       = array();
+		try {
+			add_action( 'mainwp_before_post_update', $close );
+			add_filter( 'wp_insert_post_data', $restore, 10, 2 );
+			add_filter( 'update_post_metadata', $unstamp, 10, 3 );
+			add_filter( 'pre_insert_term', $refuse );
+			$result = $this->request( 'post_plus_newpost_v2', $update );
 
-		clean_post_cache( $target );
-		$durable    = get_post( $target );
-		$stamp      = get_post_meta( $target, '_mainwp_child_content_operation_v2', true );
-		$digest     = get_post_meta( $target, '_mainwp_child_content_digest_v2', true );
-		$categories = array_map( 'intval', wp_get_object_terms( $target, 'category', array( 'fields' => 'ids' ) ) );
-		$tags       = array_map( 'intval', wp_get_object_terms( $target, 'post_tag', array( 'fields' => 'ids' ) ) );
-		if ( $durable instanceof \WP_Post ) {
-			wp_delete_post( $target, true );
+			clean_post_cache( $target );
+			$durable    = get_post( $target );
+			$stamp      = get_post_meta( $target, '_mainwp_child_content_operation_v2', true );
+			$digest     = get_post_meta( $target, '_mainwp_child_content_digest_v2', true );
+			$categories = array_map( 'intval', wp_get_object_terms( $target, 'category', array( 'fields' => 'ids' ) ) );
+			$tags       = array_map( 'intval', wp_get_object_terms( $target, 'post_tag', array( 'fields' => 'ids' ) ) );
+			if ( $durable instanceof \WP_Post ) {
+				wp_delete_post( $target, true );
+			}
+		} finally {
+			remove_filter( 'pre_insert_term', $refuse );
+			remove_filter( 'update_post_metadata', $unstamp, 10 );
+			remove_filter( 'wp_insert_post_data', $restore, 10 );
+			remove_action( 'mainwp_before_post_update', $close );
+			$wpdb->query( 'SET autocommit = 0' );
 		}
-		$wpdb->query( 'SET autocommit = 0' );
 
 		$this->assertInstanceOf( \WP_Post::class, $durable, 'The fixture must leave a durable post or it is not exercising this hazard.' );
 		$this->assertSame( $this->post_columns( $before ), $this->post_columns( $durable ), 'The fixture must leave every post column equal or the column comparison, not the digest, is what caught this.' );

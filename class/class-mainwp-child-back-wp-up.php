@@ -1474,7 +1474,6 @@ class MainWP_Child_Back_WP_Up { //phpcs:ignore -- NOSONAR - multi methods.
      * @uses \BackWPup_Page_Jobs::ajax_working()
      *
      * @return string Buffered response from BackWPup.
-     * @throws \Throwable Throws any exception that occurs during the execution of the BackWPup ajax_working() method.
      */
     private function ajax_working_legacy( $logfile, $logpos ) {
         $_GET['logfile'] = $logfile;
@@ -1497,13 +1496,21 @@ class MainWP_Child_Back_WP_Up { //phpcs:ignore -- NOSONAR - multi methods.
         add_filter( 'wp_die_ajax_handler', array( __CLASS__, 'mainwp_backwpup_wp_die_ajax_handler' ) );
         remove_filter( 'wp_die_ajax_handler', '_ajax_wp_die_handler' );
 
+        $buffer_level = ob_get_level();
         ob_start();
         try {
             \BackWPup_Page_Jobs::ajax_working();
             return ob_get_clean();
         } catch ( \Throwable $e ) {
-            ob_end_clean();
-            throw $e;
+            while ( ob_get_level() > $buffer_level ) {
+                ob_end_clean();
+            }
+
+            return wp_json_encode(
+                array(
+                    'error' => $e->getMessage(),
+                )
+            );
         }
     }
 
@@ -1627,7 +1634,7 @@ class MainWP_Child_Back_WP_Up { //phpcs:ignore -- NOSONAR - multi methods.
             'done'            => 0,
             'warnings'        => isset( $job_object->warnings ) ? $job_object->warnings : 0,
             'errors'          => isset( $job_object->errors ) ? $job_object->errors : 0,
-            'runtime'         => current_time( 'timestamp' ) - $job_object->start_time, // phpcs:ignore WordPress.DateTime.CurrentTimeTimestamp.Requested
+            'runtime'         => isset( $job_object->start_time ) ? current_time( 'timestamp' ) - $job_object->start_time : 0, // phpcs:ignore WordPress.DateTime.CurrentTimeTimestamp.Requested
             'step_percent'    => isset( $job_object->step_percent ) ? $job_object->step_percent : 0,
             'substep_percent' => isset( $job_object->substep_percent ) ? $job_object->substep_percent : 0,
             'step_done'       => isset( $job_object->steps_done ) ? count( $job_object->steps_done ) : 0,
@@ -1676,11 +1683,21 @@ class MainWP_Child_Back_WP_Up { //phpcs:ignore -- NOSONAR - multi methods.
         // BackWPup_Page_Jobs::load() reads jobid via filter_input(INPUT_GET),
         // which cannot see values assigned to $_GET after request startup.
         // Start the job through the BackWPup API instead.
-        $old_log_file = \BackWPup_Option::get( $job_id, 'logfile' );
+        $old_log_file = \BackWPup_Option::get( $job_id, 'logfile', null, false );
         $run_response = \BackWPup_Job::get_jobrun_url( 'runnow', $job_id );
 
         if ( is_wp_error( $run_response ) ) {
             return array( 'error' => $run_response->get_error_message() );
+        }
+
+        $response_code = (int) wp_remote_retrieve_response_code( $run_response );
+        if ( $response_code < 200 || $response_code >= 300 ) {
+            $response_message = wp_remote_retrieve_response_message( $run_response );
+            if ( '' === $response_message ) {
+                $response_message = sprintf( 'HTTP %d', $response_code );
+            }
+
+            return array( 'error' => $response_message );
         }
 
         $new_log_file = \BackWPup_Option::get( $job_id, 'logfile', null, false );

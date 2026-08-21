@@ -1688,20 +1688,12 @@ class MainWP_Child_Back_WP_Up { //phpcs:ignore -- NOSONAR - multi methods.
         // which cannot see values assigned to $_GET after request startup.
         // Start the job through the BackWPup API instead.
         $old_log_file = \BackWPup_Option::get( $job_id, 'logfile', null, false );
-        $run_response = \BackWPup_Job::get_jobrun_url( 'runnow', $job_id );
 
+        // Start the job now.
+        $run_response = \BackWPup_Job::get_jobrun_url( 'runnow', $job_id );
+        // Check for auth header or object form wp_remote_get() or wp_remote_post() error.
         if ( is_wp_error( $run_response ) ) {
             return array( 'error' => $run_response->get_error_message() );
-        }
-
-        $response_code = (int) wp_remote_retrieve_response_code( $run_response );
-        if ( $response_code < 200 || $response_code >= 300 ) {
-            $response_message = wp_remote_retrieve_response_message( $run_response );
-            if ( '' === $response_message ) {
-                $response_message = sprintf( 'HTTP %d', $response_code );
-            }
-
-            return array( 'error' => $response_message );
         }
 
         $new_log_file = \BackWPup_Option::get( $job_id, 'logfile', null, false );

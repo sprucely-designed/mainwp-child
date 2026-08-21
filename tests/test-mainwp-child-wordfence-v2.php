@@ -367,6 +367,46 @@ class Test_MainWP_Child_Wordfence_V2 extends WP_UnitTestCase {
 		$this->assertArrayNotHasKey( $tombstoned, get_option( 'mainwp_wordfence_abilities_v2_receipts', array() ) );
 	}
 
+	/**
+	 * A settled entry no replay could ever be answered from is not evidence, and must not pin the store.
+	 *
+	 * Shape alone says a settled entry with an empty response is readable, but the replay path
+	 * rejects it for its own reference, so it can answer nothing. Left standing with a stamp no
+	 * clock reaches, a full store of them refuses every mutation from then on.
+	 */
+	public function test_a_full_store_of_shape_valid_unreplayable_receipts_is_rebuilt_and_self_clears() {
+		$fixture  = $this->blocks_fixture();
+		$receipts = array();
+		for ( $index = 0; $index < 100; $index++ ) {
+			$receipts[ sprintf( '123e4567-e89b-42d3-a456-4266141753%02d', $index ) ] = array(
+				'effect_hash' => str_repeat( 'a', 64 ),
+				'state'       => 'settled',
+				'response'    => array(),
+				'created_at'  => PHP_INT_MAX,
+			);
+		}
+		update_option( 'mainwp_wordfence_abilities_v2_receipts', $receipts, false );
+
+		$refused = $fixture->abilities_v2( $this->blocks_request( '123e4567-e89b-42d3-a456-426614174620' ) );
+		$stored  = get_option( 'mainwp_wordfence_abilities_v2_receipts', array() );
+
+		$this->assertFalse( $refused['ok'] );
+		$this->assertSame( 'storage_unavailable', $refused['code'] );
+		$this->assertSame( array(), $fixture->calls );
+		foreach ( $stored as $reference => $entry ) {
+			$this->assertSame( 'unreadable', $entry['state'], $reference );
+			$this->assertLessThanOrEqual( time(), $entry['created_at'], $reference );
+		}
+
+		// Having been given a date, the store now clears itself as those entries age out.
+		foreach ( $stored as $reference => $entry ) {
+			$stored[ $reference ]['created_at'] = time() - ( DAY_IN_SECONDS + 3600 );
+		}
+		update_option( 'mainwp_wordfence_abilities_v2_receipts', $stored, false );
+
+		$this->assertTrue( $fixture->abilities_v2( $this->blocks_request( '123e4567-e89b-42d3-a456-426614174621' ) )['ok'] );
+	}
+
 	/** A stamp the tombstone builder rejects must not be taken as a sound tombstone. */
 	public function test_a_tombstone_with_an_impossible_stamp_is_rebuilt_rather_than_evicted() {
 		$fixture                 = $this->blocks_fixture();

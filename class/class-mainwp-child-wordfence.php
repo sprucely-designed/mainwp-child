@@ -1036,7 +1036,7 @@ class MainWP_Child_Wordfence { //phpcs:ignore -- NOSONAR - multi methods.
         $repaired  = false;
         $evictable = array();
         foreach ( $receipts as $reference => $receipt ) {
-            if ( ! $this->abilities_v2_receipt_shape( $receipt ) ) {
+            if ( ! $this->abilities_v2_receipt_readable( $reference, $receipt ) ) {
                 // An entry nobody can read is still evidence that something wrote a receipt for
                 // that reference, so its scan or repair may already have run. Giving it up to make
                 // room for an unrelated request is how a reference loses its only evidence and
@@ -1103,11 +1103,33 @@ class MainWP_Child_Wordfence { //phpcs:ignore -- NOSONAR - multi methods.
     }
 
     /**
-     * Validate the shape of one stored entry without judging it against a request.
+     * Whether a stored entry could still answer a replay of the reference it is filed under.
      *
-     * Eviction walks entries belonging to other references and operations, so it can only ask
-     * whether an entry is readable at all - whether its stored response answers the request that
-     * wrote it is a question only that request can ask.
+     * Shape alone is too weak for eviction to decide this. A settled entry carrying a response
+     * that names no operation, or names some other reference, can never answer any replay of this
+     * reference, so it is not evidence of anything and holding it only takes a slot. Left in, an
+     * entry like that combined with a stamp no clock reaches refuses every mutation from then on.
+     * Which operation the current request is asking for does not come into it: the stored response
+     * names its own operation, and that is what it would have to be replayed as.
+     *
+     * @param string $reference Reference the entry is filed under.
+     * @param mixed  $receipt   Stored entry.
+     * @return bool
+     */
+    private function abilities_v2_receipt_readable( $reference, $receipt ) {
+        if ( ! $this->abilities_v2_receipt_shape( $receipt ) ) {
+            return false;
+        }
+        if ( 'dispatching' === $receipt['state'] ) {
+            return true;
+        }
+        return isset( $receipt['response']['operation'] )
+            && is_string( $receipt['response']['operation'] )
+            && $this->abilities_v2_valid_receipt_response( $receipt['response']['operation'], $reference, $receipt['response'] );
+    }
+
+    /**
+     * Validate the shape of one stored entry without judging it against a request.
      *
      * @param mixed $receipt Stored entry.
      * @return bool

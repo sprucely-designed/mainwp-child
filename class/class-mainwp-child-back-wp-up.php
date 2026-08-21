@@ -798,19 +798,23 @@ class MainWP_Child_Back_WP_Up { //phpcs:ignore -- NOSONAR - multi methods.
         echo '<tr title=""><td>' . esc_html__( 'WP-Cron url:', 'mainwp-child' ) . '</td><td>' . esc_html( site_url( 'wp-cron.php' ) ) . '</td></tr>';
 
         echo '<tr><td>' . esc_html__( 'Server self connect:', 'mainwp-child' ) . '</td><td>';
-        $raw_response = \BackWPup_Job::get_jobrun_url( 'test' );
-        $test_result  = '';
-        if ( is_wp_error( $raw_response ) ) {
-            // translators: %s: error message.
-            $test_result .= sprintf( esc_html__( 'The HTTP response test get an error "%s"', 'mainwp-child' ), esc_html( $raw_response->get_error_message() ) );
-        } elseif ( 200 !== (int) wp_remote_retrieve_response_code( $raw_response ) && 204 !== (int) wp_remote_retrieve_response_code( $raw_response ) ) {
-            // translators: %s: HTTP status code.
-            $test_result .= sprintf( esc_html__( 'The HTTP response test get a false http status (%s)', 'mainwp-child' ), esc_html( wp_remote_retrieve_response_code( $raw_response ) ) );
-        }
-        $headers = wp_remote_retrieve_headers( $raw_response );
-        if ( isset( $headers['x-backwpup-ver'] ) && \BackWPup::get_plugin_data( 'version' ) !== $headers['x-backwpup-ver'] ) {
-            // translators: %s: header value.
-            $test_result .= sprintf( esc_html__( 'The BackWPup HTTP response header returns a false value: "%s"', 'mainwp-child' ), esc_html( $headers['x-backwpup-ver'] ) );
+        $test_result = '';
+        if ( ! $this->use_legacy_backwpup_handler() ) {
+            $raw_response = \BackWPup_Job::get_jobrun_url( 'test' );
+            if ( is_wp_error( $raw_response ) ) {
+                // translators: %s: error message.
+                $test_result .= sprintf( esc_html__( 'The HTTP response test get an error "%s"', 'mainwp-child' ), esc_html( $raw_response->get_error_message() ) );
+            } elseif ( 200 !== (int) wp_remote_retrieve_response_code( $raw_response ) && 204 !== (int) wp_remote_retrieve_response_code( $raw_response ) ) {
+                // translators: %s: HTTP status code.
+                $test_result .= sprintf( esc_html__( 'The HTTP response test get a false http status (%s)', 'mainwp-child' ), esc_html( wp_remote_retrieve_response_code( $raw_response ) ) );
+            }
+            $headers = wp_remote_retrieve_headers( $raw_response );
+            if ( isset( $headers['x-backwpup-ver'] ) && \BackWPup::get_plugin_data( 'version' ) !== $headers['x-backwpup-ver'] ) {
+                // translators: %s: header value.
+                $test_result .= sprintf( esc_html__( 'The BackWPup HTTP response header returns a false value: "%s"', 'mainwp-child' ), esc_html( $headers['x-backwpup-ver'] ) );
+            }
+        } else {
+            $test_result = esc_html__( 'Unavailable in this BackWPup version.', 'mainwp-child' );
         }
 
         if ( empty( $test_result ) ) {

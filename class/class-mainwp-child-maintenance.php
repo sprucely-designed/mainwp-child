@@ -506,6 +506,18 @@ class MainWP_Child_Maintenance {
 
         $successful = array();
         foreach ( $actions as $action ) {
+            // The margin the sweep's deadline reserves settles this record and releases the lock,
+            // and it belongs to the request rather than to the action that stopped short of it. An
+            // action that already gave up on a spent budget otherwise hands the rest of the list
+            // that margin, and the fatal inside the next destructive action leaves this record
+            // running with the lock held: the failure the deadline exists to prevent, one level up.
+            // Ahead of the renewal, which is itself an option write. The first action is exempt
+            // because no margin has been reserved yet and a budget-aware action declines its own
+            // destructive work with a truthful count; refusing before anything ran would turn a
+            // request that arrives slow into an operation that never does work at all.
+            if ( ! empty( $record['outcomes'] ) && $this->abilities_v2_budget_spent() ) {
+                break;
+            }
             if ( ! $this->abilities_v2_renew_mutation() ) {
                 return $this->abilities_v2_error( $operation, 'outcome_unknown' );
             }
@@ -537,8 +549,8 @@ class MainWP_Child_Maintenance {
             $this->abilities_v2_emit_report( $successful, $payload['revision_retention'] );
             $record['report_emitted'] = true;
         }
-        $statuses                             = array_column( $record['outcomes'], 'status' );
-        $succeeded                            = count(
+        $statuses  = array_column( $record['outcomes'], 'status' );
+        $succeeded = count(
             array_filter(
                 $statuses,
                 static function ( $status ) {
@@ -546,7 +558,10 @@ class MainWP_Child_Maintenance {
                 }
             )
         );
-        $record['status']                     = in_array( 'unknown', $statuses, true ) ? 'unknown' : ( count( $statuses ) === $succeeded ? 'succeeded' : ( 0 < $succeeded ? 'partial' : 'failed' ) );
+        // A run that stopped between actions carries no outcome for what it never started, so the
+        // statuses it does have describe part of the list: deriving from them alone reports the
+        // whole operation as succeeded on the strength of the actions that ran before the stop.
+        $record['status']                     = count( $record['outcomes'] ) !== count( $actions ) || in_array( 'unknown', $statuses, true ) ? 'unknown' : ( count( $statuses ) === $succeeded ? 'succeeded' : ( 0 < $succeeded ? 'partial' : 'failed' ) );
         $record['finished_at']                = time();
         $record['updated_at']                 = $record['finished_at'];
         $record['retryable']                  = 'failed' === $record['status'];
@@ -920,7 +935,12 @@ class MainWP_Child_Maintenance {
                 }
             )
         );
-        if ( null === $record['finished_at'] || count( $record['actions'] ) !== count( $record['outcomes'] ) ) {
+        // Only an unknown record may hold fewer outcomes than actions: that is a run which stopped
+        // between actions and says so by carrying nothing for the ones it never started, and the
+        // loop above already pins every outcome it does hold to the action at its own index. Any
+        // other terminal status with a short list is claiming a whole-operation result from part of
+        // it. Readers pad the missing entries, so the projected response still covers every action.
+        if ( null === $record['finished_at'] || ( 'unknown' !== $record['status'] && count( $record['actions'] ) !== count( $record['outcomes'] ) ) ) {
             return false;
         }
         // A settled-stale record can hold successful outcomes whose report was never emitted: the
@@ -1013,6 +1033,18 @@ class MainWP_Child_Maintenance {
     }
 
     /**
+     * Whether the request has nothing left to spend on destructive work.
+     *
+     * @return bool
+     */
+    private function abilities_v2_budget_spent() {
+        // Asked instead of hoisting the deadline up to the operation: both levels stop on the same
+        // instant, the arithmetic above stays the only place that computes it, and the action
+        // dispatch keeps the signature its subclasses override.
+        return time() >= $this->abilities_v2_revision_sweep_deadline();
+    }
+
+    /**
      * Delete revisions with exact retention.
      *
      * @param int $revision_retention Revisions retained per parent.
@@ -1020,11 +1052,24 @@ class MainWP_Child_Maintenance {
      */
     private function abilities_v2_delete_revisions( $revision_retention ) {
         global $wpdb;
+        $deadline = $this->abilities_v2_revision_sweep_deadline();
+        // Decided ahead of the retention-zero path below, which is one DELETE over every revision on
+        // the site and the largest statement in this file. Nothing can interrupt a statement once it
+        // is issued, so declining to start it is the only bound there is: a request with nothing
+        // left of its limit would spend the settle margin inside it and die with the record running
+        // and the lock held. Reported as the paged path reports an exhausted budget, because it is
+        // the same stop: nothing was destroyed and what is left over retention is not known.
+        if ( time() >= $deadline ) {
+            return array(
+                'status'     => 'unknown',
+                'affected'   => 0,
+                'error_code' => 'outcome_unknown',
+            );
+        }
         if ( 0 === $revision_retention ) {
             return $this->abilities_v2_delete_rows( 'posts', "post_type = 'revision'" );
         }
         $affected = 0;
-        $deadline = $this->abilities_v2_revision_sweep_deadline();
         while ( true ) {
             // Renewal re-arms the lock TTL, so it never ends this loop on a site whose editors keep
             // creating revisions: every page still finds parents over retention and still deletes

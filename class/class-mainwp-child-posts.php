@@ -1009,8 +1009,14 @@ class MainWP_Child_Posts { //phpcs:ignore -- NOSONAR - multi methods.
         $old_status = $old_post instanceof \WP_Post ? $old_post->post_status : '';
         // Taken here because this is the last moment before the operation writes anything; the term
         // IDs content_v2_rollback() collects for its cache purge are read after the writes and cannot
-        // stand in for it.
-        $old_terms = $old_post instanceof \WP_Post ? $this->content_v2_term_snapshot( $old_post->ID ) : null;
+        // stand in for it. The digest is snapshotted for the same reason and not compared against the
+        // value this operation means to write: two Dashboards sending identical content produce the
+        // same digest, so an equality check would convict every honest repeat of an unchanged update.
+        $before = array(
+            'post'   => $old_post,
+            'terms'  => $old_post instanceof \WP_Post ? $this->content_v2_term_snapshot( $old_post->ID ) : null,
+            'digest' => $old_post instanceof \WP_Post ? get_post_meta( $old_post->ID, '_mainwp_child_content_digest_v2', true ) : null,
+        );
         if ( false === $wpdb->query( 'START TRANSACTION' ) ) { // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
             return $this->content_v2_error( $protocol, $operation, 'storage_unavailable' );
         }
@@ -1056,35 +1062,35 @@ class MainWP_Child_Posts { //phpcs:ignore -- NOSONAR - multi methods.
 
         $post_id = wp_insert_post( wp_slash( $postarr ), true );
         if ( is_wp_error( $post_id ) || ! is_int( $post_id ) || 1 > $post_id ) {
-            $rolled_back = $this->content_v2_rollback( null, $normalized, $old_post, $old_terms );
+            $rolled_back = $this->content_v2_rollback( null, $normalized, $before );
             return $this->content_v2_error( $protocol, $operation, $this->content_v2_failure_code( $rolled_back ) );
         }
         if ( ! empty( $normalized['post']['categories'] ) ) {
             $category_ids = $this->content_v2_category_ids( $normalized['post']['categories'] );
             $terms        = false === $category_ids ? false : wp_set_post_categories( $post_id, $category_ids, false );
             if ( false === $terms || is_wp_error( $terms ) ) {
-                $rolled_back = $this->content_v2_rollback( $post_id, $normalized, $old_post, $old_terms );
+                $rolled_back = $this->content_v2_rollback( $post_id, $normalized, $before );
                 return $this->content_v2_error( $protocol, $operation, $this->content_v2_failure_code( $rolled_back ) );
             }
         }
         if ( null !== $choices['category_id'] ) {
             $terms = wp_set_post_categories( $post_id, array( $choices['category_id'] ), true );
             if ( is_wp_error( $terms ) ) {
-                $rolled_back = $this->content_v2_rollback( $post_id, $normalized, $old_post, $old_terms );
+                $rolled_back = $this->content_v2_rollback( $post_id, $normalized, $before );
                 return $this->content_v2_error( $protocol, $operation, $this->content_v2_failure_code( $rolled_back ) );
             }
         }
         if ( ! empty( $normalized['post']['tags'] ) ) {
             $terms = wp_set_post_terms( $post_id, $normalized['post']['tags'], 'post_tag', false );
             if ( is_wp_error( $terms ) ) {
-                $rolled_back = $this->content_v2_rollback( $post_id, $normalized, $old_post, $old_terms );
+                $rolled_back = $this->content_v2_rollback( $post_id, $normalized, $before );
                 return $this->content_v2_error( $protocol, $operation, $this->content_v2_failure_code( $rolled_back ) );
             }
         }
 
         $revision = $this->content_v2_post_revision( $post_id );
         if ( false === $revision ) {
-            $this->content_v2_rollback( $post_id, $normalized, $old_post, $old_terms );
+            $this->content_v2_rollback( $post_id, $normalized, $before );
             return $this->content_v2_error( $protocol, $operation, 'outcome_unknown' );
         }
         $record['post_id']                   = $post_id;
@@ -1094,7 +1100,7 @@ class MainWP_Child_Posts { //phpcs:ignore -- NOSONAR - multi methods.
         $record['updated_at']                = time();
         $records[ $record['operation_ref'] ] = $record;
         if ( ! $this->content_v2_write_records( $protocol, $records ) || false === $wpdb->query( 'COMMIT' ) ) { // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
-            $this->content_v2_rollback( $post_id, $normalized, $old_post, $old_terms );
+            $this->content_v2_rollback( $post_id, $normalized, $before );
             wp_cache_delete( $this->content_v2_option( $protocol ), 'options' );
             return $this->content_v2_error( $protocol, $operation, 'outcome_unknown' );
         }
@@ -1134,13 +1140,13 @@ class MainWP_Child_Posts { //phpcs:ignore -- NOSONAR - multi methods.
      * the terms the mutation attached are collected before the ROLLBACK and forgotten after it.
      * Categories and tags are the whole taxonomy surface this writer touches.
      *
-     * @param int|null      $post_id    Post touched inside the transaction, when one exists.
-     * @param array         $normalized Valid normalized mutation.
-     * @param \WP_Post|null $old_post   Update target as it stood before the transaction opened.
-     * @param array|null    $old_terms  Update target's terms before the transaction opened, or null.
+     * @param int|null $post_id    Post touched inside the transaction, when one exists.
+     * @param array    $normalized Valid normalized mutation.
+     * @param array    $before     Update target as it stood before the transaction opened: 'post'
+     *                             (\WP_Post|null), 'terms' (array|null), 'digest' (string|null).
      * @return bool True when no trace of this operation survived, false when one did.
      */
-    private function content_v2_rollback( $post_id, $normalized, $old_post, $old_terms ) {
+    private function content_v2_rollback( $post_id, $normalized, $before ) {
         global $wpdb;
 
         $touched = array_values(
@@ -1189,7 +1195,7 @@ class MainWP_Child_Posts { //phpcs:ignore -- NOSONAR - multi methods.
                 // still there is the whole trace.
                 return false;
             }
-            if ( ! $old_post instanceof \WP_Post ) {
+            if ( ! $before['post'] instanceof \WP_Post ) {
                 // The witness is the pre-operation row, and without it there is nothing to compare
                 // against. Guessing in the site's favour is the guess that sends the Dashboard back
                 // to retry a write that may already be durable.
@@ -1203,6 +1209,17 @@ class MainWP_Child_Posts { //phpcs:ignore -- NOSONAR - multi methods.
                 // inside the transaction and nothing outside this operation writes that value - so it
                 // is the write itself outliving the ROLLBACK. An update target that was not restamped
                 // still carries some earlier operation's ref, which never equals this one.
+                return false;
+            }
+            // The stamp is not the only meta this operation writes, and meta_input writes each entry
+            // on its own: the digest can land durably in the same breath the stamp write is refused,
+            // which leaves the check above silent. It is compared against the snapshot rather than
+            // against what this operation meant to store because a digest is not unique to an
+            // operation the way a ref is - re-sending identical content produces the identical digest,
+            // so an equality check would report outcome_unknown for every clean repeat. A snapshot
+            // too broken to compare is a state that cannot be cleared, the same as a missing row.
+            $stored_digest = get_post_meta( $id, '_mainwp_child_content_digest_v2', true );
+            if ( ! is_string( $before['digest'] ) || $before['digest'] !== $stored_digest ) {
                 return false;
             }
             // The question is whether the row is what it was before this operation, never whether
@@ -1242,7 +1259,7 @@ class MainWP_Child_Posts { //phpcs:ignore -- NOSONAR - multi methods.
                 'guid',
             );
             foreach ( $columns as $field ) {
-                if ( (string) $old_post->$field !== (string) $post->$field ) {
+                if ( (string) $before['post']->$field !== (string) $post->$field ) {
                     return false;
                 }
             }
@@ -1253,7 +1270,7 @@ class MainWP_Child_Posts { //phpcs:ignore -- NOSONAR - multi methods.
             // a state that cannot be cleared, which is outcome_unknown for the same reason a missing
             // post snapshot is.
             $new_terms = $this->content_v2_term_snapshot( $id );
-            if ( null === $old_terms || null === $new_terms || $old_terms !== $new_terms ) {
+            if ( null === $before['terms'] || null === $new_terms || $before['terms'] !== $new_terms ) {
                 return false;
             }
         }

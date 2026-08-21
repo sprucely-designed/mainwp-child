@@ -984,6 +984,124 @@ class Test_MainWP_Child_Maintenance_V2 extends WP_UnitTestCase {
 		);
 	}
 
+	/**
+	 * The deadline bounds one sweep, but the margin it holds back settles the record and releases the
+	 * lock for the whole request. An operation that runs the rest of its action list after the sweep
+	 * gave up spends that margin on new destructive work, and the fatal that follows leaves the record
+	 * running with the lock held: exactly what the deadline exists to prevent, one level up.
+	 */
+	public function test_operation_stops_starting_actions_once_the_request_budget_is_spent() {
+		global $wpdb, $timestart;
+		$parent_id = self::factory()->post->create();
+		$this->insert_revisions( $parent_id, 10 );
+		self::factory()->post->create( array( 'post_status' => 'auto-draft' ) );
+		self::factory()->post->create( array( 'post_status' => 'auto-draft' ) );
+		$auto_drafts = "SELECT COUNT(*) FROM $wpdb->posts WHERE post_status = 'auto-draft'";
+		$before      = (int) $wpdb->get_var( $auto_drafts );
+		$this->assertGreaterThan( 0, $before );
+
+		// Three seconds of sweep budget once the settle margin comes off: enough for the first batch
+		// of revisions to run, and gone by the time the operation decides whether to start autodraft.
+		$original_limit     = ini_get( 'max_execution_time' );
+		$original_timestart = $timestart;
+		ini_set( 'max_execution_time', MainWP_Child_Maintenance::ABILITIES_V2_REVISION_SWEEP_MARGIN + 3 );
+		$timestart = microtime( true );
+		$stall     = static function ( $query ) {
+			static $stalled = false;
+			if ( ! $stalled && 1 === preg_match( '/^\s*DELETE\s+FROM\s+\S*posts\b/i', $query ) ) {
+				$stalled = true;
+				$until   = time() + 4;
+				while ( time() < $until ) {
+					usleep( 50000 );
+				}
+			}
+			return $query;
+		};
+
+		add_filter( 'query', $stall );
+		try {
+			list( , $result ) = $this->real_execute( $this->real_subject(), array( 'revisions', 'autodraft' ), 2, '123e4567-e89b-42d3-a456-426614174525' );
+		} finally {
+			remove_filter( 'query', $stall );
+			ini_set( 'max_execution_time', $original_limit );
+			$timestart = $original_timestart;
+		}
+
+		$this->assertSame(
+			$before,
+			(int) $wpdb->get_var( $auto_drafts ),
+			'The action after the one that ran out of time must not have started: its rows are the evidence.'
+		);
+		$this->assertSame(
+			'2',
+			$wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM $wpdb->posts WHERE post_type = 'revision' AND post_parent = %d", $parent_id ) ),
+			'The sweep itself still ran its first batch before the budget went.'
+		);
+		$stored = get_option( MainWP_Child_Maintenance::ABILITIES_V2_OPERATIONS_OPTION, array() );
+		$this->assertSame(
+			array( 'revisions' ),
+			array_column( $stored['123e4567-e89b-42d3-a456-426614174525']['outcomes'], 'action' ),
+			'The record holds an outcome for what ran and none for what was never started.'
+		);
+		$this->assertSame( 8, $stored['123e4567-e89b-42d3-a456-426614174525']['outcomes'][0]['affected'] );
+		$this->assertSame( 'unknown', $stored['123e4567-e89b-42d3-a456-426614174525']['status'] );
+		$this->assertNotNull( $stored['123e4567-e89b-42d3-a456-426614174525']['finished_at'], 'A run that stops still settles its record instead of leaving it running.' );
+		$this->assertNull( get_option( MainWP_Child_Maintenance::ABILITIES_V2_LOCK_OPTION, null ), 'The margin the stop preserved is what releases the lock.' );
+		// The wire shape is unchanged: readers pad an unknown record out to its full action list, so
+		// the Dashboard still gets one outcome per action it asked for.
+		$this->assertTrue( $result['ok'] );
+		$this->assertSame( 'unknown', $result['status'] );
+		$this->assertSame( array( 'revisions', 'autodraft' ), array_column( $result['outcomes'], 'action' ) );
+		$this->assertSame(
+			array(
+				'action'     => 'autodraft',
+				'status'     => 'unknown',
+				'affected'   => null,
+				'error_code' => 'outcome_unknown',
+			),
+			$result['outcomes'][1]
+		);
+	}
+
+	/**
+	 * Retention zero deletes every revision on the site in one statement, and nothing can interrupt a
+	 * statement once it is issued, so a request with no budget left has to decline to start it. The
+	 * operation-level stop above never reaches this: it lets the first action run, which is what makes
+	 * the guard belong here rather than only in the caller.
+	 */
+	public function test_zero_retention_revision_delete_is_declined_when_the_budget_is_already_spent() {
+		global $wpdb, $timestart;
+		$parent_id = self::factory()->post->create();
+		$this->insert_revisions( $parent_id, 5 );
+		$revisions = $wpdb->prepare( "SELECT COUNT(*) FROM $wpdb->posts WHERE post_type = 'revision' AND post_parent = %d", $parent_id );
+
+		$original_limit     = ini_get( 'max_execution_time' );
+		$original_timestart = $timestart;
+		ini_set( 'max_execution_time', 30 );
+		// Past the limit minus the settle margin, so what is left of the request is negative.
+		$timestart = microtime( true ) - 25;
+		$sweep     = new \ReflectionMethod( MainWP_Child_Maintenance::class, 'abilities_v2_delete_revisions' );
+		$sweep->setAccessible( true );
+
+		try {
+			$outcome = $sweep->invoke( $this->real_subject(), 0 );
+		} finally {
+			ini_set( 'max_execution_time', $original_limit );
+			$timestart = $original_timestart;
+		}
+
+		$this->assertSame(
+			array(
+				'status'     => 'unknown',
+				'affected'   => 0,
+				'error_code' => 'outcome_unknown',
+			),
+			$outcome,
+			'An exhausted budget reports the same unknown the paged path reports, with nothing destroyed.'
+		);
+		$this->assertSame( '5', $wpdb->get_var( $revisions ), 'The single bulk delete must not be issued on a budget that is already gone.' );
+	}
+
 	/** Fill one parent with revisions cheaply; the sweep only ever reads them through SQL. */
 	private function insert_revisions( $parent_id, $count ) {
 		global $wpdb;

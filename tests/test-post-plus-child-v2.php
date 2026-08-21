@@ -637,6 +637,86 @@ class Test_Post_Plus_Child_V2 extends WP_UnitTestCase {
 		$this->assertSame( 'outcome_unknown', $result['code'], 'mutation_failed asserts the site is untouched, and this term write survived.' );
 	}
 
+	/**
+	 * The operation writes two meta values in one meta_input, and wp_insert_post() ignores what each
+	 * update_post_meta() returns, so the digest can land durably while the stamp write is refused.
+	 * With the columns restored and the terms untouched, that durable digest is the only trace left
+	 * and it has to be the thing that answers.
+	 */
+	public function test_a_durable_update_that_changed_no_column_is_caught_by_its_digest() {
+		global $wpdb;
+
+		$create = $this->unchanged_update_payload( '123e4567-e89b-42d3-a456-426614174649', 'Unchanged durable digest' );
+		$first  = $this->request( 'post_plus_newpost_v2', $create );
+		$this->assertTrue( $first['ok'] );
+		$posts = $this->operation_posts( $create['operation_ref'] );
+		$this->assertCount( 1, $posts );
+		$target = (int) $posts[0]->ID;
+		$before = get_post( $target );
+
+		// Content the row does not hold is what makes the digest differ; the filter below puts the
+		// stored column back so the digest is the only signal left standing. The taxonomies repeat
+		// what the create left, and only the second tag is new, so wp_set_object_terms() gives up on
+		// it before it can move anything.
+		$default                      = get_term( (int) get_option( 'default_category' ), 'category' );
+		$fixture_tag                  = get_term_by( 'slug', 'fixture', 'post_tag' );
+		$update                       = $this->unchanged_update_payload( '123e4567-e89b-42d3-a456-426614174650', 'Unchanged durable digest' );
+		$update['mode']               = 'update';
+		$update['target_post_id']     = $target;
+		$update['expected_revision']  = $first['post_revision'];
+		$update['post']['content']    = 'Content that only the digest will remember.';
+		$update['post']['categories'] = array( $default->slug );
+		$update['post']['tags']       = array( 'fixture', 'unchanged-digest-refused-tag' );
+		$update['content_digest']     = hash( 'sha256', wp_json_encode( array( $update['post'], $update['randomization'] ) ) );
+		$this->assertNotSame( $create['content_digest'], $update['content_digest'] );
+
+		$close   = static function () use ( $wpdb ) {
+			$wpdb->query( 'SET autocommit = 1' );
+		};
+		$pin     = $this->same_second_pin( $target, $before );
+		$restore = static function ( $data, $postarr ) use ( $target, $before, $pin ) {
+			$data = $pin( $data, $postarr );
+			if ( isset( $postarr['ID'] ) && $target === (int) $postarr['ID'] ) {
+				$data['post_content'] = $before->post_content;
+			}
+			return $data;
+		};
+		$unstamp = static function ( $check, $object_id, $meta_key ) {
+			return '_mainwp_child_content_operation_v2' === $meta_key ? false : $check;
+		};
+		$refuse  = static function () {
+			return new \WP_Error( 'fixture_term_refused', 'Term creation refused.' );
+		};
+		add_action( 'mainwp_before_post_update', $close );
+		add_filter( 'wp_insert_post_data', $restore, 10, 2 );
+		add_filter( 'update_post_metadata', $unstamp, 10, 3 );
+		add_filter( 'pre_insert_term', $refuse );
+		$result = $this->request( 'post_plus_newpost_v2', $update );
+		remove_filter( 'pre_insert_term', $refuse );
+		remove_filter( 'update_post_metadata', $unstamp, 10 );
+		remove_filter( 'wp_insert_post_data', $restore, 10 );
+		remove_action( 'mainwp_before_post_update', $close );
+
+		clean_post_cache( $target );
+		$durable    = get_post( $target );
+		$stamp      = get_post_meta( $target, '_mainwp_child_content_operation_v2', true );
+		$digest     = get_post_meta( $target, '_mainwp_child_content_digest_v2', true );
+		$categories = array_map( 'intval', wp_get_object_terms( $target, 'category', array( 'fields' => 'ids' ) ) );
+		$tags       = array_map( 'intval', wp_get_object_terms( $target, 'post_tag', array( 'fields' => 'ids' ) ) );
+		if ( $durable instanceof \WP_Post ) {
+			wp_delete_post( $target, true );
+		}
+		$wpdb->query( 'SET autocommit = 0' );
+
+		$this->assertInstanceOf( \WP_Post::class, $durable, 'The fixture must leave a durable post or it is not exercising this hazard.' );
+		$this->assertSame( $this->post_columns( $before ), $this->post_columns( $durable ), 'The fixture must leave every post column equal or the column comparison, not the digest, is what caught this.' );
+		$this->assertSame( $create['operation_ref'], $stamp, 'The target must still carry the earlier operation stamp or the stamp check, not the digest, is what caught this.' );
+		$this->assertSame( array( (int) $default->term_id ), $categories, 'The categories must be unchanged or the term comparison, not the digest, is what caught this.' );
+		$this->assertSame( array( (int) $fixture_tag->term_id ), $tags, 'The tags must be unchanged or the term comparison, not the digest, is what caught this.' );
+		$this->assertSame( $update['content_digest'], $digest, 'The fixture must leave this operation digest durable or it proves nothing about the digest.' );
+		$this->assertSame( 'outcome_unknown', $result['code'], 'mutation_failed asserts the site is untouched, and this digest write survived.' );
+	}
+
 	public function test_full_ledger_evicts_only_the_receipts_that_can_no_longer_be_replayed() {
 		update_option( 'mainwp_child_post_plus_operations_v2', $this->aged_ledger( 'applied' ), false );
 		$payload = $this->delivery_payload( '123e4567-e89b-42d3-a456-426614174623', 'Ledger eviction' );

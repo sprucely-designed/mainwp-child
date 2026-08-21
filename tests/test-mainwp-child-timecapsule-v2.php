@@ -38,7 +38,10 @@ class Timecapsule_V2_Factory {
 	}
 }
 
-class_alias( __NAMESPACE__ . '\\Timecapsule_V2_Factory', 'WPTC_Factory' );
+// A real Time Capsule install, or another suite's stub, may already own the global name; aliasing over it is a fatal.
+if ( ! class_exists( 'WPTC_Factory', false ) ) {
+	class_alias( __NAMESPACE__ . '\\Timecapsule_V2_Factory', 'WPTC_Factory' );
+}
 
 class Timecapsule_V2_Protocol_Fixture extends MainWP_Child_Timecapsule {
 
@@ -131,6 +134,9 @@ class Test_MainWP_Child_Timecapsule_V2 extends WP_UnitTestCase {
 
 	public function set_up(): void {
 		parent::set_up();
+		if ( ! is_a( 'WPTC_Factory', Timecapsule_V2_Factory::class, true ) ) {
+			$this->markTestSkipped( 'WPTC_Factory is already declared by something else, so the deterministic provider stub is not in place.' );
+		}
 		delete_option( 'mainwp_timecapsule_abilities_v2_receipts' );
 		delete_option( 'mainwp_timecapsule_abilities_v2_operations' );
 		$reflection    = new ReflectionClass( MainWP_Child_Timecapsule::class );

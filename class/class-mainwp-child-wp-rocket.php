@@ -1154,7 +1154,9 @@ class MainWP_Child_WP_Rocket {//phpcs:ignore -- NOSONAR - multi methods.
         if ( ! is_array( $receipts ) ) {
             return $this->abilities_v2_error( $operation, 'storage_unavailable' );
         }
-        if ( isset( $receipts[ $request_ref ] ) ) {
+        // A key holding null is still evidence that something wrote a receipt for this reference,
+        // and isset() reads it as absent. Missing it here queues the optimization a second time.
+        if ( array_key_exists( $request_ref, $receipts ) ) {
             $receipt = $receipts[ $request_ref ];
             if ( ! $this->abilities_v2_valid_receipt( $receipt ) ) {
                 return $this->abilities_v2_error( $operation, 'storage_unavailable' );
@@ -1365,11 +1367,11 @@ class MainWP_Child_WP_Rocket {//phpcs:ignore -- NOSONAR - multi methods.
     /**
      * Free one receipt slot without discarding an outcome a retry could still ask for.
      *
-     * Receipts older than any plausible Dashboard retry are dropped oldest first. An entry the
-     * Child can no longer read goes before those: it can only answer storage_unavailable on replay,
-     * so keeping it protects nothing while letting hand-edited or truncated option data hold the
-     * store shut for good. A store that still cannot free a slot refuses the request rather than
-     * evict a live receipt whose reference would then queue the optimization a second time.
+     * Receipts older than any plausible Dashboard retry are dropped oldest first. A store that
+     * still cannot free a slot refuses the request rather than evict a live receipt whose
+     * reference would then queue the optimization a second time. The accepted_at stamp is written
+     * once and never renewed, so a full store crosses the horizon on its own and starts accepting
+     * writes again without an operator touching anything.
      *
      * @param array $receipts Stored receipts.
      * @return array|false Receipts with room for one more, or false when no slot can be freed.
@@ -1378,14 +1380,40 @@ class MainWP_Child_WP_Rocket {//phpcs:ignore -- NOSONAR - multi methods.
         if ( self::ABILITIES_V2_MAX_RECEIPTS > count( $receipts ) ) {
             return $receipts;
         }
-        $horizon   = $this->abilities_v2_retry_horizon();
+        $repaired  = false;
         $evictable = array();
         foreach ( $receipts as $reference => $receipt ) {
-            if ( ! $this->abilities_v2_valid_request_ref( $reference ) || ! $this->abilities_v2_valid_receipt( $receipt ) ) {
+            if ( ! $this->abilities_v2_valid_request_ref( $reference ) ) {
+                // No request can present a reference this handler would refuse, so nothing will
+                // ever come back for this entry. It is evidence for nobody, and dropping it is what
+                // keeps a store of junk keys from holding every later optimization shut. Array keys
+                // are not always strings either, so this is also what stops one being compared as one.
                 $evictable[ $reference ] = 0;
                 continue;
             }
-            if ( $receipt['accepted_at'] < $horizon ) {
+            if ( ! $this->abilities_v2_valid_receipt( $receipt ) ) {
+                // An entry nobody can read is still evidence that something wrote a receipt for that
+                // reference, so its optimization may already be queued. Giving it up to make room for
+                // an unrelated request is how a reference loses its only evidence and queues the work
+                // a second time on its next retry. Rebuilt as a tombstone it keeps failing the receipt
+                // check, so its own reference still answers storage_unavailable, while gaining a date
+                // this store can act on - which is also what re-dates a stamp ahead of this clock,
+                // since trusted_timestamp() already reads one of those as unreadable.
+                // Rebuilding it and keeping the result only when it differs makes the builder the
+                // single definition of a tombstone. A separate "is this already a tombstone" check
+                // would be a second definition, and the two drifting apart is how an entry with an
+                // impossible stamp gets treated as sound and holds the store shut.
+                $rebuilt = $this->abilities_v2_tombstone_record( $receipt );
+                if ( $rebuilt !== $receipt ) {
+                    $receipts[ $reference ] = $rebuilt;
+                    $repaired               = true;
+                }
+                $receipt = $rebuilt;
+            }
+            // Eviction may only give up an entry it can prove is past the retry horizon, which is the
+            // same question a replay asks of a reservation. Asking it once is what stops eviction from
+            // dropping an entry a retry would still have been answered from.
+            if ( ! $this->abilities_v2_reservation_is_live( $receipt['accepted_at'] ) ) {
                 $evictable[ $reference ] = $receipt['accepted_at'];
             }
         }
@@ -1396,7 +1424,38 @@ class MainWP_Child_WP_Rocket {//phpcs:ignore -- NOSONAR - multi methods.
             }
             unset( $receipts[ $reference ] );
         }
+        // A tombstone is stamped at first observation, so a repair left unpersisted is stamped again
+        // on every request and can never grow old enough to be given up - a store of damaged entries
+        // would then refuse every optimization forever with no way out. Writing it here freezes those
+        // stamps and lets the entries cross the horizon on their own.
+        if ( $repaired && ! $this->abilities_v2_store_receipts( $receipts ) ) {
+            return false;
+        }
         return self::ABILITIES_V2_MAX_RECEIPTS > count( $receipts ) ? $receipts : false;
+    }
+
+    /**
+     * Rebuild one unreadable entry as a dated tombstone under the same reference.
+     *
+     * Keeping the reference is what stops its retry from queueing the optimization a second time.
+     * What the damaged entry no longer proves is the outcome, so nothing about the effect survives:
+     * no effect hash a request could match, and no response to replay. Its own stamp is kept where
+     * it still reads, so an entry written by an older build ages out on the date it was written
+     * rather than on the date this store first failed to read it. A stamp this clock cannot date is
+     * replaced instead: keeping it would leave an entry no clock ever passes, and one of those in a
+     * full store refuses every optimization from then on with nothing an operator can do.
+     *
+     * @param mixed $receipt Unreadable entry.
+     * @return array Dated tombstone.
+     */
+    private function abilities_v2_tombstone_record( $receipt ) {
+        $now = time();
+        return array(
+            'effect_hash' => str_repeat( '0', 64 ),
+            'state'       => 'unreadable',
+            'response'    => null,
+            'accepted_at' => is_array( $receipt ) && isset( $receipt['accepted_at'] ) && is_int( $receipt['accepted_at'] ) && 0 < $receipt['accepted_at'] && $now >= $receipt['accepted_at'] ? $receipt['accepted_at'] : $now,
+        );
     }
 
     /**

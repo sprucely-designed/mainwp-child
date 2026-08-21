@@ -1065,6 +1065,68 @@ class Test_MainWP_Child_Back_WP_Up_Abilities_V2 extends WP_UnitTestCase {
 	}
 
 	/**
+	 * Only FOLDER resolves to a download location; a remote destination never reaches its provider.
+	 */
+	public function test_provider_redeem_backup_download_refuses_remote_destinations() {
+		$destination = new class() {
+			/** @var int */
+			public $calls = 0;
+
+			/** @return array */
+			public function file_get_list() {
+				++$this->calls;
+				return array(
+					array( 'file' => '/provider/private/archive.zip', 'filename' => 'archive.zip', 'filesize' => 24, 'folder' => '/var/www/example/wp-content/backwpup-backups' ),
+				);
+			}
+		};
+		$fixture = new class( $destination ) extends MainWP_Child_Back_WP_Up {
+			/** @var object */
+			private $destination;
+
+			/** @param object $destination Destination. */
+			public function __construct( $destination ) {
+				$this->destination = $destination;
+			}
+
+			/**
+			 * @param string $destination Destination name.
+			 * @return object
+			 */
+			protected function abilities_v2_get_destination( $destination ) {
+				return $this->destination;
+			}
+		};
+
+		foreach ( array( 'S3', 'FTP', 'DROPBOX' ) as $remote ) {
+			$refused = $this->invoke_provider(
+				$fixture,
+				'abilities_v2_provider_redeem_backup_download',
+				array( array( 'destination_key' => '7_' . $remote, 'file' => '/provider/private/archive.zip' ) )
+			);
+			$this->assertInstanceOf( \WP_Error::class, $refused, $remote . ' resolved a download location' );
+			$this->assertSame( 'not_found', $refused->get_error_code() );
+		}
+		$this->assertSame( 0, $destination->calls, 'a remote destination was enumerated before being refused' );
+
+		$folder = $this->invoke_provider(
+			$fixture,
+			'abilities_v2_provider_redeem_backup_download',
+			array( array( 'destination_key' => '7_FOLDER', 'file' => '/provider/private/archive.zip' ) )
+		);
+
+		$this->assertSame(
+			array(
+				'folder'     => '/var/www/example/wp-content/backwpup-backups',
+				'file_name'  => 'archive.zip',
+				'size_bytes' => 24,
+			),
+			$folder
+		);
+		$this->assertSame( 1, $destination->calls );
+	}
+
+	/**
 	 * The real log adapter streams, sanitizes, redacts and deletes an exact file.
 	 */
 	public function test_provider_log_source_is_bounded_and_redacted() {

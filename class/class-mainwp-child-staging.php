@@ -51,6 +51,24 @@ class MainWP_Child_Staging { //phpcs:ignore -- NOSONAR - multi methods.
     const ABILITIES_V2_CLOCK_SKEW = 300;
 
     /**
+     * Option holding the clone-mutation receipts.
+     *
+     * Two stores now share the same receipt helpers, so which one a call writes to is an
+     * argument rather than a literal repeated at each site: a mistyped literal would write one
+     * store's evidence into the other and be silent about it.
+     *
+     * @var string
+     */
+    const ABILITIES_V2_OPERATION_RECEIPTS_OPTION = 'mainwp_staging_abilities_v2_operation_receipts';
+
+    /**
+     * Option holding the settings-replacement receipts.
+     *
+     * @var string
+     */
+    const ABILITIES_V2_SETTINGS_RECEIPTS_OPTION = 'mainwp_staging_abilities_v2_receipts';
+
+    /**
      * Public static variable to hold the single instance of the class.
      *
      * @var mixed Default null
@@ -614,7 +632,7 @@ class MainWP_Child_Staging { //phpcs:ignore -- NOSONAR - multi methods.
      */
     private function abilities_v2_locked_mutation( $operation, $request ) {
         $effect_hash = hash( 'sha256', wp_json_encode( array( $operation, $request['payload'] ) ) );
-        $receipts    = get_option( 'mainwp_staging_abilities_v2_operation_receipts', array() );
+        $receipts    = get_option( self::ABILITIES_V2_OPERATION_RECEIPTS_OPTION, array() );
         if ( ! is_array( $receipts ) ) {
             return $this->abilities_v2_error( $operation, 'storage_unavailable' );
         }
@@ -645,7 +663,7 @@ class MainWP_Child_Staging { //phpcs:ignore -- NOSONAR - multi methods.
 
         // Room has to exist before the provider is touched. A clone job this Child cannot record
         // is one the Dashboard's next retry runs a second time.
-        $receipts = $this->abilities_v2_evict_receipts( $receipts );
+        $receipts = $this->abilities_v2_evict_receipts( $receipts, self::ABILITIES_V2_OPERATION_RECEIPTS_OPTION );
         if ( false === $receipts ) {
             return $this->abilities_v2_error( $operation, 'storage_unavailable' );
         }
@@ -659,7 +677,7 @@ class MainWP_Child_Staging { //phpcs:ignore -- NOSONAR - multi methods.
             'response'    => null,
             'created_at'  => time(),
         );
-        if ( ! $this->abilities_v2_store_receipts( $receipts ) ) {
+        if ( ! $this->abilities_v2_store_receipts( $receipts, self::ABILITIES_V2_OPERATION_RECEIPTS_OPTION ) ) {
             return $this->abilities_v2_error( $operation, 'storage_unavailable' );
         }
 
@@ -673,7 +691,7 @@ class MainWP_Child_Staging { //phpcs:ignore -- NOSONAR - multi methods.
         // reference outcome_unknown for a full day over a provider that never touched anything.
         $receipts[ $request['request_ref'] ]['state']    = 'settled';
         $receipts[ $request['request_ref'] ]['response'] = $result;
-        if ( ! $this->abilities_v2_store_receipts( $receipts ) ) {
+        if ( ! $this->abilities_v2_store_receipts( $receipts, self::ABILITIES_V2_OPERATION_RECEIPTS_OPTION ) ) {
             return $this->abilities_v2_error( $operation, 'outcome_unknown' );
         }
         return $result;
@@ -685,11 +703,12 @@ class MainWP_Child_Staging { //phpcs:ignore -- NOSONAR - multi methods.
      * A false answer from update_option() means either a refused write or one that changed
      * nothing, so the stored value decides which of the two happened.
      *
-     * @param array $receipts Receipts to store.
+     * @param array  $receipts Receipts to store.
+     * @param string $option Store to write.
      * @return bool
      */
-    private function abilities_v2_store_receipts( $receipts ) {
-        return update_option( 'mainwp_staging_abilities_v2_operation_receipts', $receipts, false ) || get_option( 'mainwp_staging_abilities_v2_operation_receipts', array() ) === $receipts;
+    private function abilities_v2_store_receipts( $receipts, $option ) {
+        return update_option( $option, $receipts, false ) || get_option( $option, array() ) === $receipts;
     }
 
     /**
@@ -746,10 +765,11 @@ class MainWP_Child_Staging { //phpcs:ignore -- NOSONAR - multi methods.
      * The created_at stamp is written once and never restamped, so a full store crosses the
      * horizon on its own and starts accepting writes again without an operator touching anything.
      *
-     * @param array $receipts Current receipts.
+     * @param array  $receipts Current receipts.
+     * @param string $option Store the repaired entries belong to.
      * @return array|false Receipts with room for one more, or false when nothing can be given up.
      */
-    private function abilities_v2_evict_receipts( $receipts ) {
+    private function abilities_v2_evict_receipts( $receipts, $option ) {
         if ( self::ABILITIES_V2_MAX_RECEIPTS > count( $receipts ) ) {
             return $receipts;
         }
@@ -811,7 +831,7 @@ class MainWP_Child_Staging { //phpcs:ignore -- NOSONAR - multi methods.
         // again on every request and can never grow old enough to be given up - a store of damaged
         // entries would then refuse every clone mutation forever with no way out. Writing it here
         // freezes those stamps and lets the entries cross the horizon on their own.
-        if ( $repaired && ! $this->abilities_v2_store_receipts( $receipts ) ) {
+        if ( $repaired && ! $this->abilities_v2_store_receipts( $receipts, $option ) ) {
             return false;
         }
         return self::ABILITIES_V2_MAX_RECEIPTS > count( $receipts ) ? $receipts : false;
@@ -1181,19 +1201,111 @@ class MainWP_Child_Staging { //phpcs:ignore -- NOSONAR - multi methods.
             return $this->abilities_v2_error( 'replace_settings' );
         }
 
+        // The receipt lookup, the revision check and the provider write have to be one atomic
+        // step. Without it two concurrent requests both read "no receipt", both write the
+        // provider settings, and the second write of the option drops the first request's
+        // receipt along with its only record of what it answered. The clone-mutation lock is
+        // deliberately the same one: these settings are the batch, load and delay limits a
+        // clone job queued alongside this request will run under.
+        $lock = $this->abilities_v2_begin_lock();
+        if ( null === $lock ) {
+            return $this->abilities_v2_error( 'replace_settings', 'storage_unavailable' );
+        }
+        if ( true !== $lock ) {
+            return $this->abilities_v2_error( 'replace_settings', 'lock_busy' );
+        }
+        try {
+            return $this->abilities_v2_locked_replace_settings( $request, $settings );
+        } finally {
+            $this->abilities_v2_end_lock();
+        }
+    }
+
+    /**
+     * Replace provider settings at most once inside the retry horizon, under the held lock.
+     *
+     * The if_match revision check already stops the same request applying twice, so what the
+     * receipt protects here is the answer rather than the effect: a request that dies between
+     * the provider write and its receipt leaves its retry to fail the revision check and report
+     * stale_revision, which says another writer moved the revision when in fact this request
+     * did. A reservation that is durable before the provider runs turns that into
+     * outcome_unknown, which is the only true statement available.
+     *
+     * @param array $request Closed request.
+     * @param array $settings Validated public settings.
+     * @return array Closed protocol response.
+     */
+    private function abilities_v2_locked_replace_settings( $request, $settings ) {
         $effect_hash = hash( 'sha256', wp_json_encode( array( $request['payload']['if_match'], $settings ) ) );
-        $receipts    = get_option( 'mainwp_staging_abilities_v2_receipts', array() );
+        $receipts    = get_option( self::ABILITIES_V2_SETTINGS_RECEIPTS_OPTION, array() );
         if ( ! is_array( $receipts ) ) {
             return $this->abilities_v2_error( 'replace_settings', 'storage_unavailable' );
         }
-        if ( isset( $receipts[ $request['request_ref'] ] ) ) {
+        // A key holding null is still evidence that something wrote a receipt for this
+        // reference, and isset() reads it as absent.
+        if ( array_key_exists( $request['request_ref'], $receipts ) ) {
             $receipt = $receipts[ $request['request_ref'] ];
-            if ( ! is_array( $receipt ) || ! isset( $receipt['effect_hash'], $receipt['response'] ) || ! is_string( $receipt['effect_hash'] ) || ! is_array( $receipt['response'] ) ) {
+            if ( ! $this->abilities_v2_valid_receipt( $receipt ) ) {
                 return $this->abilities_v2_error( 'replace_settings', 'storage_unavailable' );
             }
-            return hash_equals( $receipt['effect_hash'], $effect_hash ) ? $receipt['response'] : $this->abilities_v2_error( 'replace_settings', 'request_conflict' );
+            if ( ! hash_equals( $receipt['effect_hash'], $effect_hash ) ) {
+                return $this->abilities_v2_error( 'replace_settings', 'request_conflict' );
+            }
+            if ( 'dispatching' !== $receipt['state'] ) {
+                return $receipt['response'];
+            }
+            // A reservation nobody settled belongs to a request that died with the provider
+            // write possibly already applied. Repeating it would decide the revision check
+            // against state this request itself moved.
+            if ( $this->abilities_v2_reservation_is_live( $receipt['created_at'] ) ) {
+                return $this->abilities_v2_error( 'replace_settings', 'outcome_unknown' );
+            }
+            // Past the horizon nothing is still coming back for it, and a reference that can
+            // only ever answer outcome_unknown is worse than letting the revision check decide.
+            unset( $receipts[ $request['request_ref'] ] );
         }
 
+        // Room has to exist before the provider is written, or this request's answer is one the
+        // store cannot hold and its retry has nothing to land on.
+        $receipts = $this->abilities_v2_evict_receipts( $receipts, self::ABILITIES_V2_SETTINGS_RECEIPTS_OPTION );
+        if ( false === $receipts ) {
+            return $this->abilities_v2_error( 'replace_settings', 'storage_unavailable' );
+        }
+        $receipts[ $request['request_ref'] ] = array(
+            'effect_hash' => $effect_hash,
+            'state'       => 'dispatching',
+            'response'    => null,
+            'created_at'  => time(),
+        );
+        if ( ! $this->abilities_v2_store_receipts( $receipts, self::ABILITIES_V2_SETTINGS_RECEIPTS_OPTION ) ) {
+            return $this->abilities_v2_error( 'replace_settings', 'storage_unavailable' );
+        }
+
+        $response = $this->abilities_v2_write_settings( $request, $settings );
+        // A refusal this Child decided is settled too: it is the final answer for this
+        // reference, and leaving it unsettled would answer every retry outcome_unknown for a
+        // day over a provider that was never written. The readback failures below are not
+        // settled, because there the provider may well have been written and only the horizon
+        // can safely release the reference.
+        if ( isset( $response['error_code'] ) && 'outcome_unknown' === $response['error_code'] ) {
+            return $response;
+        }
+        $receipts[ $request['request_ref'] ]['state']    = 'settled';
+        $receipts[ $request['request_ref'] ]['response'] = $response;
+        if ( ! $this->abilities_v2_store_receipts( $receipts, self::ABILITIES_V2_SETTINGS_RECEIPTS_OPTION ) ) {
+            return $this->abilities_v2_error( 'replace_settings', 'outcome_unknown' );
+        }
+        return $response;
+    }
+
+    /**
+     * Apply validated settings to the provider and verify the stored result exactly.
+     *
+     * @param array $request Closed request.
+     * @param array $settings Validated public settings.
+     * @return array Closed protocol response.
+     */
+    private function abilities_v2_write_settings( $request, $settings ) {
         $current = $this->abilities_v2_settings();
         if ( empty( $current['ok'] ) || ! isset( $current['revision'] ) || ! hash_equals( $current['revision'], $request['payload']['if_match'] ) ) {
             return $this->abilities_v2_error( 'replace_settings', 'stale_revision' );
@@ -1228,31 +1340,13 @@ class MainWP_Child_Staging { //phpcs:ignore -- NOSONAR - multi methods.
             }
         }
 
-        $response = array(
+        return array(
             'protocol'    => '2',
             'operation'   => 'replace_settings',
             'ok'          => true,
             'request_ref' => $request['request_ref'],
             'revision'    => $stored['revision'],
         );
-        $receipts[ $request['request_ref'] ] = array(
-            'effect_hash' => $effect_hash,
-            'response'    => $response,
-            'created_at'  => time(),
-        );
-        if ( 100 < count( $receipts ) ) {
-            uasort(
-                $receipts,
-                static function ( $left, $right ) {
-                    return ( isset( $left['created_at'] ) ? (int) $left['created_at'] : 0 ) <=> ( isset( $right['created_at'] ) ? (int) $right['created_at'] : 0 );
-                }
-            );
-            $receipts = array_slice( $receipts, -100, null, true );
-        }
-        if ( ! update_option( 'mainwp_staging_abilities_v2_receipts', $receipts, false ) && $receipts !== get_option( 'mainwp_staging_abilities_v2_receipts', array() ) ) {
-            return $this->abilities_v2_error( 'replace_settings', 'outcome_unknown' );
-        }
-        return $response;
     }
 
     /** @param array $settings Settings. @return bool */

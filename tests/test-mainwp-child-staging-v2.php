@@ -45,6 +45,12 @@ class Test_MainWP_Child_Staging_V2_Fixture extends MainWP_Child_Staging {
 	/** @var array Receipt store as it stood while the provider ran. */
 	public $receipts_during_dispatch = array();
 
+	/** @var string|null IS_FREE_LOCK() observed while the settings write ran. */
+	public $lock_free_during_settings_write = null;
+
+	/** @var array Settings receipt store as it stood while the settings write ran. */
+	public $settings_receipts_during_write = array();
+
 	/** Avoid installed-plugin lookup. */
 	public function __construct() {
 		$this->is_plugin_installed = true;
@@ -91,8 +97,15 @@ class Test_MainWP_Child_Staging_V2_Fixture extends MainWP_Child_Staging {
 
 	/** @return bool */
 	protected function abilities_v2_provider_store_settings( $settings ) {
+		global $wpdb;
 		++$this->settings_writes;
-		$this->settings = $settings;
+		$this->lock_free_during_settings_write = $wpdb->get_var( $wpdb->prepare( 'SELECT IS_FREE_LOCK(%s)', $this->abilities_v2_lock_name() ) );
+		// update_option() primes the object cache, so only a cold read shows what is actually on
+		// disk at this moment - which is the whole question a durable reservation asks.
+		wp_cache_delete( MainWP_Child_Staging::ABILITIES_V2_SETTINGS_RECEIPTS_OPTION, 'options' );
+		wp_cache_delete( 'alloptions', 'options' );
+		$this->settings_receipts_during_write = get_option( MainWP_Child_Staging::ABILITIES_V2_SETTINGS_RECEIPTS_OPTION, array() );
+		$this->settings                       = $settings;
 		return true;
 	}
 
@@ -416,6 +429,95 @@ class Test_MainWP_Child_Staging_V2 extends WP_UnitTestCase {
 		$this->assertFalse( $conflict['ok'] );
 		$this->assertSame( 'request_conflict', $conflict['error_code'] );
 		$this->assertSame( 1, $this->staging->settings_writes );
+	}
+
+	/**
+	 * The settings receipt lookup and the provider write are one atomic step, so a concurrent
+	 * request cannot read "no receipt" and overwrite the store this one is about to write.
+	 */
+	public function test_replace_settings_runs_under_the_named_lock_and_a_held_lock_refuses_it() {
+		$applied = $this->staging->abilities_v2( $this->settings_request( '123e4567-e89b-42d3-a456-426614174931' ) );
+
+		$this->assertTrue( $applied['ok'] );
+		$this->assertSame( '0', $this->staging->lock_free_during_settings_write, 'the lock must be held while the provider is written' );
+		$this->assertSame( '1', $this->lock_state( $this->staging->fixture_lock_name() ), 'the lock must be released afterwards' );
+
+		$other   = $this->hold_lock_elsewhere( $this->staging->fixture_lock_name() );
+		$refused = $this->staging->abilities_v2( $this->settings_request( '123e4567-e89b-42d3-a456-426614174932' ) );
+		$this->release_lock_elsewhere( $other, $this->staging->fixture_lock_name() );
+
+		$this->assertFalse( $refused['ok'] );
+		$this->assertSame( 'lock_busy', $refused['error_code'] );
+		$this->assertSame( 1, $this->staging->settings_writes, 'a refused request must not reach the provider' );
+		$this->assertArrayNotHasKey( '123e4567-e89b-42d3-a456-426614174932', get_option( MainWP_Child_Staging::ABILITIES_V2_SETTINGS_RECEIPTS_OPTION, array() ) );
+	}
+
+	/** A key holding null is evidence a receipt was written, so its reference must not write again. */
+	public function test_a_null_settings_entry_under_a_reference_refuses_rather_than_writing() {
+		update_option( MainWP_Child_Staging::ABILITIES_V2_SETTINGS_RECEIPTS_OPTION, array( '123e4567-e89b-42d3-a456-426614174933' => null ), false );
+
+		$refused = $this->staging->abilities_v2( $this->settings_request( '123e4567-e89b-42d3-a456-426614174933' ) );
+
+		$this->assertFalse( $refused['ok'] );
+		$this->assertSame( 'storage_unavailable', $refused['error_code'] );
+		$this->assertSame( 0, $this->staging->settings_writes );
+	}
+
+	/**
+	 * A full settings store refuses rather than giving up an entry a retry could still land on,
+	 * and it comes back on its own once the oldest is past the retry horizon.
+	 */
+	public function test_a_full_settings_receipt_store_refuses_before_writing_and_self_clears_past_the_horizon() {
+		$oldest = '123e4567-e89b-42d3-a456-4266141749b0';
+		update_option( MainWP_Child_Staging::ABILITIES_V2_SETTINGS_RECEIPTS_OPTION, $this->fill_receipts( 100, time(), $oldest ), false );
+
+		$refused = $this->staging->abilities_v2( $this->settings_request( '123e4567-e89b-42d3-a456-426614174934' ) );
+
+		$this->assertFalse( $refused['ok'] );
+		$this->assertSame( 'storage_unavailable', $refused['error_code'] );
+		$this->assertSame( 0, $this->staging->settings_writes, 'the provider must not be written when the answer cannot be recorded' );
+		$this->assertCount( 100, get_option( MainWP_Child_Staging::ABILITIES_V2_SETTINGS_RECEIPTS_OPTION, array() ) );
+
+		// Only the clock changes: the oldest entry is now past the horizon and nothing else is.
+		$receipts                          = get_option( MainWP_Child_Staging::ABILITIES_V2_SETTINGS_RECEIPTS_OPTION, array() );
+		$receipts[ $oldest ]['created_at'] = time() - ( DAY_IN_SECONDS + 3600 );
+		update_option( MainWP_Child_Staging::ABILITIES_V2_SETTINGS_RECEIPTS_OPTION, $receipts, false );
+
+		$accepted = $this->staging->abilities_v2( $this->settings_request( '123e4567-e89b-42d3-a456-426614174935' ) );
+		$stored   = get_option( MainWP_Child_Staging::ABILITIES_V2_SETTINGS_RECEIPTS_OPTION, array() );
+
+		$this->assertTrue( $accepted['ok'] );
+		$this->assertSame( 1, $this->staging->settings_writes );
+		$this->assertCount( 100, $stored );
+		$this->assertArrayNotHasKey( $oldest, $stored, 'the aged receipt is the one given up' );
+		$this->assertArrayHasKey( '123e4567-e89b-42d3-a456-426614174935', $stored );
+	}
+
+	/**
+	 * The reservation is on disk before the provider is written, so a request that dies in
+	 * between leaves its retry an honest outcome_unknown instead of a stale_revision that
+	 * blames another writer for what this request itself did.
+	 */
+	public function test_an_interrupted_settings_request_answers_outcome_unknown_rather_than_stale_revision() {
+		$request = $this->settings_request( '123e4567-e89b-42d3-a456-426614174936' );
+
+		$applied = $this->staging->abilities_v2( $request );
+
+		$this->assertTrue( $applied['ok'] );
+		$this->assertArrayHasKey( '123e4567-e89b-42d3-a456-426614174936', $this->staging->settings_receipts_during_write, 'the reservation must be durable before the provider is written' );
+		$this->assertSame( 'dispatching', $this->staging->settings_receipts_during_write['123e4567-e89b-42d3-a456-426614174936']['state'] );
+
+		// The request died before settling: the reservation is all its retry has to go on, and
+		// the revision has already moved because this same request moved it.
+		$receipts = get_option( MainWP_Child_Staging::ABILITIES_V2_SETTINGS_RECEIPTS_OPTION, array() );
+		$receipts['123e4567-e89b-42d3-a456-426614174936'] = $this->staging->settings_receipts_during_write['123e4567-e89b-42d3-a456-426614174936'];
+		update_option( MainWP_Child_Staging::ABILITIES_V2_SETTINGS_RECEIPTS_OPTION, $receipts, false );
+
+		$retry = $this->staging->abilities_v2( $request );
+
+		$this->assertFalse( $retry['ok'] );
+		$this->assertSame( 'outcome_unknown', $retry['error_code'] );
+		$this->assertSame( 1, $this->staging->settings_writes, 'the retry must not write the provider a second time' );
 	}
 
 	/** Without WP Staging the Child neither advertises nor performs the settings write. */
@@ -1123,6 +1225,40 @@ class Test_MainWP_Child_Staging_V2 extends WP_UnitTestCase {
 			'operation'   => 'create_clone',
 			'request_ref' => $request_ref,
 			'payload'     => array( 'inventory_revision' => str_repeat( 'a', 64 ) ),
+		);
+	}
+
+	/** @param string $request_ref Reference. @return array */
+	private function settings_request( $request_ref ) {
+		if ( array() === $this->staging->settings ) {
+			$this->staging->settings = array(
+				'queryLimit'        => 1000,
+				'fileLimit'         => 500,
+				'batchSize'         => 10,
+				'maxFileSize'       => 50,
+				'cpuLoad'           => 'medium',
+				'delayRequests'     => 1,
+				'debugMode'         => 0,
+				'disableAdminLogin' => 0,
+			);
+		}
+		$current = $this->invoke_v2( 'settings', array() );
+		return array(
+			'protocol'    => '2',
+			'operation'   => 'replace_settings',
+			'request_ref' => $request_ref,
+			'payload'     => array(
+				'if_match' => $current['revision'],
+				'settings' => array(
+					'query_limit'      => 900,
+					'file_limit'       => 250,
+					'batch_size_mb'    => 20,
+					'max_file_size_mb' => 100,
+					'cpu_load'         => 'low',
+					'delay_seconds'    => 2,
+					'debug_enabled'    => true,
+				),
+			),
 		);
 	}
 

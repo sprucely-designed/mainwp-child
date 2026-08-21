@@ -383,35 +383,62 @@ class Test_MainWP_Child_WP_Rocket_V2 extends WP_UnitTestCase {
 	}
 
 	/**
-	 * A store full of entries the Child cannot read must not lock the ability out.
+	 * An unreadable entry is not spare room for somebody else's optimization.
 	 *
-	 * A WordPress option is untrusted input: truncated or hand-edited receipts answer nothing on
-	 * replay, so treating them as receipts worth keeping would refuse every future optimization
-	 * until someone repaired the option by hand.
+	 * It is still evidence that a receipt was written for that reference, so giving it up lets that
+	 * reference queue the same destructive optimization again on its next retry. It becomes a dated
+	 * tombstone instead: the stamp is written once, survives the request that wrote it, and is what
+	 * lets the entry age out later rather than hold the store shut.
 	 */
-	public function test_unreadable_receipts_never_hold_the_optimization_store_shut() {
-		$receipts = array();
-		for ( $index = 0; $index < 100; $index++ ) {
-			$receipts[ sprintf( '123e4567-e89b-42d3-a456-4266141751%02d', $index ) ] = array(
-				'effect_hash' => 'not-a-hash',
-				'response'    => 'truncated',
-			);
-		}
+	public function test_an_unreadable_entry_becomes_a_dated_tombstone_rather_than_someone_elses_room() {
+		$unreadable = '123e4567-e89b-42d3-a456-4266141749b0';
+		$receipts   = $this->fill_receipts( 99, time() );
+		// The two-key shape a truncated or hand-edited option leaves behind, with no state to read.
+		$receipts[ $unreadable ] = array(
+			'effect_hash' => str_repeat( 'e', 64 ),
+			'response'    => array( 'ok' => true ),
+		);
 		update_option( 'mainwp_wp_rocket_abilities_v2_receipts', $receipts, false );
 
 		$request = array(
 			'protocol'    => '2',
 			'operation'   => 'optimize_database',
-			'request_ref' => '123e4567-e89b-42d3-a456-426614174922',
+			'request_ref' => '123e4567-e89b-42d3-a456-426614174929',
 			'payload'     => array( 'categories' => array( 'revisions' ) ),
 		);
-		$result  = $this->invoke_v2( $request );
-		$stored  = get_option( 'mainwp_wp_rocket_abilities_v2_receipts' );
+		$refused = $this->invoke_v2( $request );
+		$stored  = get_option( 'mainwp_wp_rocket_abilities_v2_receipts', array() );
 
-		$this->assertTrue( $result['ok'], wp_json_encode( $result ) );
-		$this->assertCount( 1, $this->rocket->provider_calls );
-		$this->assertArrayHasKey( $request['request_ref'], $stored );
-		$this->assertLessThanOrEqual( 100, count( $stored ) );
+		$this->assertFalse( $refused['ok'], wp_json_encode( $refused ) );
+		$this->assertSame( 'storage_unavailable', $refused['error_code'] );
+		$this->assertSame( array(), $this->rocket->provider_calls, 'no optimization may be queued behind a refusal' );
+		$this->assertArrayHasKey( $unreadable, $stored, 'the damaged entry is still evidence that reference already ran' );
+		$this->assertSame( 'unreadable', $stored[ $unreadable ]['state'] );
+		$this->assertNull( $stored[ $unreadable ]['response'] );
+		$this->assertIsInt( $stored[ $unreadable ]['accepted_at'], 'the repair has to be persisted or it is re-stamped on every request' );
+		foreach ( array_keys( $this->fill_receipts( 99, time() ) ) as $live ) {
+			$this->assertArrayHasKey( $live, $stored );
+		}
+
+		// The reference behind the tombstone still refuses rather than queueing the work again.
+		$replay                = $request;
+		$replay['request_ref'] = $unreadable;
+
+		$this->assertSame( 'storage_unavailable', $this->invoke_v2( $replay )['error_code'] );
+		$this->assertSame( array(), $this->rocket->provider_calls );
+
+		// Only the clock changes: a tombstone past the horizon is given up like any other entry,
+		// which is only possible because its stamp was frozen rather than renewed on every read.
+		$stored[ $unreadable ]['accepted_at'] = time() - ( DAY_IN_SECONDS + 3600 );
+		update_option( 'mainwp_wp_rocket_abilities_v2_receipts', $stored, false );
+
+		$request['request_ref'] = '123e4567-e89b-42d3-a456-426614174930';
+		$accepted               = $this->invoke_v2( $request );
+		$after                  = get_option( 'mainwp_wp_rocket_abilities_v2_receipts', array() );
+
+		$this->assertTrue( $accepted['ok'], wp_json_encode( $accepted ) );
+		$this->assertArrayNotHasKey( $unreadable, $after, 'the aged tombstone is the entry given up' );
+		$this->assertArrayHasKey( '123e4567-e89b-42d3-a456-426614174930', $after );
 	}
 
 	/**
@@ -508,31 +535,42 @@ class Test_MainWP_Child_WP_Rocket_V2 extends WP_UnitTestCase {
 	}
 
 	/**
-	 * A store full of receipts stamped in the future must not lock the ability out.
+	 * A store whose stamps this clock cannot date is re-dated once, so it still ages out.
 	 *
-	 * Option data is untrusted input, so an impossible timestamp is not a young receipt: nothing may
-	 * read age from it, and eviction has to treat it like any other entry it cannot use.
+	 * Nothing is given up: every reference is still there and still refuses on its own retry. What
+	 * changes is that the store now holds dates it can act on, so it is no longer a store that
+	 * refuses every later optimization with no way out.
 	 */
-	public function test_future_dated_receipts_never_hold_the_optimization_store_shut() {
-		$receipts = array();
-		for ( $index = 0; $index < 100; $index++ ) {
-			$receipts[ sprintf( '123e4567-e89b-42d3-a456-4266141752%02d', $index ) ] = $this->settled_receipt( time() + ( 10 * YEAR_IN_SECONDS ) );
-		}
-		update_option( 'mainwp_wp_rocket_abilities_v2_receipts', $receipts, false );
+	public function test_a_store_of_undatable_stamps_is_redated_once_and_then_ages_out() {
+		update_option( 'mainwp_wp_rocket_abilities_v2_receipts', $this->fill_receipts( 100, time() + ( 2 * DAY_IN_SECONDS ) ), false );
 
 		$request = array(
 			'protocol'    => '2',
 			'operation'   => 'optimize_database',
-			'request_ref' => '123e4567-e89b-42d3-a456-426614174926',
+			'request_ref' => '123e4567-e89b-42d3-a456-426614174931',
 			'payload'     => array( 'categories' => array( 'revisions' ) ),
 		);
-		$result  = $this->invoke_v2( $request );
-		$stored  = get_option( 'mainwp_wp_rocket_abilities_v2_receipts' );
+		$refused = $this->invoke_v2( $request );
+		$stored  = get_option( 'mainwp_wp_rocket_abilities_v2_receipts', array() );
 
-		$this->assertTrue( $result['ok'], wp_json_encode( $result ) );
-		$this->assertCount( 1, $this->rocket->provider_calls );
-		$this->assertArrayHasKey( $request['request_ref'], $stored );
-		$this->assertLessThanOrEqual( 100, count( $stored ) );
+		$this->assertFalse( $refused['ok'], 'a full store still refuses rather than dropping evidence' );
+		$this->assertSame( 'storage_unavailable', $refused['error_code'] );
+		$this->assertSame( array(), $this->rocket->provider_calls );
+		$this->assertCount( 100, $stored, 'not one receipt is given up to make room' );
+		foreach ( $stored as $reference => $receipt ) {
+			$this->assertLessThanOrEqual( time(), $receipt['accepted_at'], $reference );
+			$this->assertSame( 'unreadable', $receipt['state'], $reference );
+		}
+
+		// Only the clock changes: what was undatable now ages out like any other receipt.
+		foreach ( array_keys( $stored ) as $reference ) {
+			$stored[ $reference ]['accepted_at'] = time() - ( DAY_IN_SECONDS + 3600 );
+		}
+		update_option( 'mainwp_wp_rocket_abilities_v2_receipts', $stored, false );
+
+		$request['request_ref'] = '123e4567-e89b-42d3-a456-426614174932';
+
+		$this->assertTrue( $this->invoke_v2( $request )['ok'] );
 	}
 
 	/** A receipt stamped in the future is not an outcome the Child may hand back as this request's answer. */
@@ -579,6 +617,28 @@ class Test_MainWP_Child_WP_Rocket_V2 extends WP_UnitTestCase {
 		$this->assertFalse( $result['ok'] );
 		$this->assertSame( 'storage_unavailable', $result['error_code'] );
 		$this->assertSame( array(), $this->rocket->provider_calls );
+	}
+
+	/**
+	 * A reference whose stored entry is null still refuses rather than queueing the work again.
+	 *
+	 * isset() reads a key holding null as absent, and the key existing at all is the evidence that
+	 * something wrote a receipt for that reference.
+	 */
+	public function test_a_null_entry_under_a_reference_refuses_rather_than_dispatching() {
+		$request = array(
+			'protocol'    => '2',
+			'operation'   => 'optimize_database',
+			'request_ref' => '123e4567-e89b-42d3-a456-426614174933',
+			'payload'     => array( 'categories' => array( 'revisions' ) ),
+		);
+		update_option( 'mainwp_wp_rocket_abilities_v2_receipts', array( $request['request_ref'] => null ), false );
+
+		$result = $this->invoke_v2( $request );
+
+		$this->assertFalse( $result['ok'], wp_json_encode( $result ) );
+		$this->assertSame( 'storage_unavailable', $result['error_code'] );
+		$this->assertSame( array(), $this->rocket->provider_calls, 'a reference with any stored entry must not reach the provider again' );
 	}
 
 	/**
@@ -745,6 +805,22 @@ class Test_MainWP_Child_WP_Rocket_V2 extends WP_UnitTestCase {
 			),
 			'accepted_at' => $accepted_at,
 		);
+	}
+
+	/**
+	 * Fill the store with settled receipts that all carry the same stamp.
+	 *
+	 * @param int $count       How many entries.
+	 * @param int $accepted_at Stamp every entry carries.
+	 * @return array
+	 */
+	private function fill_receipts( $count, $accepted_at ) {
+		$receipts = array();
+		for ( $index = 0; $index < $count; $index++ ) {
+			$receipts[ sprintf( '123e4567-e89b-42d3-a456-4266141750%02d', $index ) ] = $this->settled_receipt( $accepted_at );
+		}
+
+		return $receipts;
 	}
 
 	/**

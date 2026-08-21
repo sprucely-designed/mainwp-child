@@ -1545,7 +1545,10 @@ class MainWP_Child_Back_WP_Up { //phpcs:ignore -- NOSONAR - multi methods.
             return new \WP_Error( 'not_found' );
         }
         list( , $destination ) = explode( '_', $target['destination_key'], 2 );
-        $provider              = $this->abilities_v2_get_destination( $destination );
+        if ( 'FOLDER' !== $destination ) {
+            return new \WP_Error( 'not_found' );
+        }
+        $provider = $this->abilities_v2_get_destination( $destination );
         if ( ! is_object( $provider ) || ! method_exists( $provider, 'file_get_list' ) ) {
             return new \WP_Error( 'operation_failed' );
         }

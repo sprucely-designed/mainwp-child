@@ -291,32 +291,34 @@ class MainWP_Child_Early_Access_Release {
 
     /** Reserve one request. */
     protected function create_receipt( $request_ref, $receipt ) {
-        if ( ! $this->valid_receipt( $receipt ) || ! add_option( $this->receipt_key( $request_ref ), $receipt, '', false ) || $receipt !== $this->load_receipt( $request_ref ) ) {
+        if ( ! $this->valid_receipt( $receipt ) ) {
             return false;
         }
-        $this->reclaim_retained_receipts( $this->receipt_key( $request_ref ), $receipt['expires_at'] );
+        $this->sweep_retained_receipts();
+        if ( ! add_option( $this->receipt_key( $request_ref ), $receipt, '', false ) || $receipt !== $this->load_receipt( $request_ref ) ) {
+            return false;
+        }
+        $this->record_retained_receipt( $this->receipt_key( $request_ref ), $receipt['expires_at'] );
         return true;
     }
 
     /**
-     * Reclaim a few rows nobody came back for, then record the one this request just wrote.
+     * Reclaim a few rows nobody came back for.
      *
      * A request reference is one-shot, so the reclaim on the apply path only ever reaches the
      * reference the current request names; every other row stays in wp_options until the site is
      * torn down. Finding them means either a prefix scan of that table, unindexed and on the hot
      * transition path, or an index of the keys this class wrote.
      *
-     * Both halves run under the transition lane, which is what makes the delete safe to decide from
-     * a value read a moment earlier, and neither may change this request's answer. The index is
-     * advisory and its failures are ignored; the sweep deletes only what receipt_expired() already
-     * permits, so a dispatch marker and a settled unknown - the two receipts that never established
-     * what the installed tree went through - stay whatever their age. Sweeping before recording
-     * keeps the row just written out of this request's own budget.
-     *
-     * @param string $option_key Receipt key this request wrote.
-     * @param int    $expires_at Retention moment stored on it.
+     * The only caller reserves under the transition lane, so this runs under it too. It may not
+     * change the request's answer, and it runs before the reservation exists so that a fatal in
+     * here leaves nothing reserved: a transition that died holding a marker it can never settle
+     * would poison the same index for every request after it. The sweep deletes only what
+     * receipt_expired() already permits, so a dispatch marker and a settled unknown - the two
+     * receipts that never established what the installed tree went through - stay whatever their
+     * age.
      */
-    private function reclaim_retained_receipts( $option_key, $expires_at ) {
+    private function sweep_retained_receipts() {
         $index = new MainWP_Child_Receipt_Index( self::RECEIPT_PREFIX );
         $index->sweep(
             self::RECEIPT_INDEX_OPTION,
@@ -325,6 +327,20 @@ class MainWP_Child_Early_Access_Release {
                 return $this->valid_receipt( $value ) && $this->receipt_expired( $value );
             }
         );
+    }
+
+    /**
+     * Record the row this request just wrote, so a later transition can find it.
+     *
+     * Recording happens after the write because only then is the key known to name a row. The index
+     * is advisory and its failure is ignored: a transition that has already reserved its effect is
+     * never refused over bookkeeping.
+     *
+     * @param string $option_key Receipt key this request wrote.
+     * @param int    $expires_at Retention moment stored on it.
+     */
+    private function record_retained_receipt( $option_key, $expires_at ) {
+        $index = new MainWP_Child_Receipt_Index( self::RECEIPT_PREFIX );
         $index->add( self::RECEIPT_INDEX_OPTION, $option_key, $expires_at, self::RECEIPT_INDEX_CAP );
     }
 

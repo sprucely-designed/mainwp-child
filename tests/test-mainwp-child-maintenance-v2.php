@@ -827,6 +827,59 @@ class Test_MainWP_Child_Maintenance_V2 extends WP_UnitTestCase {
 		$this->assertGreaterThan( 2, $remaining, 'Revisions over retention must still be there: the sweep stopped, it did not finish.' );
 	}
 
+	/**
+	 * max_execution_time bounds the whole request, so whatever validation, the preview and earlier
+	 * actions already spent is gone before the sweep starts. A deadline that ignores that time sits
+	 * behind the fatal it was added to prevent: here 58 of 60 seconds are already spent, and a sweep
+	 * granted the full limit would keep deleting for another 50.
+	 */
+	public function test_revision_sweep_deadline_accounts_for_time_already_spent_in_the_request() {
+		global $wpdb, $timestart;
+		$parent_id = self::factory()->post->create();
+		$this->insert_revisions( $parent_id, 503 );
+
+		$original_limit     = ini_get( 'max_execution_time' );
+		$original_timestart = $timestart;
+		ini_set( 'max_execution_time', 60 );
+		$timestart = microtime( true ) - 58;
+		// The sweep only reads the wall clock between batches, so time has to pass inside one.
+		$stall = static function ( $query ) {
+			static $stalled = false;
+			if ( ! $stalled && 1 === preg_match( '/^\s*DELETE\s+FROM\s+\S*posts\b/i', $query ) ) {
+				$stalled = true;
+				$until   = time() + 2;
+				while ( time() < $until ) {
+					usleep( 50000 );
+				}
+			}
+			return $query;
+		};
+
+		add_filter( 'query', $stall );
+		try {
+			list( , $result ) = $this->real_execute( $this->real_subject(), array( 'revisions' ), 2, '123e4567-e89b-42d3-a456-426614174521' );
+		} finally {
+			remove_filter( 'query', $stall );
+			ini_set( 'max_execution_time', $original_limit );
+			$timestart = $original_timestart;
+		}
+
+		$remaining = (int) $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM $wpdb->posts WHERE post_type = 'revision' AND post_parent = %d", $parent_id ) );
+		$this->assertTrue( $result['ok'] );
+		$this->assertSame( 'unknown', $result['status'] );
+		$this->assertSame(
+			array(
+				'action'     => 'revisions',
+				'status'     => 'unknown',
+				'affected'   => 503 - $remaining,
+				'error_code' => 'outcome_unknown',
+			),
+			$result['outcomes'][0],
+			'A sweep that stops on the request budget reports the rows it destroyed, not a finished run.'
+		);
+		$this->assertGreaterThan( 2, $remaining, 'The sweep must stop on the time the request already spent, not run the parent to the end.' );
+	}
+
 	/** Fill one parent with revisions cheaply; the sweep only ever reads them through SQL. */
 	private function insert_revisions( $parent_id, $count ) {
 		global $wpdb;

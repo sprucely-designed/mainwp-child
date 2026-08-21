@@ -336,6 +336,112 @@ class Test_Post_Plus_Child_V2 extends WP_UnitTestCase {
 		$this->assertSame( 'outcome_unknown', $result['code'], 'mutation_failed asserts the site is untouched, and this post survived.' );
 	}
 
+	/**
+	 * wp_insert_post() throws away what update_post_meta() returns, so the row can be written and
+	 * made durable by the implicit commit while the operation stamp never lands. A verification that
+	 * reads the stamp then sees a clean site and answers mutation_failed for a post that is still
+	 * there. On a create the row itself is the trace, stamp or no stamp.
+	 */
+	public function test_a_durable_create_that_lost_its_stamp_is_not_reported_as_mutation_failed() {
+		global $wpdb;
+
+		$payload                   = $this->delivery_payload( '123e4567-e89b-42d3-a456-426614174640', 'Unstamped create' );
+		$payload['post']['tags']   = array( 'unstamped-create-fixture-tag' );
+		$payload['content_digest'] = hash( 'sha256', wp_json_encode( array( $payload['post'], $payload['randomization'] ) ) );
+
+		$captured = 0;
+		$capture  = static function ( $post_id ) use ( &$captured ) {
+			if ( 0 === $captured ) {
+				$captured = (int) $post_id;
+			}
+		};
+		$close = static function () use ( $wpdb ) {
+			$wpdb->query( 'SET autocommit = 1' );
+		};
+		$unstamp = static function ( $check, $object_id, $meta_key ) {
+			return '_mainwp_child_content_operation_v2' === $meta_key ? false : $check;
+		};
+		$refuse = static function () {
+			return new \WP_Error( 'fixture_term_refused', 'Term creation refused.' );
+		};
+		add_action( 'mainwp_before_post_update', $close );
+		add_action( 'wp_insert_post', $capture );
+		add_filter( 'update_post_metadata', $unstamp, 10, 3 );
+		add_filter( 'pre_insert_term', $refuse );
+		$result = $this->request( 'post_plus_newpost_v2', $payload );
+		remove_filter( 'pre_insert_term', $refuse );
+		remove_filter( 'update_post_metadata', $unstamp, 10 );
+		remove_action( 'wp_insert_post', $capture );
+		remove_action( 'mainwp_before_post_update', $close );
+
+		$this->assertGreaterThan( 0, $captured );
+		clean_post_cache( $captured );
+		$durable = get_post( $captured );
+		$stamp   = get_post_meta( $captured, '_mainwp_child_content_operation_v2', true );
+		if ( $durable instanceof \WP_Post ) {
+			wp_delete_post( $captured, true );
+		}
+		$wpdb->query( 'SET autocommit = 0' );
+
+		$this->assertInstanceOf( \WP_Post::class, $durable, 'The fixture must leave a durable post or it is not exercising this hazard.' );
+		$this->assertSame( '', $stamp, 'The fixture must leave that post unstamped or it proves nothing about the stamp.' );
+		$this->assertSame( 'outcome_unknown', $result['code'], 'mutation_failed asserts the site is untouched, and this post survived.' );
+	}
+
+	/**
+	 * The same hole from the other side: an update target legitimately carries an earlier operation's
+	 * stamp, so a content change that survived its transaction with no stamp of its own reads as no
+	 * trace of this operation. What is stored in the post is the only thing that says whose write is
+	 * in place.
+	 */
+	public function test_a_durable_update_that_lost_its_stamp_is_not_reported_as_mutation_failed() {
+		global $wpdb;
+
+		$create = $this->delivery_payload( '123e4567-e89b-42d3-a456-426614174641', 'Before durable update' );
+		$first  = $this->request( 'post_plus_newpost_v2', $create );
+		$this->assertTrue( $first['ok'] );
+		$posts = $this->operation_posts( $create['operation_ref'] );
+		$this->assertCount( 1, $posts );
+		$target = (int) $posts[0]->ID;
+
+		$update                      = $this->delivery_payload( '123e4567-e89b-42d3-a456-426614174642', 'After durable update' );
+		$update['mode']              = 'update';
+		$update['target_post_id']    = $target;
+		$update['expected_revision'] = $first['post_revision'];
+		$update['post']['tags']      = array( 'durable-update-fixture-tag' );
+		$update['content_digest']    = hash( 'sha256', wp_json_encode( array( $update['post'], $update['randomization'] ) ) );
+
+		$close = static function () use ( $wpdb ) {
+			$wpdb->query( 'SET autocommit = 1' );
+		};
+		$unstamp = static function ( $check, $object_id, $meta_key ) {
+			return '_mainwp_child_content_operation_v2' === $meta_key ? false : $check;
+		};
+		$refuse = static function () {
+			return new \WP_Error( 'fixture_term_refused', 'Term creation refused.' );
+		};
+		add_action( 'mainwp_before_post_update', $close );
+		add_filter( 'update_post_metadata', $unstamp, 10, 3 );
+		add_filter( 'pre_insert_term', $refuse );
+		$result = $this->request( 'post_plus_newpost_v2', $update );
+		remove_filter( 'pre_insert_term', $refuse );
+		remove_filter( 'update_post_metadata', $unstamp, 10 );
+		remove_action( 'mainwp_before_post_update', $close );
+
+		clean_post_cache( $target );
+		$durable = get_post( $target );
+		$stamp   = get_post_meta( $target, '_mainwp_child_content_operation_v2', true );
+		if ( $durable instanceof \WP_Post ) {
+			wp_delete_post( $target, true );
+		}
+		$wpdb->query( 'SET autocommit = 0' );
+
+		$this->assertInstanceOf( \WP_Post::class, $durable );
+		$this->assertSame( 'After durable update', $durable->post_title, 'The fixture must leave the changed title durable or it is not exercising this hazard.' );
+		$this->assertSame( $create['operation_ref'], $stamp, 'The target must still carry the earlier operation stamp or the stamp check was never fooled.' );
+		$this->assertSame( 'outcome_unknown', $result['code'], 'mutation_failed asserts the site is untouched, and this change survived.' );
+	}
+
 	public function test_full_ledger_evicts_only_the_receipts_that_can_no_longer_be_replayed() {
 		update_option( 'mainwp_child_post_plus_operations_v2', $this->aged_ledger( 'applied' ), false );
 		$payload = $this->delivery_payload( '123e4567-e89b-42d3-a456-426614174623', 'Ledger eviction' );

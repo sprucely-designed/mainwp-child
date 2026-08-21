@@ -1052,35 +1052,35 @@ class MainWP_Child_Posts { //phpcs:ignore -- NOSONAR - multi methods.
 
         $post_id = wp_insert_post( wp_slash( $postarr ), true );
         if ( is_wp_error( $post_id ) || ! is_int( $post_id ) || 1 > $post_id ) {
-            $rolled_back = $this->content_v2_rollback( null, $normalized );
+            $rolled_back = $this->content_v2_rollback( null, $normalized, $postarr );
             return $this->content_v2_error( $protocol, $operation, $this->content_v2_failure_code( $rolled_back ) );
         }
         if ( ! empty( $normalized['post']['categories'] ) ) {
             $category_ids = $this->content_v2_category_ids( $normalized['post']['categories'] );
             $terms        = false === $category_ids ? false : wp_set_post_categories( $post_id, $category_ids, false );
             if ( false === $terms || is_wp_error( $terms ) ) {
-                $rolled_back = $this->content_v2_rollback( $post_id, $normalized );
+                $rolled_back = $this->content_v2_rollback( $post_id, $normalized, $postarr );
                 return $this->content_v2_error( $protocol, $operation, $this->content_v2_failure_code( $rolled_back ) );
             }
         }
         if ( null !== $choices['category_id'] ) {
             $terms = wp_set_post_categories( $post_id, array( $choices['category_id'] ), true );
             if ( is_wp_error( $terms ) ) {
-                $rolled_back = $this->content_v2_rollback( $post_id, $normalized );
+                $rolled_back = $this->content_v2_rollback( $post_id, $normalized, $postarr );
                 return $this->content_v2_error( $protocol, $operation, $this->content_v2_failure_code( $rolled_back ) );
             }
         }
         if ( ! empty( $normalized['post']['tags'] ) ) {
             $terms = wp_set_post_terms( $post_id, $normalized['post']['tags'], 'post_tag', false );
             if ( is_wp_error( $terms ) ) {
-                $rolled_back = $this->content_v2_rollback( $post_id, $normalized );
+                $rolled_back = $this->content_v2_rollback( $post_id, $normalized, $postarr );
                 return $this->content_v2_error( $protocol, $operation, $this->content_v2_failure_code( $rolled_back ) );
             }
         }
 
         $revision = $this->content_v2_post_revision( $post_id );
         if ( false === $revision ) {
-            $this->content_v2_rollback( $post_id, $normalized );
+            $this->content_v2_rollback( $post_id, $normalized, $postarr );
             return $this->content_v2_error( $protocol, $operation, 'outcome_unknown' );
         }
         $record['post_id']                   = $post_id;
@@ -1090,7 +1090,7 @@ class MainWP_Child_Posts { //phpcs:ignore -- NOSONAR - multi methods.
         $record['updated_at']                = time();
         $records[ $record['operation_ref'] ] = $record;
         if ( ! $this->content_v2_write_records( $protocol, $records ) || false === $wpdb->query( 'COMMIT' ) ) { // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
-            $this->content_v2_rollback( $post_id, $normalized );
+            $this->content_v2_rollback( $post_id, $normalized, $postarr );
             wp_cache_delete( $this->content_v2_option( $protocol ), 'options' );
             return $this->content_v2_error( $protocol, $operation, 'outcome_unknown' );
         }
@@ -1132,9 +1132,10 @@ class MainWP_Child_Posts { //phpcs:ignore -- NOSONAR - multi methods.
      *
      * @param int|null $post_id    Post touched inside the transaction, when one exists.
      * @param array    $normalized Valid normalized mutation.
+     * @param array    $postarr    Post fields this operation handed to wp_insert_post().
      * @return bool True when no trace of this operation survived, false when one did.
      */
-    private function content_v2_rollback( $post_id, $normalized ) {
+    private function content_v2_rollback( $post_id, $normalized, $postarr ) {
         global $wpdb;
 
         $touched = array_values(
@@ -1168,14 +1169,40 @@ class MainWP_Child_Posts { //phpcs:ignore -- NOSONAR - multi methods.
         // Whether the ROLLBACK landed is not knowable from its return value once a hook listener may
         // have closed the transaction under it, so the answer comes from storage instead. Only the
         // purge above makes that re-read honest - before it, the in-transaction row is still cached.
-        // An update target legitimately carries an earlier operation's stamp; only this one's ref
-        // means this write is what survived.
+        // The operation stamp cannot be that witness: wp_insert_post() drops what update_post_meta()
+        // returns, so a post the implicit commit made durable can be carrying no stamp at all, and
+        // an update target carries an earlier operation's stamp either way. Only the post row can
+        // say what is stored.
         foreach ( $touched as $id ) {
-            if ( ! ( get_post( $id ) instanceof \WP_Post ) ) {
+            $post = get_post( $id );
+            if ( ! $post instanceof \WP_Post ) {
                 continue;
             }
-            $stamp = get_post_meta( $id, '_mainwp_child_content_operation_v2', true );
-            if ( hash_equals( (string) $normalized['operation_ref'], (string) $stamp ) ) {
+            if ( 'update' !== $normalized['mode'] ) {
+                // Nothing but this operation's own insert could have created the row, so finding one
+                // still there is the whole trace.
+                return false;
+            }
+            // The target predates the operation, so only its stored fields say whose write is in
+            // place. Title, content and excerpt are where the payload carries content; the rest is
+            // low-entropy or rewritten on the way in (post_name is uniquified, the date localised),
+            // so it cannot tell this write apart from the one it replaced. One field still matching
+            // is taken as survival - a filter that rewrote a field during the insert is
+            // indistinguishable from a rollback, and outcome_unknown is the safe half of that
+            // ambiguity. An operation that meant to write nothing distinguishing leaves the two
+            // states indistinguishable as well, which is the same answer.
+            $distinguishing = 0;
+            foreach ( array( 'post_title', 'post_content', 'post_excerpt' ) as $field ) {
+                $intended = isset( $postarr[ $field ] ) ? (string) $postarr[ $field ] : '';
+                if ( '' === $intended ) {
+                    continue;
+                }
+                ++$distinguishing;
+                if ( $intended === (string) $post->$field ) {
+                    return false;
+                }
+            }
+            if ( 0 === $distinguishing ) {
                 return false;
             }
         }

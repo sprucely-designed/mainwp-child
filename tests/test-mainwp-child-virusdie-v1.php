@@ -269,6 +269,135 @@ class Test_MainWP_Child_Virusdie_V1 extends WP_UnitTestCase {
 	}
 
 	/**
+	 * This class holds no lane, so the sweep's read and its delete are separated by a window a
+	 * concurrent request can land in: the reference it judged is reclaimed and reserved again, and
+	 * the delete arrives after the fresh dispatch marker was written. A delete matched on the option
+	 * key alone would take that marker with it, leaving the request that wrote it an effect to
+	 * perform and no receipt to settle - and a retry against restored preconditions to perform it
+	 * twice. The filter puts this test inside that window: the sweep reads the value the racer
+	 * replaced, while the row already holds the replacement.
+	 */
+	public function test_a_receipt_row_rewritten_after_the_sweep_read_it_survives_the_delete() {
+		$subject                   = new Testable_MainWP_Child_Virusdie();
+		$subject->durable_receipts = true;
+		$subject->gateway_bytes    = '<?php // signed fixture';
+		$request                   = $this->install_request( $subject->gateway_bytes );
+		$key                       = 'mainwp_child_virusdie_v1_' . hash( 'sha256', $request['payload']['request_ref'] );
+		$raced                     = '123e4567-e89b-42d3-a456-426614175022';
+		$leaked                    = 'mainwp_child_virusdie_v1_' . hash( 'sha256', $raced );
+		$replacement               = $this->dispatching_receipt_row( $raced );
+		$this->assertTrue( add_option( $leaked, $replacement, '', false ) );
+		update_option( 'mainwp_child_virusdie_receipt_index', array( array( 'key' => $leaked, 'expires_at' => time() - 86400 ) ), false );
+		$stale = $this->expired_receipt( $raced );
+		$read  = static function () use ( $stale ) {
+			return $stale;
+		};
+		add_filter( "option_$leaked", $read );
+
+		$this->assertTrue( $subject->request_v1( $request )['ok'] );
+
+		remove_filter( "option_$leaked", $read );
+		$this->assertSame( $replacement, $this->cold_option( $leaked ) );
+		// Nothing was reclaimed, so the entry stays where a refused predicate would leave it.
+		$this->assertContains( $leaked, wp_list_pluck( get_option( 'mainwp_child_virusdie_receipt_index', array() ), 'key' ) );
+
+		delete_option( $key );
+		delete_option( $leaked );
+		delete_option( 'mainwp_child_virusdie_receipt_index' );
+	}
+
+	/**
+	 * add() can never write past the cap, so an index longer than any cap could produce was put
+	 * there by a hand edit, a partial restore or corruption. Reading it entry by entry is unbounded
+	 * work on a path that has an effect to reserve, and refusing over it is not on the table either.
+	 */
+	public function test_an_index_beyond_the_ceiling_is_discarded_rather_than_walked() {
+		$subject                   = new Testable_MainWP_Child_Virusdie();
+		$subject->durable_receipts = true;
+		$subject->gateway_bytes    = '<?php // signed fixture';
+		$request                   = $this->install_request( $subject->gateway_bytes );
+		$key                       = 'mainwp_child_virusdie_v1_' . hash( 'sha256', $request['payload']['request_ref'] );
+		$oversized                 = array();
+		for ( $entry = 0; $entry <= MainWP_Child_Receipt_Index::RAW_ENTRY_CEILING; ++$entry ) {
+			$oversized[] = array(
+				'key'        => 'mainwp_child_virusdie_v1_' . hash( 'sha256', 'filler-' . $entry ),
+				'expires_at' => time() + 86400,
+			);
+		}
+		update_option( 'mainwp_child_virusdie_receipt_index', $oversized, false );
+
+		$result = $subject->request_v1( $request );
+
+		$this->assertTrue( $result['ok'] );
+		$this->assertSame( 1, $subject->installs );
+		// Discarded whole and written over, rather than normalized down to the cap one entry at a time.
+		$this->assertSame( array( $key ), wp_list_pluck( get_option( 'mainwp_child_virusdie_receipt_index', array() ), 'key' ) );
+
+		delete_option( $key );
+		delete_option( 'mainwp_child_virusdie_receipt_index' );
+	}
+
+	/**
+	 * Index work is where a poisoned index makes a request die, and a request that dies after
+	 * reserving leaves a marker nothing can settle - which every later request under that reference
+	 * then reads. Sweeping before the reservation exists keeps a fatal in here from stranding one.
+	 */
+	public function test_the_sweep_runs_before_the_request_reserves_its_own_receipt() {
+		global $wpdb;
+		$subject                   = new Testable_MainWP_Child_Virusdie();
+		$subject->durable_receipts = true;
+		$subject->gateway_bytes    = '<?php // signed fixture';
+		$request                   = $this->install_request( $subject->gateway_bytes );
+		$key                       = 'mainwp_child_virusdie_v1_' . hash( 'sha256', $request['payload']['request_ref'] );
+		$raced                     = '123e4567-e89b-42d3-a456-426614175023';
+		$leaked                    = 'mainwp_child_virusdie_v1_' . hash( 'sha256', $raced );
+		$this->assertTrue( add_option( $leaked, $this->expired_receipt( $raced ), '', false ) );
+		update_option( 'mainwp_child_virusdie_receipt_index', array( array( 'key' => $leaked, 'expires_at' => time() - 86400 ) ), false );
+		$reserved = null;
+		$probe    = static function ( $value ) use ( &$reserved, $key, $wpdb ) {
+			$reserved = (int) $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM $wpdb->options WHERE option_name = %s", $key ) );
+			return $value;
+		};
+		add_filter( "option_$leaked", $probe );
+
+		$this->assertTrue( $subject->request_v1( $request )['ok'] );
+
+		remove_filter( "option_$leaked", $probe );
+		$this->assertSame( 0, $reserved );
+		$this->assertNull( $this->cold_option( $leaked ) );
+
+		delete_option( $key );
+		delete_option( 'mainwp_child_virusdie_receipt_index' );
+	}
+
+	/**
+	 * Every key this class writes is its prefix followed by a sha256 of the request reference, so a
+	 * key that only shares the prefix names a row this class never wrote. The index stops tracking
+	 * it and nothing is deleted, because dropping an entry is bookkeeping and deleting a foreign row
+	 * is not.
+	 */
+	public function test_an_indexed_key_that_is_not_a_receipt_key_is_dropped_rather_than_deleted() {
+		$subject                   = new Testable_MainWP_Child_Virusdie();
+		$subject->durable_receipts = true;
+		$subject->gateway_bytes    = '<?php // signed fixture';
+		$request                   = $this->install_request( $subject->gateway_bytes );
+		$key                       = 'mainwp_child_virusdie_v1_' . hash( 'sha256', $request['payload']['request_ref'] );
+		$foreign                   = 'mainwp_child_virusdie_v1_retention_settings';
+		$stored                    = $this->expired_receipt( '123e4567-e89b-42d3-a456-426614175024' );
+		$this->assertTrue( add_option( $foreign, $stored, '', false ) );
+		update_option( 'mainwp_child_virusdie_receipt_index', array( array( 'key' => $foreign, 'expires_at' => time() - 86400 ) ), false );
+
+		$this->assertTrue( $subject->request_v1( $request )['ok'] );
+
+		$this->assertSame( $stored, $this->cold_option( $foreign ) );
+		$this->assertSame( array( $key ), wp_list_pluck( get_option( 'mainwp_child_virusdie_receipt_index', array() ), 'key' ) );
+
+		delete_option( $key );
+		delete_option( $foreign );
+		delete_option( 'mainwp_child_virusdie_receipt_index' );
+	}
+
+	/**
 	 * Read one option past the request-local cache.
 	 *
 	 * update_option() primes that cache, so a row asserted straight after a write reads back from
@@ -362,6 +491,22 @@ class Test_MainWP_Child_Virusdie_V1 extends WP_UnitTestCase {
 			),
 			'updated_at'      => time() - 172800,
 			'expires_at'      => time() - 86400,
+		);
+	}
+
+	/** The row a request writes the moment it reserves a reference, before any effect is performed. */
+	private function dispatching_receipt_row( $ref ) {
+		return array(
+			'effect_hash'     => str_repeat( 'd', 64 ),
+			'operation'       => 'install',
+			'request_ref'     => $ref,
+			'basename'        => 'virusdie_fixture.php',
+			'expected_sha256' => str_repeat( 'e', 64 ),
+			'site_generation' => str_repeat( 'a', 64 ),
+			'state'           => 'dispatching',
+			'result'          => null,
+			'updated_at'      => time(),
+			'expires_at'      => time() + 86400,
 		);
 	}
 

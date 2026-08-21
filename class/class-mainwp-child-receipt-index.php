@@ -29,6 +29,19 @@ if ( ! defined( 'ABSPATH' ) ) {
 class MainWP_Child_Receipt_Index {
 
     /**
+     * Stored elements above which an index is discarded instead of read entry by entry.
+     *
+     * Nothing this class writes can exceed the cap its caller passes, so an array this long was put
+     * there by a hand edit, a partial restore or corruption, and walking it would put unbounded
+     * work on a mutation path that has already reserved its effect. Counting an array is O(1), so
+     * the guard costs nothing. It bounds the traversal only: get_option() has already unserialized
+     * whatever was stored by the time this class sees it.
+     *
+     * @var int
+     */
+    const RAW_ENTRY_CEILING = 2000;
+
+    /**
      * Option-key prefix every indexed row has to carry.
      *
      * @var string
@@ -101,7 +114,7 @@ class MainWP_Child_Receipt_Index {
             // again since it was indexed, and a row nothing can parse is still evidence a resent
             // request needs, which is why a predicate that says no keeps the entry as well as the
             // row. A delete that did not take leaves both standing for the same reason.
-            if ( true !== $reclaimable( $value ) || ! delete_option( $entry['key'] ) ) {
+            if ( true !== $reclaimable( $value ) || ! $this->delete_matched( $entry['key'], $value ) ) {
                 $kept[] = $entry;
                 continue;
             }
@@ -121,14 +134,16 @@ class MainWP_Child_Receipt_Index {
      * option row: the row it might have named simply stops being tracked, which is the leak this
      * class exists to reduce and never a deletion. An index that will not read at all is treated
      * as empty and written over, because refusing on behalf of an unreadable one would stall every
-     * mutation behind it.
+     * mutation behind it. An index holding more elements than any cap could have produced is
+     * discarded the same way, for the same reason: normalizing it entry by entry is the unbounded
+     * work, not the refusal.
      *
      * @param string $index_option Option holding this protocol's index.
      * @return array Validated entries in insertion order.
      */
     private function entries( $index_option ) {
         $stored = get_option( $index_option, array() );
-        if ( ! is_array( $stored ) ) {
+        if ( ! is_array( $stored ) || self::RAW_ENTRY_CEILING < count( $stored ) ) {
             return array();
         }
         $entries = array();
@@ -147,13 +162,67 @@ class MainWP_Child_Receipt_Index {
      * Whether one key belongs to the namespace this index was bound to.
      *
      * An empty prefix would make every row in the options table look like this protocol's own, so
-     * it matches nothing at all.
+     * it matches nothing at all. Every key an owner can actually write is its prefix followed by a
+     * sha256 of the request reference, so anything else under the prefix is a row this class did
+     * not write and has no business handing to an owner's delete predicate. The length bound stays
+     * because the prefix is the part this class is handed rather than derived.
      *
      * @param mixed $option_key Candidate option key.
      * @return bool
      */
     private function own_key( $option_key ) {
-        return '' !== $this->prefix && is_string( $option_key ) && 191 >= strlen( $option_key ) && 0 === strpos( $option_key, $this->prefix );
+        return '' !== $this->prefix && is_string( $option_key ) && 191 >= strlen( $option_key ) && 1 === preg_match( '/^' . preg_quote( $this->prefix, '/' ) . '[a-f0-9]{64}$/D', $option_key );
+    }
+
+    /**
+     * Delete one row only while it still holds the exact value the owner judged.
+     *
+     * Core's delete_option() matches the option key alone, so a delete decided from a value read a
+     * moment earlier lands on whatever has since been written under the same reference. A
+     * reference is one-shot, so what lands there is a fresh dispatch marker: dropping that leaves
+     * the request which wrote it holding an effect to perform and no receipt to settle, and a later
+     * retry against restored preconditions performs the effect again. Two of the three owners hold
+     * a lane around their mutation and one does not, and the index cannot tell which is calling.
+     *
+     * The stored column carries the serialized form, so the value read back has to be serialized
+     * again to compare against it.
+     *
+     * @param string $option_key Row to delete.
+     * @param mixed  $value      Value the owner judged, exactly as it was read.
+     * @return bool Whether that exact row went.
+     */
+    private function delete_matched( $option_key, $value ) {
+        global $wpdb;
+        // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- delete_option() cannot condition on the value, which is the whole judgement here.
+        $deleted = $wpdb->query( $wpdb->prepare( "DELETE FROM $wpdb->options WHERE option_name = %s AND option_value = %s", $option_key, maybe_serialize( $value ) ) );
+        $this->forget_option_cache( $option_key );
+        return 1 === (int) $deleted;
+    }
+
+    /**
+     * Correct the options cache for a row deleted behind the options API.
+     *
+     * Core's delete_option() maintains these buckets and a direct query does not, so a row that has
+     * gone keeps answering every later get_option() in the request out of the cache or the
+     * alloptions bucket - including the owner's own status read, which would replay a receipt that
+     * is no longer there. The notoptions entry is cleared alongside them so the three cannot
+     * disagree about the same key. Only the key that was deleted is dropped, the way core corrects
+     * the buckets, because flushing them would cost every option the request has already loaded.
+     *
+     * @param string $option_key Key whose cached state is now wrong.
+     */
+    private function forget_option_cache( $option_key ) {
+        wp_cache_delete( $option_key, 'options' );
+        $alloptions = wp_cache_get( 'alloptions', 'options' );
+        if ( is_array( $alloptions ) && isset( $alloptions[ $option_key ] ) ) {
+            unset( $alloptions[ $option_key ] );
+            wp_cache_set( 'alloptions', $alloptions, 'options' );
+        }
+        $notoptions = wp_cache_get( 'notoptions', 'options' );
+        if ( is_array( $notoptions ) && isset( $notoptions[ $option_key ] ) ) {
+            unset( $notoptions[ $option_key ] );
+            wp_cache_set( 'notoptions', $notoptions, 'options' );
+        }
     }
 
     /**

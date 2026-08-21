@@ -990,7 +990,23 @@ class MainWP_Child_Maintenance {
         if ( 0 >= $limit ) {
             return time() + self::ABILITIES_V2_REVISION_SWEEP_BUDGET;
         }
-        return time() + max( 1, min( self::ABILITIES_V2_REVISION_SWEEP_BUDGET, $limit - self::ABILITIES_V2_REVISION_SWEEP_MARGIN ) );
+        global $timestart;
+        // The limit bounds the whole request, not this method: request validation, the preview and
+        // any earlier action already spent part of it. Granting the sweep the full limit puts the
+        // deadline behind the fatal it exists to prevent, so what is left of the request is what it
+        // gets. WordPress stamps the request start into $timestart as a float; a value that is
+        // missing, not numeric, not positive or in the future is a host that moved the clock or
+        // never loaded wp-settings, and that is no reason to refuse a sweep - elapsed counts as
+        // nothing there and the deadline is the whole limit again, as it was before.
+        $now     = microtime( true );
+        $elapsed = 0;
+        if ( is_numeric( $timestart ) && 0 < $timestart && $timestart <= $now ) {
+            $elapsed = $now - (float) $timestart;
+        }
+        // Floored at a second, as the budget already was: a request that has spent its limit before
+        // the sweep starts still does one bounded batch and settles, instead of every such request
+        // answering unknown with nothing destroyed.
+        return time() + max( 1, (int) min( self::ABILITIES_V2_REVISION_SWEEP_BUDGET, $limit - $elapsed - self::ABILITIES_V2_REVISION_SWEEP_MARGIN ) );
     }
 
     /**

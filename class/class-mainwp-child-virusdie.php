@@ -202,31 +202,32 @@ class MainWP_Child_Virusdie {
 
     /** Reserve a request exactly once. */
     protected function create_receipt( $request_ref, $receipt ) {
-        if ( ! $this->valid_receipt( $receipt ) || ! add_option( $this->receipt_key( $request_ref ), $receipt, '', false ) || $receipt !== $this->load_receipt( $request_ref ) ) {
+        if ( ! $this->valid_receipt( $receipt ) ) {
             return false;
         }
-        $this->reclaim_retained_receipts( $this->receipt_key( $request_ref ), $receipt['expires_at'] );
+        $this->sweep_retained_receipts();
+        if ( ! add_option( $this->receipt_key( $request_ref ), $receipt, '', false ) || $receipt !== $this->load_receipt( $request_ref ) ) {
+            return false;
+        }
+        $this->record_retained_receipt( $this->receipt_key( $request_ref ), $receipt['expires_at'] );
         return true;
     }
 
     /**
-     * Reclaim a few rows nobody came back for, then record the one this request just wrote.
+     * Reclaim a few rows nobody came back for.
      *
      * A request reference is one-shot, so the eviction on the mutation path above only ever reaches
      * the reference the current request names; every other row sits there until the site is torn
      * down. Finding them means either a prefix scan of wp_options, which is unindexed and would run
      * on the hot mutation path, or an index of the keys this class wrote.
      *
-     * Neither half may change this request's answer. The index is advisory and its failures are
-     * ignored, and the sweep deletes only rows this class's own predicate has already judged
-     * forgettable - the same judgement the eviction above makes, on rows whose retention ran out
-     * without a Dashboard ever asking again. Sweeping before recording keeps the row just written
-     * out of this request's own budget.
-     *
-     * @param string $option_key Receipt key this request wrote.
-     * @param int    $expires_at Retention moment stored on it.
+     * This may not change the request's answer, and it runs before the reservation exists so that a
+     * fatal in here leaves nothing reserved: a request that died holding a marker it can never
+     * settle would poison the same index for every request after it. The sweep deletes only rows
+     * this class's own predicate has already judged forgettable - the same judgement the eviction
+     * above makes, on rows whose retention ran out without a Dashboard ever asking again.
      */
-    private function reclaim_retained_receipts( $option_key, $expires_at ) {
+    private function sweep_retained_receipts() {
         $index = new MainWP_Child_Receipt_Index( self::RECEIPT_PREFIX );
         $index->sweep(
             self::RECEIPT_INDEX_OPTION,
@@ -235,6 +236,20 @@ class MainWP_Child_Virusdie {
                 return $this->valid_receipt( $value ) && $this->receipt_expired( $value );
             }
         );
+    }
+
+    /**
+     * Record the row this request just wrote, so a later mutation can find it.
+     *
+     * Recording happens after the write because only then is the key known to name a row. The index
+     * is advisory and its failure is ignored: a mutation that has already reserved its effect is
+     * never refused over bookkeeping.
+     *
+     * @param string $option_key Receipt key this request wrote.
+     * @param int    $expires_at Retention moment stored on it.
+     */
+    private function record_retained_receipt( $option_key, $expires_at ) {
+        $index = new MainWP_Child_Receipt_Index( self::RECEIPT_PREFIX );
         $index->add( self::RECEIPT_INDEX_OPTION, $option_key, $expires_at, self::RECEIPT_INDEX_CAP );
     }
 

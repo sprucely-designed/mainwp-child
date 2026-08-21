@@ -974,6 +974,33 @@ class Test_MainWP_Child_Timecapsule_V2 extends WP_UnitTestCase {
 		$this->assertArrayHasKey( '123e4567-e89b-42d3-a456-426614174981', $stored );
 	}
 
+	/**
+	 * A store keyed by references nothing can address after folding must still be reclaimable.
+	 *
+	 * A reference is folded to lowercase before it keys a receipt, so an uppercase key is
+	 * unreachable however well formed it looks. Held live it refuses every later mutation.
+	 */
+	public function test_full_store_of_noncanonical_uppercase_keys_is_reclaimed() {
+		$fixture  = $this->backup_fixture();
+		$receipts = array();
+		for ( $index = 0; $index < 100; $index++ ) {
+			$receipts[ sprintf( '123E4567-E89B-42D3-A456-42661417%04X', $index ) ] = array(
+				'effect_hash' => str_repeat( 'a', 64 ),
+				'state'       => 'dispatching',
+				'response'    => null,
+				'created_at'  => PHP_INT_MAX,
+			);
+		}
+		update_option( 'mainwp_timecapsule_abilities_v2_receipts', $receipts, false );
+
+		$result = $fixture->abilities_v2( $this->receipt_backup_request( '123e4567-e89b-42d3-a456-426614174982' ) );
+		$stored = get_option( 'mainwp_timecapsule_abilities_v2_receipts', array() );
+
+		$this->assertTrue( $result['ok'], 'a store nothing can address must not refuse forever' );
+		$this->assertCount( 1, $fixture->calls );
+		$this->assertArrayHasKey( '123e4567-e89b-42d3-a456-426614174982', $stored );
+	}
+
 	/** @return Timecapsule_V2_Protocol_Fixture */
 	private function backup_fixture() {
 		$fixture                          = new Timecapsule_V2_Protocol_Fixture();

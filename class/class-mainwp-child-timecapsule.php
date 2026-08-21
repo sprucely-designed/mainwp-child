@@ -620,11 +620,13 @@ class MainWP_Child_Timecapsule { //phpcs:ignore -- NOSONAR - multi methods.
         $repaired  = false;
         $evictable = array();
         foreach ( $receipts as $reference => $receipt ) {
-            if ( ! $this->abilities_v2_valid_request_ref( $reference ) ) {
+            if ( ! $this->abilities_v2_valid_request_ref( $reference ) || strtolower( $reference ) !== $reference ) {
                 // No request can present a reference this store would refuse, so nothing will ever
                 // come back for this entry. It is evidence for nobody, and dropping it is what
                 // keeps a store of junk keys from holding every later mutation shut. Array keys are
                 // not always strings either, so this is also what stops one being compared as one.
+                // A reference is folded to lowercase before it keys a receipt here, so an uppercase
+                // key is equally unreachable however well formed it looks: every lookup folds first.
                 $evictable[ $reference ] = 0;
                 continue;
             }

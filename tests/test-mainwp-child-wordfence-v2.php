@@ -536,6 +536,33 @@ class Test_MainWP_Child_Wordfence_V2 extends WP_UnitTestCase {
 		$this->assertSame( array(), $fixture->calls, 'a reference with any stored entry must not reach the provider again' );
 	}
 
+	/**
+	 * A store keyed by references nothing can address after folding must still be reclaimable.
+	 *
+	 * A reference is folded to lowercase before it keys a receipt, so an uppercase key is
+	 * unreachable however well formed it looks. Held live it refuses every later mutation.
+	 */
+	public function test_full_store_of_noncanonical_uppercase_keys_is_reclaimed() {
+		$fixture  = $this->blocks_fixture();
+		$receipts = array();
+		for ( $index = 0; $index < 100; $index++ ) {
+			$receipts[ sprintf( '123E4567-E89B-42D3-A456-42661417%04X', $index ) ] = array(
+				'effect_hash' => str_repeat( 'a', 64 ),
+				'state'       => 'dispatching',
+				'response'    => null,
+				'created_at'  => PHP_INT_MAX,
+			);
+		}
+		update_option( 'mainwp_wordfence_abilities_v2_receipts', $receipts, false );
+
+		$result = $fixture->abilities_v2( $this->blocks_request( '123e4567-e89b-42d3-a456-426614174626' ) );
+		$stored = get_option( 'mainwp_wordfence_abilities_v2_receipts', array() );
+
+		$this->assertTrue( $result['ok'], 'a store nothing can address must not refuse forever' );
+		$this->assertCount( 1, $fixture->calls );
+		$this->assertArrayHasKey( '123e4567-e89b-42d3-a456-426614174626', $stored );
+	}
+
 	/** @param array $request Blocks request. @param int $created_at Stamp. @return array */
 	private function reservation( $request, $created_at ) {
 		return array(

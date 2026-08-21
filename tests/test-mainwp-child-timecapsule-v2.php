@@ -769,22 +769,21 @@ class Test_MainWP_Child_Timecapsule_V2 extends WP_UnitTestCase {
 	}
 
 	/**
-	 * A tombstone is stamped once, and a clock that moved backwards does not restart its clock.
+	 * A tombstone this clock cannot date is re-dated, so the store still ages out.
 	 *
-	 * Re-observing an entry the store already tombstoned must leave the stamp alone. Rebuilding it
-	 * would refuse to salvage a stamp that now reads as future-dated and would write today's date
-	 * instead, so an entry on a drifting host would never grow old enough to be given up.
+	 * Keeping the stamp would leave an entry no clock ever reaches, and one of those in a full
+	 * store refuses every mutation from then on with nothing an operator could do. Re-dating it
+	 * costs nothing: the reference behind it still refuses, and now the entry can grow old.
 	 */
-	public function test_an_existing_tombstone_is_not_restamped_when_the_clock_moves_backwards() {
+	public function test_a_tombstone_this_clock_cannot_date_is_redated_rather_than_held_forever() {
 		$fixture                 = $this->backup_fixture();
 		$receipts                = $this->fill_receipts( 99, time() );
 		$tombstoned              = '123e4567-e89b-42d3-a456-4266141749e0';
-		$ahead                   = time() + ( 2 * DAY_IN_SECONDS );
 		$receipts[ $tombstoned ] = array(
 			'effect_hash' => str_repeat( '0', 64 ),
 			'state'       => 'unreadable',
 			'response'    => null,
-			'created_at'  => $ahead,
+			'created_at'  => PHP_INT_MAX,
 		);
 		update_option( 'mainwp_timecapsule_abilities_v2_receipts', $receipts, false );
 
@@ -793,7 +792,59 @@ class Test_MainWP_Child_Timecapsule_V2 extends WP_UnitTestCase {
 
 		$this->assertFalse( $refused['ok'] );
 		$this->assertSame( 'storage_unavailable', $refused['code'] );
-		$this->assertSame( $ahead, $stored[ $tombstoned ]['created_at'], 'an entry already tombstoned keeps the stamp it was given' );
+		$this->assertLessThanOrEqual( time(), $stored[ $tombstoned ]['created_at'], 'a stamp no clock reaches has to be replaced with one that ages' );
+
+		// Proof that it now ages out: only the clock changes and the entry becomes the one given up.
+		$stored[ $tombstoned ]['created_at'] = time() - ( DAY_IN_SECONDS + 3600 );
+		update_option( 'mainwp_timecapsule_abilities_v2_receipts', $stored, false );
+
+		$this->assertTrue( $fixture->abilities_v2( $this->receipt_backup_request( '123e4567-e89b-42d3-a456-42661417497e' ) )['ok'] );
+		$this->assertArrayNotHasKey( $tombstoned, get_option( 'mainwp_timecapsule_abilities_v2_receipts', array() ) );
+	}
+
+	/**
+	 * A stamp the tombstone builder rejects must not be taken as a sound tombstone.
+	 *
+	 * A nonsense stamp sorts to the front of the disposable list, so an entry that is still the
+	 * only evidence its reference already ran gets given up to an unrelated request.
+	 */
+	public function test_a_tombstone_with_an_impossible_stamp_is_rebuilt_rather_than_evicted() {
+		$fixture                 = $this->backup_fixture();
+		$receipts                = $this->fill_receipts( 99, time() );
+		$tombstoned              = '123e4567-e89b-42d3-a456-4266141749e1';
+		$receipts[ $tombstoned ] = array(
+			'effect_hash' => str_repeat( '0', 64 ),
+			'state'       => 'unreadable',
+			'response'    => null,
+			'created_at'  => -1,
+		);
+		update_option( 'mainwp_timecapsule_abilities_v2_receipts', $receipts, false );
+
+		$refused = $fixture->abilities_v2( $this->receipt_backup_request( '123e4567-e89b-42d3-a456-42661417497f' ) );
+		$stored  = get_option( 'mainwp_timecapsule_abilities_v2_receipts', array() );
+
+		$this->assertFalse( $refused['ok'] );
+		$this->assertSame( array(), $fixture->calls );
+		$this->assertArrayHasKey( $tombstoned, $stored, 'an impossible stamp is not proof the entry is past the horizon' );
+		$this->assertGreaterThan( 0, $stored[ $tombstoned ]['created_at'] );
+	}
+
+	/**
+	 * A reference whose stored entry is null still refuses rather than backing up again.
+	 *
+	 * isset() reads a key holding null as absent, and the key existing at all is the evidence
+	 * that something wrote a receipt for that reference.
+	 */
+	public function test_a_null_entry_under_a_reference_refuses_rather_than_dispatching() {
+		$fixture = $this->backup_fixture();
+		$request = $this->receipt_backup_request( '123e4567-e89b-42d3-a456-426614174980' );
+		update_option( 'mainwp_timecapsule_abilities_v2_receipts', array( $request['request_ref'] => null ), false );
+
+		$result = $fixture->abilities_v2( $request );
+
+		$this->assertFalse( $result['ok'] );
+		$this->assertSame( 'storage_unavailable', $result['code'] );
+		$this->assertSame( array(), $fixture->calls, 'a reference with any stored entry must not reach the provider again' );
 	}
 
 	/** A hash the store cannot read is a corrupt store, not a different request. */

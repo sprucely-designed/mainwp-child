@@ -449,7 +449,9 @@ class MainWP_Child_Timecapsule { //phpcs:ignore -- NOSONAR - multi methods.
             if ( ! is_array( $receipts ) ) {
                 return $this->abilities_v2_error( $operation, 'storage_unavailable' );
             }
-            if ( isset( $receipts[ $request_ref ] ) ) {
+            // A key holding null is still evidence that something wrote a receipt for this
+            // reference, and isset() reads it as absent. Missing it starts a second backup.
+            if ( array_key_exists( $request_ref, $receipts ) ) {
                 $receipt = $receipts[ $request_ref ];
                 if ( ! $this->abilities_v2_valid_receipt( $receipt ) ) {
                     return $this->abilities_v2_error( $operation, 'storage_unavailable' );
@@ -618,16 +620,23 @@ class MainWP_Child_Timecapsule { //phpcs:ignore -- NOSONAR - multi methods.
         $repaired  = false;
         $evictable = array();
         foreach ( $receipts as $reference => $receipt ) {
-            if ( ! $this->abilities_v2_valid_receipt( $receipt ) && ! $this->abilities_v2_tombstone( $receipt ) ) {
+            if ( ! $this->abilities_v2_valid_receipt( $receipt ) ) {
                 // An entry nobody can read is still evidence that something wrote a receipt for
                 // that reference, so its backup or restore may already have run. Giving it up to
                 // make room for an unrelated request is how a reference loses its only evidence
                 // and runs a second time on its next retry. Rebuilt as a tombstone it keeps
                 // failing the receipt check, so its own reference still answers
                 // storage_unavailable, while gaining a date this store can act on.
-                $receipt                = $this->abilities_v2_tombstone_record( $receipt );
-                $receipts[ $reference ] = $receipt;
-                $repaired               = true;
+                // Rebuilding it and keeping the result only when it differs makes the builder the
+                // single definition of a tombstone. A separate "is this already a tombstone"
+                // check would be a second definition, and the two drifting apart is how an entry
+                // with an impossible stamp gets treated as sound and holds the store shut.
+                $rebuilt = $this->abilities_v2_tombstone_record( $receipt );
+                if ( $rebuilt !== $receipt ) {
+                    $receipts[ $reference ] = $rebuilt;
+                    $repaired               = true;
+                }
+                $receipt = $rebuilt;
             }
             // Eviction may only give up an entry it can prove is past the retry horizon, which is
             // the same question a replay asks of a reservation. Asking it once is what stops
@@ -654,26 +663,15 @@ class MainWP_Child_Timecapsule { //phpcs:ignore -- NOSONAR - multi methods.
     }
 
     /**
-     * Whether an entry is already the dated tombstone of an unreadable receipt.
-     *
-     * @param mixed $receipt Stored entry.
-     * @return bool
-     */
-    private function abilities_v2_tombstone( $receipt ) {
-        return is_array( $receipt )
-            && $this->abilities_v2_exact_keys( $receipt, array( 'effect_hash', 'state', 'response', 'created_at' ) )
-            && 'unreadable' === $receipt['state']
-            && is_int( $receipt['created_at'] );
-    }
-
-    /**
      * Rebuild one unreadable entry as a dated tombstone under the same reference.
      *
      * Keeping the reference is what stops its retry from starting a second backup. What the
      * damaged entry no longer proves is the outcome, so nothing about the effect survives: no
      * effect hash a request could match, and no response to replay. Its own stamp is kept where
      * it still reads, so an entry written by an older build ages out on the date it was written
-     * rather than on the date this store first failed to read it.
+     * rather than on the date this store first failed to read it. A stamp this clock cannot date
+     * is replaced instead: keeping it would leave an entry no clock ever passes, and one of those
+     * in a full store refuses every mutation from then on with nothing an operator can do.
      *
      * @param mixed $receipt Unreadable entry.
      * @return array Dated tombstone.

@@ -537,13 +537,13 @@ class MainWP_Child_Back_WP_Up { //phpcs:ignore -- NOSONAR - multi methods.
             $log_items          = array();
             $can_advance_cursor = true;
             foreach ( $logfiles as $mtime => $logfile ) {
-                $log_path = false !== strpos( $logfile, '/' ) ? $logfile : $log_folder . '/' . $logfile;
+                $log_path   = false !== strpos( $logfile, '/' ) ? $logfile : $log_folder . '/' . $logfile;
                 $file_mtime = filemtime( $log_path );
                 if ( false === $file_mtime || $file_mtime < $scan_from || $file_mtime > $scan_until ) {
                     continue;
                 }
 
-                $meta     = \BackWPup_Job::read_logheader( $log_path );
+                $meta = \BackWPup_Job::read_logheader( $log_path );
                 if ( ! is_array( $meta ) || ! isset( $meta['logtime'], $meta['type'] ) || '' === (string) $meta['type'] ) {
                     $can_advance_cursor = false;
                     continue;
@@ -1415,35 +1415,76 @@ class MainWP_Child_Back_WP_Up { //phpcs:ignore -- NOSONAR - multi methods.
     }
 
     /**
+     * Determine whether the installed BackWPup supports the modern job API.
+     *
+     * Older releases use the Page Jobs handlers and read values from $_GET.
+     * Newer releases expose get_jobrun_url() and use filter_input() internally.
+     *
+     * @return bool True when the legacy Page Jobs flow is required.
+     */
+    protected function use_legacy_backwpup_handler() {
+        return ! method_exists( '\BackWPup_Job', 'get_jobrun_url' );
+    }
+
+    /**
      * BackWPup Ajax Working.
      *
      * @uses MainWP_Child_Back_WP_Up::wp_list_table_dependency()
-     * @uses \BackWPup_Page_Jobs::ajax_working()
+     * @uses \BackWPup_Option::get()
+     * @uses MainWP_Utility::get_lasttime_backup()
      *
      * @return array Return success array[ success, response ]
      */
     protected function ajax_working() {
         // phpcs:disable WordPress.Security.NonceVerification.Missing, WordPress.Security.ValidatedSanitizedInput.MissingUnslash, WordPress.Security.ValidatedSanitizedInput.InputNotSanitized
-        if ( ! isset( $_POST['settings'] ) || ! is_array( $_POST['settings'] )
-            || ! isset( $_POST['settings']['logfile'] ) || ! isset( $_POST['settings']['logpos'] )
-            || ! isset( $_POST['settings']['job_id'] )
-        ) {
-            return array( 'error' => esc_html__( 'Missing logfile or logpos.', 'mainwp-child' ) );
+        $settings = $_POST['settings'] ?? array();
+        if ( ! is_array( $settings ) || ! isset( $settings['logfile'], $settings['logpos'], $settings['job_id'] ) ) {
+            return array(
+                'error' => esc_html__( 'Missing logfile, logpos or job_id.', 'mainwp-child' ),
+            );
         }
 
         // Get job log file.
-        $job_id      = $_POST['settings']['job_id'] ?? 0;
+        $job_id      = absint( $settings['job_id'] );
         $job_logfile = \BackWPup_Option::get( $job_id, 'logfile' );
         $logfile     = basename( $job_logfile );
 
-        $_GET['logfile']      = ! empty( $_POST['settings']['logfile'] ) ? wp_unslash( $_POST['settings']['logfile'] ) : $logfile;
-        $_GET['logpos']       = ! empty( $_POST['settings']['logpos'] ) && 0 !== intval( $_POST['settings']['logpos'] ) ? wp_unslash( $_POST['settings']['logpos'] ) : '';
-        $_REQUEST['_wpnonce'] = wp_create_nonce( 'backwpupworking_ajax_nonce' );
-
         $this->wp_list_table_dependency();
-        // We do this in order to not die when using wp_die.
-        if ( ! defined( 'DOING_AJAX' ) ) {
 
+        $logfile = ! empty( $settings['logfile'] ) ? basename( wp_unslash( $settings['logfile'] ) ) : $logfile;
+        $logpos  = ! empty( $settings['logpos'] ) ? absint( wp_unslash( $settings['logpos'] ) ) : 0;
+
+        $output = $this->use_legacy_backwpup_handler() ? $this->ajax_working_legacy( $logfile, $logpos ) : $this->get_backwpup_working_response( $logfile, $logpos );
+
+        // Get last backup time.
+        $lastbackup = MainWP_Utility::get_lasttime_backup( 'backwpup' );
+        // phpcs:enable WordPress.Security.NonceVerification.Missing, WordPress.Security.ValidatedSanitizedInput.MissingUnslash, WordPress.Security.ValidatedSanitizedInput.InputNotSanitized
+        return array(
+            'success'    => 1,
+            'response'   => $output,
+            'lastbackup' => $lastbackup,
+        );
+    }
+
+    /**
+     * Backup working using the legacy BackWPup handler.
+     *
+     * @param string $logfile Log file basename.
+     * @param int    $logpos  Current log position.
+     * @uses \BackWPup_Page_Jobs::ajax_working()
+     *
+     * @return string Buffered response from BackWPup.
+     * @throws \Throwable Throws any exception that occurs during the execution of the BackWPup ajax_working() method.
+     */
+    private function ajax_working_legacy( $logfile, $logpos ) {
+        $_GET['logfile'] = $logfile;
+        $_GET['logpos']  = $logpos;
+
+        $ajax_nonce              = wp_create_nonce( 'backwpupworking_ajax_nonce' );
+        $_REQUEST['_ajax_nonce'] = $ajax_nonce;
+        $_REQUEST['_wpnonce']    = $ajax_nonce;
+
+        if ( ! defined( 'DOING_AJAX' ) ) {
             /**
              * Checks whether ajax job is in progress.
              *
@@ -1457,25 +1498,154 @@ class MainWP_Child_Back_WP_Up { //phpcs:ignore -- NOSONAR - multi methods.
         remove_filter( 'wp_die_ajax_handler', '_ajax_wp_die_handler' );
 
         ob_start();
-        \BackWPup_Page_Jobs::ajax_working();
-        $output = ob_get_contents();
-        ob_end_clean();
-        // Get last backup time.
-        $lastbackup = MainWP_Utility::get_lasttime_backup( 'backwpup' );
-        // phpcs:enable WordPress.Security.NonceVerification.Missing, WordPress.Security.ValidatedSanitizedInput.MissingUnslash, WordPress.Security.ValidatedSanitizedInput.InputNotSanitized
+        try {
+            \BackWPup_Page_Jobs::ajax_working();
+            return ob_get_clean();
+        } catch ( \Throwable $e ) {
+            ob_end_clean();
+            throw $e;
+        }
+    }
+
+    /**
+     * Build the BackWPup working response without making a loopback HTTP request.
+     *
+     * @param string $logfile Log file basename.
+     * @param int    $logpos  Current log position.
+     *
+     * @uses \BackWPup_File::get_absolute_path()
+     * @uses \WPMedia\BackWPup\Log\LogFacade()
+     *
+     * @return string JSON-encoded working response.
+     */
+    protected function get_backwpup_working_response( $logfile, $logpos ) {
+        $log_folder = untrailingslashit(
+            \BackWPup_File::get_absolute_path(
+                get_site_option( 'backwpup_cfg_logfolder' )
+            )
+        );
+
+        $logfile = $log_folder . '/' . basename( $logfile );
+        if ( file_exists( $logfile . '.gz' ) ) {
+            $logfile .= '.gz';
+        }
+
+        if ( ! is_readable( $logfile ) ) {
+            return wp_json_encode( 0 );
+        }
+
+        $working_data = $this->get_backwpup_working_data( $logfile );
+        $filesystem   = backwpup_wpfilesystem();
+
+        $log_data = '.gz' === substr( $logfile, -3 ) ? $filesystem->get_contents( 'compress.zlib://' . $logfile ) : $filesystem->get_contents( $logfile );
+        $log_data = substr( (string) $log_data, $logpos );
+
+        preg_match( '/<body[^>]*>/si', $log_data, $match );
+
+        $startpos = ! empty( $match[0] ) ? strpos( $log_data, $match[0] ) + strlen( $match[0] ) : 0;
+        $endpos   = stripos( $log_data, '</body>' );
+
+        if ( false === $endpos ) {
+            $endpos = strlen( $log_data );
+        }
+
+        // Extract the log text between the <body> and </body> tags.
+        $log_text = substr( $log_data, $startpos, $endpos - $startpos );
+
+        if ( method_exists( '\WPMedia\BackWPup\Log\LogFacade', 'render_html' ) ) {
+            $log_text = ( new \WPMedia\BackWPup\Log\LogFacade() )->render_html( $log_text );
+        }
+
+        $data = array(
+            'log_pos'          => strlen( $log_data ) + $logpos,
+            'log_text'         => $log_text,
+            'warning_count'    => $working_data['warnings'],
+            'error_count'      => $working_data['errors'],
+            'running_time'     => $working_data['runtime'],
+            'step_percent'     => $working_data['step_percent'],
+            'on_step'          => $working_data['onstep'],
+            'last_msg'         => $working_data['lastmsg'],
+            'last_error_msg'   => $working_data['lasterrormsg'],
+            'sub_step_percent' => $working_data['substep_percent'],
+            'restart_url'      => '',
+            'job_done'         => $working_data['done'],
+            'step_done'        => $working_data['step_done'],
+            'step_todo'        => $working_data['step_todo'],
+            'substeps_todo'    => $working_data['substeps_todo'],
+            'substeps_done'    => $working_data['substeps_done'],
+            'job_id'           => $working_data['job_id'],
+        );
+
+        return wp_json_encode( $data );
+    }
+
+    /**
+     * Get the current BackWPup working data.
+     *
+     * Falls back to the log header when no active job is available.
+     *
+     * @param string $logfile Log file path.
+     * @uses \BackWPup_Job::get_working_data()
+     * @uses \BackWPup_Job::read_logheader()
+     *
+     * @return array Working job data.
+     */
+    private function get_backwpup_working_data( $logfile ) {
+        $job_object = \BackWPup_Job::get_working_data();
+
+        if ( ! is_object( $job_object ) ) {
+
+            $logheader = \BackWPup_Job::read_logheader( $logfile );
+            $logheader = is_array( $logheader ) ? $logheader : array();
+            $lastmsg   = sprintf(
+                // translators: %s: number of seconds.
+                esc_html__( 'Backup created in %s seconds.', 'mainwp-child' ),
+                isset( $logheader['runtime'] ) ? $logheader['runtime'] : 0
+            );
+
+            return array(
+                'done'            => 1,
+                'warnings'        => isset( $logheader['warnings'] ) ? $logheader['warnings'] : 0,
+                'errors'          => isset( $logheader['errors'] ) ? $logheader['errors'] : 0,
+                'runtime'         => isset( $logheader['runtime'] ) ? $logheader['runtime'] : 0,
+                'step_percent'    => 100,
+                'substep_percent' => 100,
+                'step_done'       => 100,
+                'step_todo'       => 100,
+                'substeps_todo'   => 100,
+                'substeps_done'   => 100,
+                'onstep'          => esc_html__( 'Job completed', 'mainwp-child' ),
+                'lastmsg'         => $lastmsg,
+                'lasterrormsg'    => '',
+                'job_id'          => 0,
+            );
+        }
+
+        $job_id = isset( $job_object->job['jobid'] ) ? $job_object->job['jobid'] : 0;
+
         return array(
-            'success'    => 1,
-            'response'   => $output,
-            'lastbackup' => $lastbackup,
+            'done'            => 0,
+            'warnings'        => isset( $job_object->warnings ) ? $job_object->warnings : 0,
+            'errors'          => isset( $job_object->errors ) ? $job_object->errors : 0,
+            'runtime'         => current_time( 'timestamp' ) - $job_object->start_time, // phpcs:ignore WordPress.DateTime.CurrentTimeTimestamp.Requested
+            'step_percent'    => isset( $job_object->step_percent ) ? $job_object->step_percent : 0,
+            'substep_percent' => isset( $job_object->substep_percent ) ? $job_object->substep_percent : 0,
+            'step_done'       => isset( $job_object->steps_done ) ? count( $job_object->steps_done ) : 0,
+            'step_todo'       => isset( $job_object->steps_todo ) ? count( $job_object->steps_todo ) : 0,
+            'substeps_todo'   => isset( $job_object->substeps_todo ) ? $job_object->substeps_todo : 0,
+            'substeps_done'   => isset( $job_object->substeps_done ) ? $job_object->substeps_done : 0,
+            'onstep'          => isset( $job_object->steps_data[ $job_object->step_working ]['NAME'] ) ? $job_object->steps_data[ $job_object->step_working ]['NAME'] : '',
+            'lastmsg'         => isset( $job_object->lastmsg ) ? $job_object->lastmsg : '',
+            'lasterrormsg'    => isset( $job_object->lasterrormsg ) ? $job_object->lasterrormsg : '',
+            'job_id'          => $job_id,
         );
     }
 
     /**
      * Backup now.
      *
-     * @uses MainWP_Child_Back_WP_Up::wp_list_table_dependency()
-     * @uses MainWP_Child_Back_WP_Up::check_backwpup_messages()
-     * @uses \BackWPup_Page_Jobs::load()
+     * @uses \BackWPup_Option::get()
+     * @uses \BackWPup_Job::get_jobrun_url()
      * @uses \BackWPup_Job::get_working_data()
      *
      * @return array Response array[ success, response, logfile ] or array[ error ]
@@ -1486,41 +1656,60 @@ class MainWP_Child_Back_WP_Up { //phpcs:ignore -- NOSONAR - multi methods.
             return array( 'error' => esc_html__( 'Missing job_id', 'mainwp-child' ) );  // NOSONAR.
         }
 
-        // Simulate http://wp/wp-admin/admin.php?jobid=1&page=backwpupjobs&action=runnow.
-        $_GET['jobid'] = isset( $_POST['settings']['job_id'] ) ? sanitize_text_field( wp_unslash( $_POST['settings']['job_id'] ) ) : '';  // phpcs:ignore -- NOSONAR
+        $job_id = absint( wp_unslash( $_POST['settings']['job_id'] ) );  // phpcs:ignore WordPress.Security.NonceVerification.Missing -- NOSONAR.
+        if ( ! $job_id ) {
+            return array( 'error' => esc_html__( 'Invalid job_id', 'mainwp-child' ) );
+        }
 
-        $_REQUEST['action']   = 'runnow';
-        $_REQUEST['_wpnonce'] = wp_create_nonce( 'backwpup_job_run-runnowlink' );
+        if ( ! current_user_can( 'backwpup_jobs_start' ) ) {
+            return array( 'error' => esc_html__( 'You do not have permission to start BackWPup jobs.', 'mainwp-child' ) );
+        }
 
         update_site_option( 'backwpup_messages', array() );
 
         $this->wp_list_table_dependency();
 
-        ob_start();
-        \BackWPup_Page_Jobs::load();
-        ob_end_clean();
+        if ( $this->use_legacy_backwpup_handler() ) {
+            return $this->backup_now_legacy( $job_id );
+        }
 
-        $output = $this->check_backwpup_messages();
+        // BackWPup_Page_Jobs::load() reads jobid via filter_input(INPUT_GET),
+        // which cannot see values assigned to $_GET after request startup.
+        // Start the job through the BackWPup API instead.
+        $old_log_file = \BackWPup_Option::get( $job_id, 'logfile' );
+        $run_response = \BackWPup_Job::get_jobrun_url( 'runnow', $job_id );
+
+        if ( is_wp_error( $run_response ) ) {
+            return array( 'error' => $run_response->get_error_message() );
+        }
+
+        $new_log_file = \BackWPup_Option::get( $job_id, 'logfile', null, false );
+        $attempts     = 0;
+        while ( $old_log_file === $new_log_file && $attempts < 40 ) {
+            usleep( 250000 );
+            $new_log_file = \BackWPup_Option::get( $job_id, 'logfile', null, false );
+            ++$attempts;
+        }
 
         // Disable onboarding.
         $this->disable_onboarding();
 
-        if ( isset( $output['error'] ) ) {
-            return array( 'error' => '\BackWPup_Page_Jobs::load fail: ' . $output['error'] );
+        if ( $old_log_file === $new_log_file ) {
+            return array( 'error' => esc_html__( 'BackWPup did not start the job.', 'mainwp-child' ) );
         } else {
             $job_object = \BackWPup_Job::get_working_data();
             $lastbackup = MainWP_Utility::get_lasttime_backup( 'backwpup' );
             if ( is_object( $job_object ) ) {
                 return array(
                     'success'    => 1,
-                    'response'   => $output['message'],
+                    'response'   => esc_html__( 'Job started.', 'mainwp-child' ),
                     'logfile'    => basename( $job_object->logfile ),
                     'lastbackup' => $lastbackup,
                 );
             } else {
                 return array(
                     'success'    => 1,
-                    'response'   => $output['message'],
+                    'response'   => esc_html__( 'Job started.', 'mainwp-child' ),
                     'lastbackup' => $lastbackup,
                 );
             }
@@ -1528,20 +1717,83 @@ class MainWP_Child_Back_WP_Up { //phpcs:ignore -- NOSONAR - multi methods.
     }
 
     /**
+     * Backup now using the legacy BackWPup handler.
+     *
+     * @param int $job_id job id.
+     * @uses \BackWPup_Page_Jobs::load()
+     * @uses \BackWPup_Job::get_working_data()
+     * @uses MainWP_Utility::get_lasttime_backup()
+     *
+     * @return array Return success or error response.
+     */
+    private function backup_now_legacy( $job_id ) {
+        $_GET['jobid']        = $job_id;
+        $_REQUEST['action']   = 'runnow';
+        $_REQUEST['_wpnonce'] = wp_create_nonce( 'backwpup_job_run-runnowlink' );
+
+        ob_start();
+        \BackWPup_Page_Jobs::load();
+        ob_end_clean();
+
+        $output = $this->check_backwpup_messages();
+        $this->disable_onboarding();
+
+        if ( isset( $output['error'] ) ) {
+            return array( 'error' => '\\BackWPup_Page_Jobs::load fail: ' . $output['error'] );
+        }
+
+        $job_object = \BackWPup_Job::get_working_data();
+        $lastbackup = MainWP_Utility::get_lasttime_backup( 'backwpup' );
+        return array(
+            'success'    => 1,
+            'response'   => $output['message'],
+            'logfile'    => is_object( $job_object ) ? basename( $job_object->logfile ) : '',
+            'lastbackup' => $lastbackup,
+        );
+    }
+
+    /**
      * Abort backup.
      *
-     * @uses MainWP_Child_Back_WP_Up::wp_list_table_dependency()
-     * @uses MainWP_Child_Back_WP_Up::check_backwpup_messages()
+     * @uses \BackWPup::get_plugin_data()
+     * @uses \BackWPup_Job::user_abort()
+     *
+     * @return array<string, mixed> Return success data or error[message] on failure.
+     */
+    protected function backup_abort() {  // phpcs:ignore -- NOSONAR - complex.
+        $running_file = \BackWPup::get_plugin_data( 'running_file' );
+        if ( empty( $running_file ) || ! file_exists( $running_file ) ) {
+            return array( 'error' => esc_html__( 'No BackWPup backup is currently running.', 'mainwp-child' ) );
+        }
+
+        if ( $this->use_legacy_backwpup_handler() ) {
+            return $this->backup_abort_legacy();
+        }
+
+        try {
+            \BackWPup_Job::user_abort();
+        } catch ( \Throwable $e ) {
+            return array( 'error' => 'Cannot abort: ' . $e->getMessage() );
+        }
+
+        return array(
+            'success' => 1,
+            'message' => esc_html__( 'Job will be terminated.', 'mainwp-child' ),
+        );
+    }
+
+    /**
+     * Abort backup using the legacy BackWPup handler.
+     *
      * @uses \BackWPup_Page_Jobs::load()
      *
-     * @return array|string[] Return array or error[message] on failure.
+     * @return array Return success or error response.
      */
-    protected function backup_abort() {
+    private function backup_abort_legacy() {
         $_REQUEST['action']   = 'abort';
         $_REQUEST['_wpnonce'] = wp_create_nonce( 'abort-job' );
 
         update_site_option( 'backwpup_messages', array() );
-
         $this->wp_list_table_dependency();
 
         ob_start();
@@ -1551,13 +1803,15 @@ class MainWP_Child_Back_WP_Up { //phpcs:ignore -- NOSONAR - multi methods.
         $output = $this->check_backwpup_messages();
 
         if ( isset( $output['error'] ) ) {
-            return array( 'error' => 'Cannot abort: ' . $output['error'] );
-        } else {
             return array(
-                'success' => 1,
-                'message' => $output['message'],
+                'error' => 'Cannot abort: ' . $output['error'],
             );
         }
+
+        return array(
+            'success' => 1,
+            'message' => $output['message'],
+        );
     }
 
     /**

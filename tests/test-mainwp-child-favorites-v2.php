@@ -439,9 +439,11 @@ class Test_MainWP_Child_Favorites_V2 extends WP_UnitTestCase {
 	public function test_theme_install_destination_honors_a_moved_theme_root() {
 		global $wp_theme_directories;
 
-		$alt_root = WP_CONTENT_DIR . '/mainwp-favorites-alt-themes';
+		$alt_root     = WP_CONTENT_DIR . '/mainwp-favorites-alt-themes';
+		$created_root = false;
 		if ( ! is_dir( $alt_root ) ) {
 			mkdir( $alt_root );
+			$created_root = true;
 		}
 		register_theme_directory( $alt_root );
 		$move_root = static function () use ( $alt_root ) {
@@ -479,7 +481,7 @@ class Test_MainWP_Child_Favorites_V2 extends WP_UnitTestCase {
 				$wp_theme_directories = array_values( array_diff( $wp_theme_directories, array( untrailingslashit( $alt_root ) ) ) );
 			}
 			unlink( $package );
-			if ( is_dir( $alt_root ) ) {
+			if ( $created_root && is_dir( $alt_root ) ) {
 				rmdir( $alt_root );
 			}
 		}

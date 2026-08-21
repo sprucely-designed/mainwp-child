@@ -1052,35 +1052,35 @@ class MainWP_Child_Posts { //phpcs:ignore -- NOSONAR - multi methods.
 
         $post_id = wp_insert_post( wp_slash( $postarr ), true );
         if ( is_wp_error( $post_id ) || ! is_int( $post_id ) || 1 > $post_id ) {
-            $rolled_back = $this->content_v2_rollback( null, $normalized, $postarr );
+            $rolled_back = $this->content_v2_rollback( null, $normalized, $old_post );
             return $this->content_v2_error( $protocol, $operation, $this->content_v2_failure_code( $rolled_back ) );
         }
         if ( ! empty( $normalized['post']['categories'] ) ) {
             $category_ids = $this->content_v2_category_ids( $normalized['post']['categories'] );
             $terms        = false === $category_ids ? false : wp_set_post_categories( $post_id, $category_ids, false );
             if ( false === $terms || is_wp_error( $terms ) ) {
-                $rolled_back = $this->content_v2_rollback( $post_id, $normalized, $postarr );
+                $rolled_back = $this->content_v2_rollback( $post_id, $normalized, $old_post );
                 return $this->content_v2_error( $protocol, $operation, $this->content_v2_failure_code( $rolled_back ) );
             }
         }
         if ( null !== $choices['category_id'] ) {
             $terms = wp_set_post_categories( $post_id, array( $choices['category_id'] ), true );
             if ( is_wp_error( $terms ) ) {
-                $rolled_back = $this->content_v2_rollback( $post_id, $normalized, $postarr );
+                $rolled_back = $this->content_v2_rollback( $post_id, $normalized, $old_post );
                 return $this->content_v2_error( $protocol, $operation, $this->content_v2_failure_code( $rolled_back ) );
             }
         }
         if ( ! empty( $normalized['post']['tags'] ) ) {
             $terms = wp_set_post_terms( $post_id, $normalized['post']['tags'], 'post_tag', false );
             if ( is_wp_error( $terms ) ) {
-                $rolled_back = $this->content_v2_rollback( $post_id, $normalized, $postarr );
+                $rolled_back = $this->content_v2_rollback( $post_id, $normalized, $old_post );
                 return $this->content_v2_error( $protocol, $operation, $this->content_v2_failure_code( $rolled_back ) );
             }
         }
 
         $revision = $this->content_v2_post_revision( $post_id );
         if ( false === $revision ) {
-            $this->content_v2_rollback( $post_id, $normalized, $postarr );
+            $this->content_v2_rollback( $post_id, $normalized, $old_post );
             return $this->content_v2_error( $protocol, $operation, 'outcome_unknown' );
         }
         $record['post_id']                   = $post_id;
@@ -1090,7 +1090,7 @@ class MainWP_Child_Posts { //phpcs:ignore -- NOSONAR - multi methods.
         $record['updated_at']                = time();
         $records[ $record['operation_ref'] ] = $record;
         if ( ! $this->content_v2_write_records( $protocol, $records ) || false === $wpdb->query( 'COMMIT' ) ) { // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
-            $this->content_v2_rollback( $post_id, $normalized, $postarr );
+            $this->content_v2_rollback( $post_id, $normalized, $old_post );
             wp_cache_delete( $this->content_v2_option( $protocol ), 'options' );
             return $this->content_v2_error( $protocol, $operation, 'outcome_unknown' );
         }
@@ -1130,12 +1130,12 @@ class MainWP_Child_Posts { //phpcs:ignore -- NOSONAR - multi methods.
      * the terms the mutation attached are collected before the ROLLBACK and forgotten after it.
      * Categories and tags are the whole taxonomy surface this writer touches.
      *
-     * @param int|null $post_id    Post touched inside the transaction, when one exists.
-     * @param array    $normalized Valid normalized mutation.
-     * @param array    $postarr    Post fields this operation handed to wp_insert_post().
+     * @param int|null      $post_id    Post touched inside the transaction, when one exists.
+     * @param array         $normalized Valid normalized mutation.
+     * @param \WP_Post|null $old_post   Update target as it stood before the transaction opened.
      * @return bool True when no trace of this operation survived, false when one did.
      */
-    private function content_v2_rollback( $post_id, $normalized, $postarr ) {
+    private function content_v2_rollback( $post_id, $normalized, $old_post ) {
         global $wpdb;
 
         $touched = array_values(
@@ -1178,32 +1178,57 @@ class MainWP_Child_Posts { //phpcs:ignore -- NOSONAR - multi methods.
             if ( ! $post instanceof \WP_Post ) {
                 continue;
             }
-            if ( 'update' !== $normalized['mode'] ) {
+            if ( 'update' !== $normalized['mode'] || (int) $id !== (int) $normalized['target_post_id'] ) {
                 // Nothing but this operation's own insert could have created the row, so finding one
                 // still there is the whole trace.
                 return false;
             }
-            // The target predates the operation, so only its stored fields say whose write is in
-            // place. Title, content and excerpt are where the payload carries content; the rest is
-            // low-entropy or rewritten on the way in (post_name is uniquified, the date localised),
-            // so it cannot tell this write apart from the one it replaced. One field still matching
-            // is taken as survival - a filter that rewrote a field during the insert is
-            // indistinguishable from a rollback, and outcome_unknown is the safe half of that
-            // ambiguity. An operation that meant to write nothing distinguishing leaves the two
-            // states indistinguishable as well, which is the same answer.
-            $distinguishing = 0;
-            foreach ( array( 'post_title', 'post_content', 'post_excerpt' ) as $field ) {
-                $intended = isset( $postarr[ $field ] ) ? (string) $postarr[ $field ] : '';
-                if ( '' === $intended ) {
-                    continue;
-                }
-                ++$distinguishing;
-                if ( $intended === (string) $post->$field ) {
+            if ( ! $old_post instanceof \WP_Post ) {
+                // The witness is the pre-operation row, and without it there is nothing to compare
+                // against. Guessing in the site's favour is the guess that sends the Dashboard back
+                // to retry a write that may already be durable.
+                return false;
+            }
+            // The question is whether the row is what it was before this operation, never whether
+            // what the operation meant to write is there. Anything on wp_insert_post()'s own path -
+            // wp_insert_post_data above all - may rewrite a field between the payload and storage,
+            // so intended values can match nothing in the row while the write is perfectly durable;
+            // the snapshot answers without reading the payload at all. The fields are the columns
+            // wp_insert_post() writes, so no surviving part of this write can land outside them,
+            // and post_modified_gmt is among them because the update path restamps it even when the
+            // content it stored was unchanged.
+            //
+            // Honest edge: an update that stored exactly what was already there leaves the two
+            // states identical (down to a restamp inside the same second), and calling that a
+            // landed rollback is right - nothing changed either way, so mutation_failed still
+            // describes the post truthfully.
+            $columns = array(
+                'post_author',
+                'post_date',
+                'post_date_gmt',
+                'post_content',
+                'post_content_filtered',
+                'post_title',
+                'post_excerpt',
+                'post_status',
+                'post_type',
+                'comment_status',
+                'ping_status',
+                'post_password',
+                'post_name',
+                'to_ping',
+                'pinged',
+                'post_modified',
+                'post_modified_gmt',
+                'post_parent',
+                'menu_order',
+                'post_mime_type',
+                'guid',
+            );
+            foreach ( $columns as $field ) {
+                if ( (string) $old_post->$field !== (string) $post->$field ) {
                     return false;
                 }
-            }
-            if ( 0 === $distinguishing ) {
-                return false;
             }
         }
         return true;

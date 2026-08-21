@@ -442,6 +442,65 @@ class Test_Post_Plus_Child_V2 extends WP_UnitTestCase {
 		$this->assertSame( 'outcome_unknown', $result['code'], 'mutation_failed asserts the site is untouched, and this change survived.' );
 	}
 
+	/**
+	 * A valid update may carry nothing but a title, and wp_insert_post_data lets a site rewrite that
+	 * title on the way into the row. Every value the operation meant to write is then absent from
+	 * storage while the write itself is durable, so a verification that looks for the intended values
+	 * sees a clean site and answers mutation_failed. Only the pre-operation row can say whether the
+	 * rollback landed, because it is the one witness the write path cannot rewrite.
+	 */
+	public function test_a_durable_update_whose_title_a_filter_rewrote_is_not_reported_as_mutation_failed() {
+		global $wpdb;
+
+		$create = $this->delivery_payload( '123e4567-e89b-42d3-a456-426614174643', 'Before rewritten update' );
+		$first  = $this->request( 'post_plus_newpost_v2', $create );
+		$this->assertTrue( $first['ok'] );
+		$posts = $this->operation_posts( $create['operation_ref'] );
+		$this->assertCount( 1, $posts );
+		$target = (int) $posts[0]->ID;
+
+		// Title only: with content and excerpt empty, the title is the whole of what the payload
+		// intends to store, so rewriting it leaves the intended-value comparison nothing to match.
+		$update                      = $this->delivery_payload( '123e4567-e89b-42d3-a456-426614174644', 'Intended rewritten title' );
+		$update['mode']              = 'update';
+		$update['target_post_id']    = $target;
+		$update['expected_revision'] = $first['post_revision'];
+		$update['post']['content']   = '';
+		$update['post']['excerpt']   = '';
+		$update['post']['tags']      = array( 'rewritten-title-fixture-tag' );
+		$update['content_digest']    = hash( 'sha256', wp_json_encode( array( $update['post'], $update['randomization'] ) ) );
+
+		$close = static function () use ( $wpdb ) {
+			$wpdb->query( 'SET autocommit = 1' );
+		};
+		$rewrite = static function ( $data ) {
+			$data['post_title'] = 'Rewritten by a site filter';
+			return $data;
+		};
+		$refuse = static function () {
+			return new \WP_Error( 'fixture_term_refused', 'Term creation refused.' );
+		};
+		add_action( 'mainwp_before_post_update', $close );
+		add_filter( 'wp_insert_post_data', $rewrite );
+		add_filter( 'pre_insert_term', $refuse );
+		$result = $this->request( 'post_plus_newpost_v2', $update );
+		remove_filter( 'pre_insert_term', $refuse );
+		remove_filter( 'wp_insert_post_data', $rewrite );
+		remove_action( 'mainwp_before_post_update', $close );
+
+		clean_post_cache( $target );
+		$durable = get_post( $target );
+		if ( $durable instanceof \WP_Post ) {
+			wp_delete_post( $target, true );
+		}
+		$wpdb->query( 'SET autocommit = 0' );
+
+		$this->assertInstanceOf( \WP_Post::class, $durable );
+		$this->assertSame( 'Rewritten by a site filter', $durable->post_title, 'The fixture must leave the rewritten title durable or it is not exercising this hazard.' );
+		$this->assertNotSame( $update['post']['title'], $durable->post_title, 'The intended title must be absent from storage or the intended-value comparison was never fooled.' );
+		$this->assertSame( 'outcome_unknown', $result['code'], 'mutation_failed asserts the site is untouched, and this change survived.' );
+	}
+
 	public function test_full_ledger_evicts_only_the_receipts_that_can_no_longer_be_replayed() {
 		update_option( 'mainwp_child_post_plus_operations_v2', $this->aged_ledger( 'applied' ), false );
 		$payload = $this->delivery_payload( '123e4567-e89b-42d3-a456-426614174623', 'Ledger eviction' );

@@ -781,13 +781,17 @@ class Test_MainWP_Child_Maintenance_V2 extends WP_UnitTestCase {
 	 * the record unsettled. The wall clock has to stop it, and report the rows it destroyed.
 	 */
 	public function test_revision_sweep_stops_when_the_wall_clock_budget_runs_out() {
-		global $wpdb;
+		global $wpdb, $timestart;
 		$parent_id = self::factory()->post->create();
 		$this->insert_revisions( $parent_id, 503 );
-		// One second of sweep budget once the settle margin comes off, so the stop is reachable
-		// without waiting out the 120s ceiling.
-		$original_limit = ini_get( 'max_execution_time' );
-		ini_set( 'max_execution_time', MainWP_Child_Maintenance::ABILITIES_V2_REVISION_SWEEP_MARGIN + 1 );
+		// Two seconds of sweep budget once the settle margin comes off, so the stop is reachable
+		// without waiting out the 120s ceiling and the first batch still gets to run. $timestart is
+		// the harness bootstrap here, seconds back by the time this case runs, and that elapsed time
+		// comes off the same budget: pinning it to now is what leaves the two seconds.
+		$original_limit     = ini_get( 'max_execution_time' );
+		$original_timestart = $timestart;
+		ini_set( 'max_execution_time', MainWP_Child_Maintenance::ABILITIES_V2_REVISION_SWEEP_MARGIN + 2 );
+		$timestart = microtime( true );
 		// Burn the budget inside the first batch, so the sweep is over time by the time it decides
 		// whether to start the second one.
 		$stall = static function ( $query ) {
@@ -808,6 +812,7 @@ class Test_MainWP_Child_Maintenance_V2 extends WP_UnitTestCase {
 		} finally {
 			remove_filter( 'query', $stall );
 			ini_set( 'max_execution_time', $original_limit );
+			$timestart = $original_timestart;
 		}
 
 		$remaining = (int) $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM $wpdb->posts WHERE post_type = 'revision' AND post_parent = %d", $parent_id ) );
@@ -878,6 +883,48 @@ class Test_MainWP_Child_Maintenance_V2 extends WP_UnitTestCase {
 			'A sweep that stops on the request budget reports the rows it destroyed, not a finished run.'
 		);
 		$this->assertGreaterThan( 2, $remaining, 'The sweep must stop on the time the request already spent, not run the parent to the end.' );
+	}
+
+	/**
+	 * A request that has already spent its limit before the sweep starts has no budget left to hand
+	 * out. Starting one page query and one 500-row delete anyway is the fatal the deadline exists to
+	 * prevent, so the sweep has to destroy nothing and say so; the next request gets the whole limit.
+	 */
+	public function test_revision_sweep_does_no_work_when_the_request_budget_is_already_spent() {
+		global $wpdb, $timestart;
+		$parent_id = self::factory()->post->create();
+		$this->insert_revisions( $parent_id, 12 );
+
+		$original_limit     = ini_get( 'max_execution_time' );
+		$original_timestart = $timestart;
+		ini_set( 'max_execution_time', 30 );
+		// Past the limit minus the settle margin, so what is left of the request is negative.
+		$timestart = microtime( true ) - 25;
+
+		try {
+			list( , $result ) = $this->real_execute( $this->real_subject(), array( 'revisions' ), 2, '123e4567-e89b-42d3-a456-426614174522' );
+		} finally {
+			ini_set( 'max_execution_time', $original_limit );
+			$timestart = $original_timestart;
+		}
+
+		$this->assertTrue( $result['ok'] );
+		$this->assertSame( 'unknown', $result['status'] );
+		$this->assertSame(
+			array(
+				'action'     => 'revisions',
+				'status'     => 'unknown',
+				'affected'   => 0,
+				'error_code' => 'outcome_unknown',
+			),
+			$result['outcomes'][0],
+			'An exhausted budget reports the same unknown as the other early stops, with nothing destroyed.'
+		);
+		$this->assertSame(
+			'12',
+			$wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM $wpdb->posts WHERE post_type = 'revision' AND post_parent = %d", $parent_id ) ),
+			'Every revision over retention has to still be there: a sweep with no budget runs no batch at all.'
+		);
 	}
 
 	/** Fill one parent with revisions cheaply; the sweep only ever reads them through SQL. */

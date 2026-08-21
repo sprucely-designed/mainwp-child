@@ -25,6 +25,15 @@ if ( ! defined( 'ABSPATH' ) ) {
  * drops its oldest entry, so the row that entry named goes back to leaking exactly as it did
  * before there was an index, rather than a bookkeeping limit travelling back into a mutation that
  * has already reserved its effect.
+ *
+ * Refusal reaches an owner two ways and both stop at this boundary. Every option read and write in
+ * here runs the option filters, which any plugin on the site can hook, so a failure inside one
+ * arrives as a throw rather than as a false. Letting one out would end the owner's mutation from
+ * inside its bookkeeping - and add() runs after the durable dispatch marker exists, so the request
+ * would die holding a reservation for an effect that never ran, which every later request under
+ * that reference then reads. That is the one reason this class swallows a \Throwable where the rest
+ * of this plugin deliberately fails loudly: what a caught throw costs is a tracked key, and what an
+ * escaped one costs is a request nothing can settle.
  */
 class MainWP_Child_Receipt_Index {
 
@@ -70,16 +79,22 @@ class MainWP_Child_Receipt_Index {
         if ( ! $this->own_key( $option_key ) || ! is_int( $expires_at ) || 0 >= $expires_at || ! is_int( $cap ) || 1 > $cap ) {
             return false;
         }
-        $entries   = $this->entries( $index_option );
-        $entries[] = array(
-            'key'        => $option_key,
-            'expires_at' => $expires_at,
-        );
-        $overflow  = count( $entries ) - $cap;
-        if ( 0 < $overflow ) {
-            $entries = array_slice( $entries, $overflow );
+        try {
+            $entries   = $this->entries( $index_option );
+            $entries[] = array(
+                'key'        => $option_key,
+                'expires_at' => $expires_at,
+            );
+            $overflow  = count( $entries ) - $cap;
+            if ( 0 < $overflow ) {
+                $entries = array_slice( $entries, $overflow );
+            }
+            return $this->store( $index_option, $entries );
+        } catch ( \Throwable $index_failed ) {
+            // The answer a rejected entry already gets, because the caller must not be able to tell
+            // a key that went untracked from one that did.
+            return false;
         }
-        return $this->store( $index_option, $entries );
     }
 
     /**
@@ -94,34 +109,43 @@ class MainWP_Child_Receipt_Index {
         if ( ! is_int( $limit ) || 1 > $limit ) {
             return 0;
         }
-        $entries   = $this->entries( $index_option );
         $kept      = array();
         $read      = 0;
         $reclaimed = 0;
         $now       = time();
         $missing   = '__mainwp_child_receipt_index_missing__';
-        foreach ( $entries as $entry ) {
-            if ( $read >= $limit || $entry['expires_at'] > $now ) {
-                $kept[] = $entry;
-                continue;
+        try {
+            $entries = $this->entries( $index_option );
+            foreach ( $entries as $entry ) {
+                if ( $read >= $limit || $entry['expires_at'] > $now ) {
+                    $kept[] = $entry;
+                    continue;
+                }
+                ++$read;
+                $value = get_option( $entry['key'], $missing );
+                if ( $missing === $value ) {
+                    continue;
+                }
+                // The owner judges the row as it stands, never the entry: the key may have been
+                // written again since it was indexed, and a row nothing can parse is still evidence
+                // a resent request needs, which is why a predicate that says no keeps the entry as
+                // well as the row. A delete that did not take leaves both standing for the same
+                // reason.
+                if ( true !== $reclaimable( $value ) || ! $this->delete_matched( $entry['key'], $value ) ) {
+                    $kept[] = $entry;
+                    continue;
+                }
+                ++$reclaimed;
             }
-            ++$read;
-            $value = get_option( $entry['key'], $missing );
-            if ( $missing === $value ) {
-                continue;
+            if ( $kept !== $entries ) {
+                $this->store( $index_option, $kept );
             }
-            // The owner judges the row as it stands, never the entry: the key may have been written
-            // again since it was indexed, and a row nothing can parse is still evidence a resent
-            // request needs, which is why a predicate that says no keeps the entry as well as the
-            // row. A delete that did not take leaves both standing for the same reason.
-            if ( true !== $reclaimable( $value ) || ! $this->delete_matched( $entry['key'], $value ) ) {
-                $kept[] = $entry;
-                continue;
-            }
-            ++$reclaimed;
-        }
-        if ( $kept !== $entries ) {
-            $this->store( $index_option, $kept );
+        } catch ( \Throwable $index_failed ) {
+            // The rows counted so far are gone from the table, so the count reports them; the index
+            // simply keeps naming them until a later sweep reads them missing and drops the entries.
+            // The throw ends the sweep instead of skipping the entry it landed on: a predicate that
+            // threw said nothing about the row it was judging, and a delete decided after an unknown
+            // failure is the one thing this class must never do.
         }
         return $reclaimed;
     }

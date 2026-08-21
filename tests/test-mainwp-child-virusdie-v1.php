@@ -398,6 +398,50 @@ class Test_MainWP_Child_Virusdie_V1 extends WP_UnitTestCase {
 	}
 
 	/**
+	 * Every option this index reads and writes goes through filters any plugin on the site can hook,
+	 * so a failure in one arrives as a throw rather than a false. add() runs after the durable
+	 * dispatch marker exists, so a throw that escapes it kills the request holding a reservation for
+	 * an effect that already ran, and every later request under that reference reads the marker.
+	 */
+	public function test_a_throwing_index_write_does_not_fail_the_mutation_it_bookkeeps() {
+		$subject                   = new Testable_MainWP_Child_Virusdie();
+		$subject->durable_receipts = true;
+		$subject->gateway_bytes    = '<?php // signed fixture';
+		$request                   = $this->install_request( $subject->gateway_bytes );
+		$key                       = 'mainwp_child_virusdie_v1_' . hash( 'sha256', $request['payload']['request_ref'] );
+		$raced                     = '123e4567-e89b-42d3-a456-426614175025';
+		$leaked                    = 'mainwp_child_virusdie_v1_' . hash( 'sha256', $raced );
+		$seeded                    = array( array( 'key' => $leaked, 'expires_at' => time() - 86400 ) );
+		$this->assertTrue( add_option( $leaked, $this->expired_receipt( $raced ), '', false ) );
+		update_option( 'mainwp_child_virusdie_receipt_index', $seeded, false );
+		// Poisons both index writes at once: the sweep's rewrite before the reservation, and the
+		// record that follows it.
+		$poison = static function () {
+			throw new \RuntimeException( 'hostile option filter' );
+		};
+		add_filter( 'pre_update_option_mainwp_child_virusdie_receipt_index', $poison );
+
+		try {
+			$result = $subject->request_v1( $request );
+
+			$this->assertTrue( $result['ok'] );
+			$this->assertSame( 'completed', $result['status'] );
+			$this->assertSame( 1, $subject->installs );
+			$this->assertSame( $result, $this->cold_option( $key )['result'] );
+			// The sweep's delete was committed before its own rewrite threw, so it stands; this
+			// request's row is simply untracked, which is the leak the index reduces rather than a
+			// mutation refused over bookkeeping.
+			$this->assertNull( $this->cold_option( $leaked ) );
+			$this->assertSame( $seeded, $this->cold_option( 'mainwp_child_virusdie_receipt_index' ) );
+		} finally {
+			remove_filter( 'pre_update_option_mainwp_child_virusdie_receipt_index', $poison );
+		}
+
+		delete_option( $key );
+		delete_option( 'mainwp_child_virusdie_receipt_index' );
+	}
+
+	/**
 	 * Read one option past the request-local cache.
 	 *
 	 * update_option() primes that cache, so a row asserted straight after a write reads back from

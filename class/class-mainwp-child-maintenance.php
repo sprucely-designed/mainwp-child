@@ -1003,10 +1003,13 @@ class MainWP_Child_Maintenance {
         if ( is_numeric( $timestart ) && 0 < $timestart && $timestart <= $now ) {
             $elapsed = $now - (float) $timestart;
         }
-        // Floored at a second, as the budget already was: a request that has spent its limit before
-        // the sweep starts still does one bounded batch and settles, instead of every such request
-        // answering unknown with nothing destroyed.
-        return time() + max( 1, (int) min( self::ABILITIES_V2_REVISION_SWEEP_BUDGET, $limit - $elapsed - self::ABILITIES_V2_REVISION_SWEEP_MARGIN ) );
+        // What is left of the request is all the sweep gets, and when nothing is left it gets no
+        // work: this goes negative or zero on a request that already spent its limit, so the
+        // deadline lands in the past and the first check stops the sweep before any page query or
+        // 500-row delete. Granting a token second there would start exactly the batch whose fatal
+        // this bound exists to prevent; an unknown with nothing destroyed is truthful and costs
+        // only a retry, and the next request arrives with the whole limit again.
+        return time() + (int) min( self::ABILITIES_V2_REVISION_SWEEP_BUDGET, $limit - $elapsed - self::ABILITIES_V2_REVISION_SWEEP_MARGIN );
     }
 
     /**
@@ -1023,23 +1026,25 @@ class MainWP_Child_Maintenance {
         $affected = 0;
         $deadline = $this->abilities_v2_revision_sweep_deadline();
         while ( true ) {
-            // A site with enough parents keeps paging past the 300s lock TTL, so the lock is renewed
-            // and re-verified before every page. Once this run can no longer prove it owns the lock
-            // it stops deleting and reports the rows it already destroyed alongside the unknown,
-            // rather than claiming a sweep it could not finish under the lock.
-            if ( ! $this->abilities_v2_renew_mutation() ) {
+            // Renewal re-arms the lock TTL, so it never ends this loop on a site whose editors keep
+            // creating revisions: every page still finds parents over retention and still deletes
+            // something, so the progress invariant stays satisfied and only the execution limit is
+            // left to stop the run. The wall clock stops it first, before the page rather than
+            // after, so the margin is still there to settle the record. Ahead of the renewal too,
+            // because renewing is itself an option write: a request already out of time must not
+            // spend any on the way to noticing.
+            if ( time() >= $deadline ) {
                 return array(
                     'status'     => 'unknown',
                     'affected'   => $affected,
                     'error_code' => 'outcome_unknown',
                 );
             }
-            // Renewal re-arms the lock TTL, so it never ends this loop on a site whose editors keep
-            // creating revisions: every page still finds parents over retention and still deletes
-            // something, so the progress invariant stays satisfied and only the execution limit is
-            // left to stop the run. The wall clock stops it first, before the page rather than
-            // after, so the margin is still there to settle the record.
-            if ( time() >= $deadline ) {
+            // A site with enough parents keeps paging past the 300s lock TTL, so the lock is renewed
+            // and re-verified before every page. Once this run can no longer prove it owns the lock
+            // it stops deleting and reports the rows it already destroyed alongside the unknown,
+            // rather than claiming a sweep it could not finish under the lock.
+            if ( ! $this->abilities_v2_renew_mutation() ) {
                 return array(
                     'status'     => 'unknown',
                     'affected'   => $affected,
@@ -1138,6 +1143,17 @@ class MainWP_Child_Maintenance {
                 );
             }
             $deleted += $removed;
+            // Same wall clock as the pages, because one parent's surplus alone can outlast the
+            // request, and ahead of the renewal for the same reason: renewing writes an option, and
+            // a request already out of time must not spend any on the way to noticing. Reporting
+            // this as 'lock_lost' would be a lie: the lock is held and the caller turns both into
+            // the same unknown anyway.
+            if ( time() >= $deadline ) {
+                return array(
+                    'deleted' => $deleted,
+                    'status'  => 'out_of_time',
+                );
+            }
             // One parent can hold enough surplus to page past the 300s lock TTL on its own, so ownership is
             // renewed and re-verified between batches and not only between pages: no batch is ever more than
             // one batch of work away from a lock this run could prove it held. The rows already destroyed
@@ -1146,15 +1162,6 @@ class MainWP_Child_Maintenance {
                 return array(
                     'deleted' => $deleted,
                     'status'  => 'lock_lost',
-                );
-            }
-            // Same wall clock as the pages, because one parent's surplus alone can outlast the
-            // request. Reporting this as 'lock_lost' would be a lie: the lock is held and was just
-            // renewed, and the caller turns both into the same unknown anyway.
-            if ( time() >= $deadline ) {
-                return array(
-                    'deleted' => $deleted,
-                    'status'  => 'out_of_time',
                 );
             }
         }

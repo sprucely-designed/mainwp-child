@@ -37,6 +37,20 @@ if ( ! defined( 'ABSPATH' ) ) {
 class MainWP_Child_Staging { //phpcs:ignore -- NOSONAR - multi methods.
 
     /**
+     * How many clone-mutation receipts the option holds.
+     *
+     * @var int
+     */
+    const ABILITIES_V2_MAX_RECEIPTS = 100;
+
+    /**
+     * How far ahead of this Child's clock a receipt stamp is still believed.
+     *
+     * @var int
+     */
+    const ABILITIES_V2_CLOCK_SKEW = 300;
+
+    /**
      * Public static variable to hold the single instance of the class.
      *
      * @var mixed Default null
@@ -573,6 +587,32 @@ class MainWP_Child_Staging { //phpcs:ignore -- NOSONAR - multi methods.
         if ( ! $this->abilities_v2_valid_request_ref( $request['request_ref'] ) || ! $this->abilities_v2_valid_mutation_payload( $operation, $request['payload'] ) ) {
             return $this->abilities_v2_error( $operation );
         }
+
+        // The receipt lookup and the clone job it guards have to be one atomic step, or two
+        // concurrent requests both read "no receipt", both reach the provider, and the second
+        // write of the option drops the first request's receipt along with its only record.
+        $lock = $this->abilities_v2_begin_lock();
+        if ( null === $lock ) {
+            return $this->abilities_v2_error( $operation, 'storage_unavailable' );
+        }
+        if ( true !== $lock ) {
+            return $this->abilities_v2_error( $operation, 'lock_busy' );
+        }
+        try {
+            return $this->abilities_v2_locked_mutation( $operation, $request );
+        } finally {
+            $this->abilities_v2_end_lock();
+        }
+    }
+
+    /**
+     * Run one clone mutation at most once, under the held mutation lock.
+     *
+     * @param string $operation Operation name.
+     * @param array  $request Closed request.
+     * @return array
+     */
+    private function abilities_v2_locked_mutation( $operation, $request ) {
         $effect_hash = hash( 'sha256', wp_json_encode( array( $operation, $request['payload'] ) ) );
         $receipts    = get_option( 'mainwp_staging_abilities_v2_operation_receipts', array() );
         if ( ! is_array( $receipts ) ) {
@@ -580,10 +620,17 @@ class MainWP_Child_Staging { //phpcs:ignore -- NOSONAR - multi methods.
         }
         if ( isset( $receipts[ $request['request_ref'] ] ) ) {
             $receipt = $receipts[ $request['request_ref'] ];
-            if ( ! is_array( $receipt ) || ! $this->abilities_v2_exact_keys( $receipt, array( 'effect_hash', 'response' ) ) || ! is_string( $receipt['effect_hash'] ) || ! is_array( $receipt['response'] ) ) {
+            if ( ! $this->abilities_v2_valid_receipt( $receipt ) ) {
                 return $this->abilities_v2_error( $operation, 'storage_unavailable' );
             }
             return hash_equals( $receipt['effect_hash'], $effect_hash ) ? $receipt['response'] : $this->abilities_v2_error( $operation, 'request_conflict' );
+        }
+
+        // Room has to exist before the provider is touched. A clone job this Child cannot record
+        // is one the Dashboard's next retry runs a second time.
+        $receipts = $this->abilities_v2_evict_receipts( $receipts );
+        if ( false === $receipts ) {
+            return $this->abilities_v2_error( $operation, 'storage_unavailable' );
         }
 
         $result = $this->abilities_v2_provider_result( $operation, $request['payload'] );
@@ -592,14 +639,126 @@ class MainWP_Child_Staging { //phpcs:ignore -- NOSONAR - multi methods.
         }
         $result['request_ref'] = $request['request_ref'];
         $result                = array_merge( array_intersect_key( $result, array( 'protocol' => true, 'operation' => true, 'ok' => true ) ), array( 'request_ref' => $request['request_ref'] ), array_diff_key( $result, array( 'protocol' => true, 'operation' => true, 'ok' => true, 'request_ref' => true ) ) );
-        if ( 100 <= count( $receipts ) ) {
-            array_shift( $receipts );
-        }
-        $receipts[ $request['request_ref'] ] = array( 'effect_hash' => $effect_hash, 'response' => $result );
+
+        $receipts[ $request['request_ref'] ] = array(
+            'effect_hash' => $effect_hash,
+            'response'    => $result,
+            'created_at'  => time(),
+        );
         if ( ! update_option( 'mainwp_staging_abilities_v2_operation_receipts', $receipts, false ) && $receipts !== get_option( 'mainwp_staging_abilities_v2_operation_receipts', array() ) ) {
             return $this->abilities_v2_error( $operation, 'outcome_unknown' );
         }
         return $result;
+    }
+
+    /**
+     * Validate one stored clone-mutation receipt.
+     *
+     * @param mixed $receipt Stored receipt.
+     * @return bool
+     */
+    private function abilities_v2_valid_receipt( $receipt ) {
+        return is_array( $receipt )
+            && $this->abilities_v2_exact_keys( $receipt, array( 'effect_hash', 'response', 'created_at' ) )
+            && is_string( $receipt['effect_hash'] )
+            && is_array( $receipt['response'] )
+            && is_int( $receipt['created_at'] );
+    }
+
+    /**
+     * Free one receipt slot without discarding an outcome a retry could still ask for.
+     *
+     * The created_at stamp is written once and never restamped, so a full store crosses the
+     * horizon on its own and starts accepting writes again without an operator touching anything.
+     *
+     * @param array $receipts Current receipts.
+     * @return array|false Receipts with room for one more, or false when nothing can be given up.
+     */
+    private function abilities_v2_evict_receipts( $receipts ) {
+        if ( self::ABILITIES_V2_MAX_RECEIPTS > count( $receipts ) ) {
+            return $receipts;
+        }
+        $now       = time();
+        $horizon   = $now - ( DAY_IN_SECONDS + 60 );
+        $evictable = array();
+        foreach ( $receipts as $reference => $receipt ) {
+            if ( ! $this->abilities_v2_valid_receipt( $receipt ) || $receipt['created_at'] > $now + self::ABILITIES_V2_CLOCK_SKEW ) {
+                // An entry that cannot be read, or that carries a stamp from the future no horizon
+                // will ever pass, answers no retry. Giving those up first is what stops a store
+                // written by an older build, or by a host whose clock jumped, from wedging shut.
+                $evictable[ $reference ] = 0;
+                continue;
+            }
+            if ( $receipt['created_at'] < $horizon ) {
+                $evictable[ $reference ] = $receipt['created_at'];
+            }
+        }
+        asort( $evictable, SORT_NUMERIC );
+        foreach ( array_keys( $evictable ) as $reference ) {
+            if ( self::ABILITIES_V2_MAX_RECEIPTS > count( $receipts ) ) {
+                break;
+            }
+            unset( $receipts[ $reference ] );
+        }
+        return self::ABILITIES_V2_MAX_RECEIPTS > count( $receipts ) ? $receipts : false;
+    }
+
+    /**
+     * Return this installation's named clone-mutation lock.
+     *
+     * @return string
+     */
+    protected function abilities_v2_lock_name() {
+        return 'mainwp_staging_v2_' . substr( hash( 'sha256', home_url( '/' ) ), 0, 32 );
+    }
+
+    /**
+     * Acquire the Child-wide clone-mutation lock without waiting.
+     *
+     * @return bool|null True when acquired, false when another session holds it, null when the lock backend could not answer.
+     */
+    protected function abilities_v2_begin_lock() {
+        global $wpdb;
+        if ( ! is_object( $wpdb ) || ! is_callable( array( $wpdb, 'prepare' ) ) || ! is_callable( array( $wpdb, 'get_var' ) ) ) {
+            return null;
+        }
+        $wpdb->last_error = '';
+        $locked           = $wpdb->get_var( $wpdb->prepare( 'SELECT GET_LOCK(%s,0)', $this->abilities_v2_lock_name() ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery -- Named lock is the serialization primitive.
+        if ( ! empty( $wpdb->last_error ) ) {
+            return null;
+        }
+        if ( '1' === (string) $locked ) {
+            return true;
+        }
+        // Only '0' means someone else holds it. GET_LOCK() answers NULL on an error or an
+        // interrupted wait, which says nothing about who holds the lock, so it is not reported
+        // as contention the Child never observed.
+        return '0' === (string) $locked ? false : null;
+    }
+
+    /**
+     * Release the Child-wide clone-mutation lock.
+     *
+     * @return bool
+     */
+    protected function abilities_v2_end_lock() {
+        global $wpdb;
+        if ( ! is_object( $wpdb ) || ! is_callable( array( $wpdb, 'prepare' ) ) || ! is_callable( array( $wpdb, 'get_var' ) ) ) {
+            return false;
+        }
+        // A lock this session fails to give back outlives the request on a persistent connection
+        // and blocks every later mutation with no way for an operator to clear it, so one failed
+        // release earns a second attempt before it is given up on.
+        for ( $attempt = 0; $attempt < 2; $attempt++ ) {
+            $wpdb->last_error = '';
+            $released         = $wpdb->get_var( $wpdb->prepare( 'SELECT RELEASE_LOCK(%s)', $this->abilities_v2_lock_name() ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery -- Named lock release must be checked.
+            // RELEASE_LOCK() answers NULL when the named lock does not exist, which is the state
+            // the caller asked for.
+            if ( empty( $wpdb->last_error ) && ( null === $released || '1' === (string) $released ) ) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /** @param string $operation Operation. @param array $payload Payload. @return array */

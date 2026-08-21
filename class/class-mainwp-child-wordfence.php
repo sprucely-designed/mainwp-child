@@ -67,6 +67,17 @@ class MainWP_Child_Wordfence { //phpcs:ignore -- NOSONAR - multi methods.
     const BLOCK_TYPE_BLACKLIST   = 'blacklist';
 
     /**
+     * Where the reason for a failed file operation belongs.
+     *
+     * Absolute server paths come back inside error_get_last(), and any plugin that installs an
+     * error handler can leave it holding an error this operation never raised, so the detail stays
+     * in the log the operator can already read and only this pointer goes to the Dashboard.
+     *
+     * @var string
+     */
+    const ERROR_LOG_HINT = 'Check the site\'s PHP error log for the reason.';
+
+    /**
      * Public variable to hold the KEY_TYPE_FREE value.
      *
      * @var string the KEY_TYPE_FREE value.
@@ -842,7 +853,11 @@ class MainWP_Child_Wordfence { //phpcs:ignore -- NOSONAR - multi methods.
 
         // The receipt check and the dispatch it guards have to be one atomic step, or two
         // concurrent requests carrying the same reference both reach the provider.
-        if ( ! $this->abilities_v2_begin_mutation_lock() ) {
+        $lock = $this->abilities_v2_begin_mutation_lock();
+        if ( null === $lock ) {
+            return $this->abilities_v2_error( $operation, 'storage_unavailable' );
+        }
+        if ( true !== $lock ) {
             return $this->abilities_v2_error( $operation, 'lock_busy' );
         }
         try {
@@ -949,16 +964,25 @@ class MainWP_Child_Wordfence { //phpcs:ignore -- NOSONAR - multi methods.
     /**
      * Acquire the Child-wide Wordfence mutation lock without waiting.
      *
-     * @return bool
+     * @return bool|null True when acquired, false when another session holds it, null when the lock backend could not answer.
      */
     protected function abilities_v2_begin_mutation_lock() {
         global $wpdb;
         if ( ! is_object( $wpdb ) || ! is_callable( array( $wpdb, 'prepare' ) ) || ! is_callable( array( $wpdb, 'get_var' ) ) ) {
-            return false;
+            return null;
         }
         $wpdb->last_error = '';
         $locked           = $wpdb->get_var( $wpdb->prepare( 'SELECT GET_LOCK(%s,0)', $this->abilities_v2_lock_name() ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery -- Named lock is the serialization primitive.
-        return empty( $wpdb->last_error ) && '1' === (string) $locked;
+        if ( ! empty( $wpdb->last_error ) ) {
+            return null;
+        }
+        if ( '1' === (string) $locked ) {
+            return true;
+        }
+        // Only '0' means someone else holds it. GET_LOCK() answers NULL on an error or an
+        // interrupted wait, which says nothing about who holds the lock, so it is not reported
+        // as contention the Child never observed.
+        return '0' === (string) $locked ? false : null;
     }
 
     /**
@@ -1874,17 +1898,13 @@ SQL
                 if ( 'del' === $op ) {
                     // wp_delete_file() only gained a return value in WP 6.7 and we support 6.2+, so
                     // the readback decides; the return would report every delete as failed on 6.2-6.6.
-                    // Without the clear, a warning raised earlier in the request by anything at all
-                    // would be handed to the Dashboard as this deletion's reason.
-                    error_clear_last();
                     wp_delete_file( $localFile );
                     clearstatcache( true, $localFile );
                     if ( ! file_exists( $localFile ) ) {
                         $issues->updateIssue( $id, 'delete' );
                         $filesWorkedOn ++;
                     } else {
-                        $err      = error_get_last();
-                        $errors[] = 'Could not delete file ' . htmlentities( $file ) . '. Error was: ' . htmlentities( is_array( $err ) ? $err['message'] : 'unknown' );
+                        $errors[] = 'Could not delete file ' . htmlentities( $file ) . '. ' . self::ERROR_LOG_HINT;
                     }
                 } elseif ( 'repair' === $op ) {
                     $dat    = $issue['data'];
@@ -1901,13 +1921,15 @@ SQL
                         $errors[] = 'An invalid file ' . htmlentities( $file ) . ' was specified for repair.';
                         continue;
                     }
+                    // The clear is what makes the permission test below answer about this open and
+                    // not about an error anything else in the request left behind.
+                    error_clear_last();
                     $fh = fopen( $localFile, 'w' );
                     if ( ! $fh ) {
-                        $err = error_get_last();
-                        if ( preg_match( '/Permission denied/i', $err['message'] ) ) {
+                        if ( self::write_failed_on_permissions() ) {
                             $errMsg = "You don't have permission to repair " . htmlentities( $file ) . '. You need to either fix the file manually using FTP or change the file permissions and ownership so that your web server has write access to repair the file.';
                         } else {
-                            $errMsg = 'We could not write to ' . htmlentities( $file ) . '. The error was: ' . $err['message'];
+                            $errMsg = 'We could not write to ' . htmlentities( $file ) . '. ' . self::ERROR_LOG_HINT;
                         }
                         $errors[] = $errMsg;
                         continue;
@@ -1991,10 +2013,7 @@ SQL
             return array( 'errorMsg' => 'An invalid file was requested for deletion.' );
         }
         // wp_delete_file() only gained a return value in WP 6.7 and we support 6.2+, so the readback
-        // decides; the return would report every delete as failed on 6.2-6.6. Without the clear, a
-        // warning raised earlier in the request by anything at all would be handed to the Dashboard
-        // as this deletion's reason.
-        error_clear_last();
+        // decides; the return would report every delete as failed on 6.2-6.6.
         wp_delete_file( $localFile );
         clearstatcache( true, $localFile );
         if ( ! file_exists( $localFile ) ) {
@@ -2006,9 +2025,7 @@ SQL
                 'file'      => $file,
             );
         } else {
-            $err = error_get_last();
-
-            return array( 'errorMsg' => 'Could not delete file ' . htmlentities( $file ) . '. The error was: ' . htmlentities( is_array( $err ) ? $err['message'] : 'unknown' ) );
+            return array( 'errorMsg' => 'Could not delete file ' . htmlentities( $file ) . '. ' . self::ERROR_LOG_HINT );
         }
     }
 
@@ -2041,13 +2058,15 @@ SQL
             return array( 'cerrorMsg' => 'An invalid file was specified for repair.' );
         }
         $localFile = ABSPATH . '/' . preg_replace( '/^[\.\/]+/', '', $file );
-        $fh        = fopen( $localFile, 'w' );
+        // The clear is what makes the permission test below answer about this open and not about an
+        // error anything else in the request left behind.
+        error_clear_last();
+        $fh = fopen( $localFile, 'w' );
         if ( ! $fh ) {
-            $err = error_get_last();
-            if ( preg_match( '/Permission denied/i', $err['message'] ) ) {
+            if ( self::write_failed_on_permissions() ) {
                 $errMsg = "You don't have permission to repair that file. You need to either fix the file manually using FTP or change the file permissions and ownership so that your web server has write access to repair the file.";
             } else {
-                $errMsg = 'We could not write to that file. The error was: ' . $err['message'];
+                $errMsg = 'We could not write to that file. ' . self::ERROR_LOG_HINT;
             }
 
             return array( 'cerrorMsg' => $errMsg );
@@ -3314,9 +3333,8 @@ SQL
         }
         $fh = fopen( $file, 'r+' );
         if ( ! $fh ) {
-            $err = error_get_last();
             return array(
-                'err'  => 'We found your .htaccess file but could not open it for writing: ' . $err['message'],
+                'err'  => 'We found your .htaccess file but could not open it for writing. ' . self::ERROR_LOG_HINT,
                 'code' => \wfCache::getHtaccessCode(),
             );
         }
@@ -3347,10 +3365,22 @@ SQL
         }
         $fh = fopen( $file, 'r+' );
         if ( ! $fh ) {
-            $err = error_get_last();
-            $result = array( 'err' => 'We found your .htaccess file but could not open it for writing: ' . $err['message'] );
+            $result = array( 'err' => 'We found your .htaccess file but could not open it for writing. ' . self::ERROR_LOG_HINT );
         }
         return $result;
+    }
+
+    /**
+     * Report whether the write that just failed failed for want of permissions.
+     *
+     * Only ever consulted straight after an error_clear_last() and a failed open, so a swallowed or
+     * absent error reads as "some other reason" rather than as a message to dereference.
+     *
+     * @return bool
+     */
+    private static function write_failed_on_permissions() {
+        $err = error_get_last();
+        return is_array( $err ) && isset( $err['message'] ) && is_string( $err['message'] ) && preg_match( '/Permission denied/i', $err['message'] );
     }
 
     /**

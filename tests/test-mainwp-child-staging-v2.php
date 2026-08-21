@@ -39,6 +39,9 @@ class Test_MainWP_Child_Staging_V2_Fixture extends MainWP_Child_Staging {
 	/** @var bool */
 	public $preview_ready = true;
 
+	/** @var string|null IS_FREE_LOCK() observed while the provider ran. */
+	public $lock_free_during_dispatch = null;
+
 	/** Avoid installed-plugin lookup. */
 	public function __construct() {
 		$this->is_plugin_installed = true;
@@ -92,13 +95,49 @@ class Test_MainWP_Child_Staging_V2_Fixture extends MainWP_Child_Staging {
 
 	/** @return array|WP_Error */
 	protected function abilities_v2_provider_operation( $operation, $payload ) {
-		$this->operation_calls[] = array( $operation, $payload );
+		global $wpdb;
+		$this->operation_calls[]         = array( $operation, $payload );
+		$this->lock_free_during_dispatch = $wpdb->get_var( $wpdb->prepare( 'SELECT IS_FREE_LOCK(%s)', $this->abilities_v2_lock_name() ) );
 		return isset( $this->operation_results[ $operation ] ) ? $this->operation_results[ $operation ] : new WP_Error( 'provider_unavailable' );
 	}
 
 	/** @return array|false */
 	public function fixture_inventory_rows() {
 		return $this->abilities_v2_inventory_rows();
+	}
+
+	/** @return string */
+	public function fixture_lock_name() {
+		return $this->abilities_v2_lock_name();
+	}
+}
+
+/** Answers a named-lock query from a script, so each acquire attempt is observable. */
+class Test_MainWP_Child_Staging_V2_Lock_Wpdb {
+
+	/** @var string */
+	public $last_error = '';
+
+	/** @var array One array( error, result ) per expected attempt. */
+	private $answers;
+
+	/** @param array $answers Scripted answers. */
+	public function __construct( $answers ) {
+		$this->answers = $answers;
+	}
+
+	/** @param string $query Query. @return string */
+	public function prepare( $query, ...$args ) {
+		unset( $args );
+		return $query;
+	}
+
+	/** @param string $query Query. @return mixed */
+	public function get_var( $query ) {
+		unset( $query );
+		$answer           = array_shift( $this->answers );
+		$this->last_error = $answer[0];
+		return $answer[1];
 	}
 }
 
@@ -627,6 +666,173 @@ class Test_MainWP_Child_Staging_V2 extends WP_UnitTestCase {
 		);
 		$this->assertTrue( $reconcile['ok'] );
 		$this->assertSame( 2, $reconcile['affected_steps'] );
+	}
+
+	/** The clone job runs with the mutation lock held, and a lock held elsewhere refuses it outright. */
+	public function test_clone_mutation_runs_under_the_named_lock_and_a_held_lock_refuses_it() {
+		$this->staging->operation_results['create_clone'] = $this->queued_clone_result();
+
+		$result = $this->staging->abilities_v2( $this->clone_request( '123e4567-e89b-42d3-a456-426614174941' ) );
+		$this->assertTrue( $result['ok'] );
+		$this->assertSame( '0', (string) $this->staging->lock_free_during_dispatch );
+		$this->assertSame( '1', (string) $this->lock_state( $this->staging->fixture_lock_name() ) );
+
+		$this->staging->operation_calls = array();
+		$holder                         = $this->hold_lock_elsewhere( $this->staging->fixture_lock_name() );
+		$held                           = $this->staging->abilities_v2( $this->clone_request( '123e4567-e89b-42d3-a456-426614174942' ) );
+		$this->release_lock_elsewhere( $holder, $this->staging->fixture_lock_name() );
+
+		$this->assertFalse( $held['ok'] );
+		$this->assertSame( 'lock_busy', $held['error_code'] );
+		$this->assertSame( array(), $this->staging->operation_calls );
+		$this->assertArrayNotHasKey( '123e4567-e89b-42d3-a456-426614174942', get_option( 'mainwp_staging_abilities_v2_operation_receipts', array() ) );
+	}
+
+	/** A lock backend that cannot answer is refused as a store failure, not as someone else's lock. */
+	public function test_an_unusable_lock_backend_is_refused_apart_from_a_held_lock() {
+		// The lock name reads home_url(), so it is resolved while the real connection is still in place.
+		$this->staging->fixture_lock_name();
+		$this->staging->operation_results['create_clone'] = $this->queued_clone_result();
+		$request = $this->clone_request( '123e4567-e89b-42d3-a456-426614174943' );
+
+		$backends = array(
+			'driver error'     => array( array( 'MySQL server has gone away', null ) ),
+			'GET_LOCK is NULL' => array( array( '', null ) ),
+		);
+		foreach ( $backends as $label => $answers ) {
+			$real            = $GLOBALS['wpdb'];
+			$GLOBALS['wpdb'] = new Test_MainWP_Child_Staging_V2_Lock_Wpdb( $answers );
+			try {
+				$result = $this->staging->abilities_v2( $request );
+			} finally {
+				$GLOBALS['wpdb'] = $real;
+			}
+
+			$this->assertFalse( $result['ok'], $label );
+			$this->assertSame( 'storage_unavailable', $result['error_code'], $label );
+		}
+		$this->assertSame( array(), $this->staging->operation_calls );
+		$this->assertSame( array(), get_option( 'mainwp_staging_abilities_v2_operation_receipts', array() ) );
+	}
+
+	/**
+	 * A full store refuses rather than forgetting a receipt a retry still needs, and it comes back
+	 * on its own once the oldest entry ages past the retry horizon.
+	 */
+	public function test_a_full_receipt_store_refuses_before_dispatch_and_self_clears_past_the_horizon() {
+		$this->staging->operation_results['create_clone'] = $this->queued_clone_result();
+		$oldest = '123e4567-e89b-42d3-a456-4266141749a0';
+		update_option( 'mainwp_staging_abilities_v2_operation_receipts', $this->fill_receipts( 100, time(), $oldest ), false );
+
+		$refused = $this->staging->abilities_v2( $this->clone_request( '123e4567-e89b-42d3-a456-426614174944' ) );
+
+		$this->assertFalse( $refused['ok'] );
+		$this->assertSame( 'storage_unavailable', $refused['error_code'] );
+		$this->assertSame( array(), $this->staging->operation_calls, 'the provider must not run when the outcome cannot be recorded' );
+		$this->assertCount( 100, get_option( 'mainwp_staging_abilities_v2_operation_receipts', array() ) );
+
+		// Only the clock changes: the oldest receipt is now past the horizon and nothing else is.
+		$receipts                          = get_option( 'mainwp_staging_abilities_v2_operation_receipts', array() );
+		$receipts[ $oldest ]['created_at'] = time() - ( DAY_IN_SECONDS + 3600 );
+		update_option( 'mainwp_staging_abilities_v2_operation_receipts', $receipts, false );
+
+		$accepted = $this->staging->abilities_v2( $this->clone_request( '123e4567-e89b-42d3-a456-426614174945' ) );
+		$stored   = get_option( 'mainwp_staging_abilities_v2_operation_receipts', array() );
+
+		$this->assertTrue( $accepted['ok'] );
+		$this->assertCount( 1, $this->staging->operation_calls );
+		$this->assertCount( 100, $stored );
+		$this->assertArrayNotHasKey( $oldest, $stored, 'the aged receipt is the one given up' );
+		$this->assertArrayHasKey( '123e4567-e89b-42d3-a456-426614174945', $stored );
+	}
+
+	/** An entry no retry can be answered from is given up before any receipt still inside the horizon. */
+	public function test_unreadable_and_future_stamped_entries_are_evicted_before_live_receipts() {
+		$this->staging->operation_results['create_clone'] = $this->queued_clone_result();
+		$receipts                                         = $this->fill_receipts( 98, time() );
+		// The two-key shape an earlier build of this branch wrote, and a stamp from a clock that jumped.
+		$receipts['123e4567-e89b-42d3-a456-4266141749b0'] = array(
+			'effect_hash' => str_repeat( 'e', 64 ),
+			'response'    => array( 'ok' => true ),
+		);
+		$receipts['123e4567-e89b-42d3-a456-4266141749b1'] = array(
+			'effect_hash' => str_repeat( 'f', 64 ),
+			'response'    => array( 'ok' => true ),
+			'created_at'  => time() + YEAR_IN_SECONDS,
+		);
+		update_option( 'mainwp_staging_abilities_v2_operation_receipts', $receipts, false );
+
+		$result = $this->staging->abilities_v2( $this->clone_request( '123e4567-e89b-42d3-a456-426614174946' ) );
+		$stored = get_option( 'mainwp_staging_abilities_v2_operation_receipts', array() );
+
+		$this->assertTrue( $result['ok'] );
+		$this->assertArrayNotHasKey( '123e4567-e89b-42d3-a456-4266141749b0', $stored );
+		$this->assertArrayHasKey( '123e4567-e89b-42d3-a456-4266141749b1', $stored, 'only one slot is freed per request' );
+		$this->assertCount( 100, $stored );
+	}
+
+	/** @param int $count How many. @param int $created_at Stamp. @param string|null $first Reference of the first entry. @return array */
+	private function fill_receipts( $count, $created_at, $first = null ) {
+		$receipts = array();
+		for ( $index = 0; $index < $count; $index++ ) {
+			$reference = 0 === $index && null !== $first ? $first : sprintf( '123e4567-e89b-42d3-a456-4266141750%02d', $index );
+			$receipts[ $reference ] = array(
+				'effect_hash' => hash( 'sha256', $reference ),
+				'response'    => array(
+					'protocol'    => '2',
+					'operation'   => 'create_clone',
+					'ok'          => true,
+					'request_ref' => $reference,
+				),
+				'created_at'  => $created_at,
+			);
+		}
+		return $receipts;
+	}
+
+	/** @return array */
+	private function queued_clone_result() {
+		return array(
+			'operation_ref' => '123e4567-e89b-42d3-a456-426614174940',
+			'clone_ref'     => null,
+			'status'        => 'queued',
+		);
+	}
+
+	/** @param string $request_ref Reference. @return array */
+	private function clone_request( $request_ref ) {
+		return array(
+			'protocol'    => '2',
+			'operation'   => 'create_clone',
+			'request_ref' => $request_ref,
+			'payload'     => array( 'inventory_revision' => str_repeat( 'a', 64 ) ),
+		);
+	}
+
+	/** @param string $name Lock name. @return string|null */
+	private function lock_state( $name ) {
+		global $wpdb;
+		return $wpdb->get_var( $wpdb->prepare( 'SELECT IS_FREE_LOCK(%s)', $name ) );
+	}
+
+	/** @param string $name Lock name. @return wpdb */
+	private function hold_lock_elsewhere( $name ) {
+		$other = new wpdb( DB_USER, DB_PASSWORD, DB_NAME, DB_HOST );
+		$other->suppress_errors( true );
+		$held = (string) $other->get_var( $other->prepare( 'SELECT GET_LOCK(%s,0)', $name ) );
+		if ( '1' !== $held ) {
+			// A lock this connection never took needs no release, but the connection is ours either
+			// way and a failing assertion would otherwise strand it for the rest of the run.
+			$other->close();
+		}
+		$this->assertSame( '1', $held );
+		return $other;
+	}
+
+	/** @param wpdb $other Connection. @param string $name Lock name. */
+	private function release_lock_elsewhere( $other, $name ) {
+		$other->get_var( $other->prepare( 'SELECT RELEASE_LOCK(%s)', $name ) );
+		$other->close();
 	}
 
 	/** Legacy action names remain available. */

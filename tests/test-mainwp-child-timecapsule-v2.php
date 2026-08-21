@@ -555,6 +555,76 @@ class Test_MainWP_Child_Timecapsule_V2 extends WP_UnitTestCase {
 		$this->assertTrue( $read['ok'] );
 	}
 
+	/**
+	 * A full receipt store refuses rather than forgetting an outcome a retry still needs, and it
+	 * comes back on its own once the oldest entry ages past the retry horizon.
+	 */
+	public function test_a_full_receipt_store_refuses_before_the_provider_and_self_clears_past_the_horizon() {
+		$fixture                          = new Timecapsule_V2_Protocol_Fixture();
+		$fixture->is_plugin_installed     = true;
+		$fixture->results['start_backup'] = array(
+			'operation_ref' => str_repeat( 'a', 64 ),
+			'state'         => 'queued',
+			'scope'         => 'full',
+		);
+		$oldest = '123e4567-e89b-42d3-a456-4266141749c0';
+		update_option( 'mainwp_timecapsule_abilities_v2_receipts', $this->fill_receipts( 100, time(), $oldest ), false );
+
+		$refused = $fixture->abilities_v2( $this->receipt_backup_request( '123e4567-e89b-42d3-a456-426614174971' ) );
+
+		$this->assertFalse( $refused['ok'] );
+		$this->assertSame( 'storage_unavailable', $refused['code'] );
+		$this->assertSame( array(), $fixture->calls, 'the provider must not run when the outcome cannot be recorded' );
+		$this->assertCount( 100, get_option( 'mainwp_timecapsule_abilities_v2_receipts', array() ) );
+
+		// Only the clock changes: the oldest receipt is now past the horizon and nothing else is.
+		$receipts                          = get_option( 'mainwp_timecapsule_abilities_v2_receipts', array() );
+		$receipts[ $oldest ]['created_at'] = time() - ( DAY_IN_SECONDS + 3600 );
+		update_option( 'mainwp_timecapsule_abilities_v2_receipts', $receipts, false );
+
+		$accepted = $fixture->abilities_v2( $this->receipt_backup_request( '123e4567-e89b-42d3-a456-426614174972' ) );
+		$stored   = get_option( 'mainwp_timecapsule_abilities_v2_receipts', array() );
+
+		$this->assertTrue( $accepted['ok'] );
+		$this->assertCount( 1, $fixture->calls );
+		$this->assertCount( 100, $stored );
+		$this->assertArrayNotHasKey( $oldest, $stored, 'the aged receipt is the one given up' );
+		$this->assertArrayHasKey( '123e4567-e89b-42d3-a456-426614174972', $stored );
+	}
+
+	/** @param int $count How many. @param int $created_at Stamp. @param string|null $first Reference of the first entry. @return array */
+	private function fill_receipts( $count, $created_at, $first = null ) {
+		$receipts = array();
+		for ( $index = 0; $index < $count; $index++ ) {
+			$reference              = 0 === $index && null !== $first ? $first : sprintf( '123e4567-e89b-42d3-a456-4266141751%02d', $index );
+			$receipts[ $reference ] = array(
+				'effect_hash' => hash( 'sha256', $reference ),
+				'response'    => array(
+					'protocol'    => '2',
+					'operation'   => 'start_backup',
+					'ok'          => true,
+					'request_ref' => $reference,
+				),
+				'created_at'  => $created_at,
+			);
+		}
+		return $receipts;
+	}
+
+	/** @param string $request_ref Reference. @return array */
+	private function receipt_backup_request( $request_ref ) {
+		return array(
+			'protocol'    => '2',
+			'operation'   => 'start_backup',
+			'request_ref' => $request_ref,
+			'payload'     => array(
+				'scope'             => 'full',
+				'label'             => null,
+				'policy_generation' => str_repeat( 'b', 64 ),
+			),
+		);
+	}
+
 	private function start_backup_request( $policy_generation ) {
 		return array(
 			'protocol'    => '2',

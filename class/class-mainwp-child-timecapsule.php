@@ -33,6 +33,20 @@ if ( ! defined( 'ABSPATH' ) ) {
 class MainWP_Child_Timecapsule { //phpcs:ignore -- NOSONAR - multi methods.
 
     /**
+     * How many mutation receipts the option holds.
+     *
+     * @var int
+     */
+    const ABILITIES_V2_MAX_RECEIPTS = 100;
+
+    /**
+     * How far ahead of this Child's clock a receipt stamp is still believed.
+     *
+     * @var int
+     */
+    const ABILITIES_V2_CLOCK_SKEW = 300;
+
+    /**
      * Public static variable to hold the single instance of the class.
      *
      * @var mixed Default null
@@ -433,10 +447,17 @@ class MainWP_Child_Timecapsule { //phpcs:ignore -- NOSONAR - multi methods.
             }
             if ( isset( $receipts[ $request_ref ] ) ) {
                 $receipt = $receipts[ $request_ref ];
-                if ( ! is_array( $receipt ) || ! $this->abilities_v2_exact_keys( $receipt, array( 'effect_hash', 'response' ) ) || ! is_string( $receipt['effect_hash'] ) || ! is_array( $receipt['response'] ) ) {
+                if ( ! $this->abilities_v2_valid_receipt( $receipt ) ) {
                     return $this->abilities_v2_error( $operation, 'storage_unavailable' );
                 }
                 return hash_equals( $receipt['effect_hash'], $effect_hash ) ? $receipt['response'] : $this->abilities_v2_error( $operation, 'request_conflict' );
+            }
+
+            // Room has to exist before the provider is touched. A backup or restore this Child
+            // cannot record is one the Dashboard's next retry runs a second time.
+            $receipts = $this->abilities_v2_evict_receipts( $receipts );
+            if ( false === $receipts ) {
+                return $this->abilities_v2_error( $operation, 'storage_unavailable' );
             }
         }
 
@@ -463,15 +484,68 @@ class MainWP_Child_Timecapsule { //phpcs:ignore -- NOSONAR - multi methods.
             $result
         );
         if ( $is_mutation ) {
-            if ( 100 <= count( $receipts ) ) {
-                array_shift( $receipts );
-            }
-            $receipts[ $request_ref ] = array( 'effect_hash' => $effect_hash, 'response' => $response );
+            $receipts[ $request_ref ] = array(
+                'effect_hash' => $effect_hash,
+                'response'    => $response,
+                'created_at'  => time(),
+            );
             if ( ! update_option( 'mainwp_timecapsule_abilities_v2_receipts', $receipts, false ) && $receipts !== get_option( 'mainwp_timecapsule_abilities_v2_receipts', array() ) ) {
                 return $this->abilities_v2_error( $operation, 'outcome_unknown' );
             }
         }
         return $response;
+    }
+
+    /**
+     * Validate one stored mutation receipt.
+     *
+     * @param mixed $receipt Stored receipt.
+     * @return bool
+     */
+    private function abilities_v2_valid_receipt( $receipt ) {
+        return is_array( $receipt )
+            && $this->abilities_v2_exact_keys( $receipt, array( 'effect_hash', 'response', 'created_at' ) )
+            && is_string( $receipt['effect_hash'] )
+            && is_array( $receipt['response'] )
+            && is_int( $receipt['created_at'] );
+    }
+
+    /**
+     * Free one receipt slot without discarding an outcome a retry could still ask for.
+     *
+     * The created_at stamp is written once and never restamped, so a full store crosses the
+     * horizon on its own and starts accepting writes again without an operator touching anything.
+     *
+     * @param array $receipts Current receipts.
+     * @return array|false Receipts with room for one more, or false when nothing can be given up.
+     */
+    private function abilities_v2_evict_receipts( $receipts ) {
+        if ( self::ABILITIES_V2_MAX_RECEIPTS > count( $receipts ) ) {
+            return $receipts;
+        }
+        $now       = time();
+        $horizon   = $now - ( DAY_IN_SECONDS + 60 );
+        $evictable = array();
+        foreach ( $receipts as $reference => $receipt ) {
+            if ( ! $this->abilities_v2_valid_receipt( $receipt ) || $receipt['created_at'] > $now + self::ABILITIES_V2_CLOCK_SKEW ) {
+                // An entry that cannot be read, or that carries a stamp from the future no horizon
+                // will ever pass, answers no retry. Giving those up first is what stops a store
+                // written by an older build, or by a host whose clock jumped, from wedging shut.
+                $evictable[ $reference ] = 0;
+                continue;
+            }
+            if ( $receipt['created_at'] < $horizon ) {
+                $evictable[ $reference ] = $receipt['created_at'];
+            }
+        }
+        asort( $evictable, SORT_NUMERIC );
+        foreach ( array_keys( $evictable ) as $reference ) {
+            if ( self::ABILITIES_V2_MAX_RECEIPTS > count( $receipts ) ) {
+                break;
+            }
+            unset( $receipts[ $reference ] );
+        }
+        return self::ABILITIES_V2_MAX_RECEIPTS > count( $receipts ) ? $receipts : false;
     }
 
     /**

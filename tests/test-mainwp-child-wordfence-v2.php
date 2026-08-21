@@ -41,8 +41,8 @@ class Wordfence_V2_Protocol_Fixture extends MainWP_Child_Wordfence {
 	}
 }
 
-/** Answers RELEASE_LOCK() from a script, so each release attempt is observable. */
-class Wordfence_Release_Wpdb_Stub {
+/** Answers a named-lock query from a script, so each acquire or release attempt is observable. */
+class Wordfence_Lock_Wpdb_Stub {
 
 	/** @var array Queries this substitute was asked to run. */
 	public $queries = array();
@@ -84,10 +84,54 @@ class Wordfence_Issue_Store_Stub {
 	}
 }
 
-// Wordfence is not installed in the harness, so the global name the Child constructs is aliased
+/** Stand-in for the Wordfence facade the repair paths read original file content from. */
+class Wordfence_Facade_Stub {
+
+	public static function getWPFileContent( $file, $c_type, $c_name = '', $c_version = '' ) {
+		unset( $file, $c_type, $c_name, $c_version );
+		return array(
+			'cerrorMsg'   => '',
+			'fileContent' => 'original contents',
+		);
+	}
+}
+
+/** Stand-in for the Wordfence cache helper the .htaccess paths ask for a path. */
+class Wordfence_Cache_Stub {
+
+	/** @var string Path the Child will try to open for writing. */
+	public static $htaccess_path = '';
+
+	public static function getHtaccessPath() {
+		return self::$htaccess_path;
+	}
+
+	public static function getHtaccessCode() {
+		return 'htaccess-code';
+	}
+}
+
+/** Stand-in for the Wordfence server-detection helper. */
+class Wordfence_Utils_Stub {
+
+	public static function isNginx() {
+		return false;
+	}
+}
+
+// Wordfence is not installed in the harness, so the global names the Child constructs are aliased
 // rather than declared - this file cannot open a global namespace block without being rewritten.
 if ( ! class_exists( '\wfIssues', false ) ) {
 	class_alias( Wordfence_Issue_Store_Stub::class, 'wfIssues' );
+}
+if ( ! class_exists( '\wordfence', false ) ) {
+	class_alias( Wordfence_Facade_Stub::class, 'wordfence' );
+}
+if ( ! class_exists( '\wfCache', false ) ) {
+	class_alias( Wordfence_Cache_Stub::class, 'wfCache' );
+}
+if ( ! class_exists( '\wfUtils', false ) ) {
+	class_alias( Wordfence_Utils_Stub::class, 'wfUtils' );
 }
 
 class Test_MainWP_Child_Wordfence_V2 extends WP_UnitTestCase {
@@ -97,6 +141,9 @@ class Test_MainWP_Child_Wordfence_V2 extends WP_UnitTestCase {
 
 	/** Substring that only the earlier, unrelated warning can contribute to a message. */
 	const STALE_MARKER = 'mainwp-unrelated-earlier-warning';
+
+	/** Web-root directory the write paths are pointed at, so every fopen() for writing fails. */
+	const PROBE_DIR = 'mainwp-wordfence-write-probe';
 
 	/** @var MainWP_Child_Wordfence */
 	private $subject;
@@ -248,6 +295,39 @@ class Test_MainWP_Child_Wordfence_V2 extends WP_UnitTestCase {
 		$this->assertSame( 'provider_unavailable', $read['code'] );
 	}
 
+	/** A lock backend that cannot answer is refused as a store failure, not as someone else's lock. */
+	public function test_an_unusable_lock_backend_is_refused_apart_from_a_held_lock() {
+		$fixture = $this->blocks_fixture();
+		// The lock name reads home_url(), so it is resolved while the real connection is still in place.
+		$name = $fixture->lock_name();
+
+		$backends = array(
+			'driver error'     => array( array( 'MySQL server has gone away', null ) ),
+			'GET_LOCK is NULL' => array( array( '', null ) ),
+		);
+		foreach ( $backends as $label => $answers ) {
+			$real            = $GLOBALS['wpdb'];
+			$GLOBALS['wpdb'] = new Wordfence_Lock_Wpdb_Stub( $answers );
+			try {
+				$result = $fixture->abilities_v2( $this->blocks_request() );
+			} finally {
+				$GLOBALS['wpdb'] = $real;
+			}
+
+			$this->assertFalse( $result['ok'], $label );
+			$this->assertSame( 'storage_unavailable', $result['code'], $label );
+		}
+
+		$holder = $this->hold_lock_elsewhere( $name );
+		$held   = $fixture->abilities_v2( $this->blocks_request() );
+		$this->release_lock_elsewhere( $holder, $name );
+
+		$this->assertFalse( $held['ok'] );
+		$this->assertSame( 'lock_busy', $held['code'] );
+		$this->assertSame( array(), $fixture->calls );
+		$this->assertSame( array(), get_option( 'mainwp_wordfence_abilities_v2_receipts', array() ) );
+	}
+
 	public function test_release_reads_an_absent_lock_as_released_and_retries_a_failed_release_once() {
 		$fixture = new Wordfence_V2_Protocol_Fixture();
 		// The lock name reads home_url(), so it is resolved while the real connection is still in place.
@@ -255,17 +335,17 @@ class Test_MainWP_Child_Wordfence_V2 extends WP_UnitTestCase {
 		$real = $GLOBALS['wpdb'];
 
 		try {
-			$absent          = new Wordfence_Release_Wpdb_Stub( array( array( '', null ) ) );
+			$absent          = new Wordfence_Lock_Wpdb_Stub( array( array( '', null ) ) );
 			$GLOBALS['wpdb'] = $absent;
 			$this->assertTrue( $fixture->end_mutation_lock() );
 			$this->assertCount( 1, $absent->queries );
 
-			$retried         = new Wordfence_Release_Wpdb_Stub( array( array( 'MySQL server has gone away', null ), array( '', '1' ) ) );
+			$retried         = new Wordfence_Lock_Wpdb_Stub( array( array( 'MySQL server has gone away', null ), array( '', '1' ) ) );
 			$GLOBALS['wpdb'] = $retried;
 			$this->assertTrue( $fixture->end_mutation_lock() );
 			$this->assertCount( 2, $retried->queries );
 
-			$failing         = new Wordfence_Release_Wpdb_Stub( array( array( 'Lost connection', null ), array( 'Lost connection', null ) ) );
+			$failing         = new Wordfence_Lock_Wpdb_Stub( array( array( 'Lost connection', null ), array( 'Lost connection', null ) ) );
 			$GLOBALS['wpdb'] = $failing;
 			$this->assertFalse( $fixture->end_mutation_lock() );
 			$this->assertCount( 2, $failing->queries );
@@ -298,9 +378,121 @@ class Test_MainWP_Child_Wordfence_V2 extends WP_UnitTestCase {
 		}
 
 		$this->assertStringNotContainsString( self::STALE_MARKER, $single['errorMsg'] );
-		$this->assertStringContainsString( 'unknown', $single['errorMsg'] );
+		$this->assertStringNotContainsString( ABSPATH, $single['errorMsg'] );
+		$this->assertStringContainsString( MainWP_Child_Wordfence::ERROR_LOG_HINT, $single['errorMsg'] );
 		$this->assertStringNotContainsString( self::STALE_MARKER, $bulk['bulkBody'] );
-		$this->assertStringContainsString( 'unknown', $bulk['bulkBody'] );
+		$this->assertStringNotContainsString( ABSPATH, $bulk['bulkBody'] );
+		$this->assertStringContainsString( MainWP_Child_Wordfence::ERROR_LOG_HINT, $bulk['bulkBody'] );
+	}
+
+	/**
+	 * Every path that reports a failed write must answer with its own fixed reason.
+	 *
+	 * Two conditions, because error_get_last() misleads in both directions once another plugin has
+	 * installed an error handler that swallows warnings: it keeps returning some earlier, unrelated
+	 * error, or it returns null and there is nothing to read at all.
+	 */
+	public function test_write_failures_report_a_fixed_reason_and_never_read_a_swallowed_error() {
+		$probe = ABSPATH . self::PROBE_DIR;
+		mkdir( $probe );
+		Wordfence_Cache_Stub::$htaccess_path = $probe;
+		Wordfence_Issue_Store_Stub::$issues  = array(
+			'issue-1' => array(
+				'data' => array(
+					'file'     => self::PROBE_DIR,
+					'cType'    => 'plugin',
+					'cName'    => 'probe',
+					'cVersion' => '1.0',
+				),
+			),
+		);
+		$subject = $this->subject;
+		$calls   = array(
+			'restore_file'          => function () use ( $subject ) {
+				$_POST['issueID'] = 'issue-1';
+				try {
+					return $subject->restore_file();
+				} finally {
+					unset( $_POST['issueID'] );
+				}
+			},
+			'bulk_operation repair' => function () use ( $subject ) {
+				$_POST['op']  = 'repair';
+				$_POST['ids'] = array( 'issue-1' );
+				try {
+					return $subject->bulk_operation();
+				} finally {
+					unset( $_POST['op'], $_POST['ids'] );
+				}
+			},
+			'check_htaccess'        => function () {
+				return MainWP_Child_Wordfence::check_htaccess();
+			},
+			'check_falcon_htaccess' => function () {
+				return MainWP_Child_Wordfence::check_falcon_htaccess();
+			},
+		);
+
+		try {
+			foreach ( $calls as $label => $call ) {
+				// An error another plugin raised earlier in the request is all error_get_last() holds.
+				$this->raise_unrelated_warning();
+				list( $borrowed ) = $this->swallow_errors( $call );
+				$borrowed_text    = wp_json_encode( $borrowed );
+				$this->assertStringNotContainsString( self::STALE_MARKER, $borrowed_text, $label );
+				$this->assertStringNotContainsString( ABSPATH, $borrowed_text, $label );
+				$this->assertStringNotContainsString( 'The error was', $borrowed_text, $label );
+				$this->assertStringNotContainsString( 'could not open it for writing:', $borrowed_text, $label );
+
+				// Someone else's "Permission denied" must not become this open's diagnosis.
+				@trigger_error( self::STALE_MARKER . ' Permission denied', E_USER_WARNING ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_trigger_error,WordPress.PHP.NoSilencedErrors.Discouraged -- Seeds error_get_last() without tripping the harness handler.
+				list( $misdiagnosed ) = $this->swallow_errors( $call );
+				$this->assertStringNotContainsString( 'permission', strtolower( wp_json_encode( $misdiagnosed ) ), $label );
+
+				// Nothing pending at all: the path must not read the null back out.
+				error_clear_last();
+				list( , $raised ) = $this->swallow_errors( $call );
+				$nulls            = array_values(
+					array_filter(
+						$raised,
+						function ( $message ) {
+							return false !== stripos( $message, 'null' );
+						}
+					)
+				);
+				$this->assertSame( array(), $nulls, $label );
+			}
+		} finally {
+			Wordfence_Issue_Store_Stub::$issues  = array();
+			Wordfence_Cache_Stub::$htaccess_path = '';
+			rmdir( $probe );
+		}
+	}
+
+	/**
+	 * Run one call with every error it raises swallowed and recorded.
+	 *
+	 * A handler that returns true leaves error_get_last() holding whatever was already there, which
+	 * is how another plugin's error handler makes both misreadings above reachable in production.
+	 *
+	 * @param callable $call Call to run.
+	 * @return array array( return value, messages raised )
+	 */
+	private function swallow_errors( $call ) {
+		$raised = array();
+		set_error_handler( // phpcs:ignore WordPress.PHP.DevelopmentFunctions.prevent_path_disclosure_set_error_handler -- Scoped to one call and restored below.
+			function ( $errno, $errstr ) use ( &$raised ) {
+				unset( $errno );
+				$raised[] = $errstr;
+				return true;
+			}
+		);
+		try {
+			$result = $call();
+		} finally {
+			restore_error_handler();
+		}
+		return array( $result, $raised );
 	}
 
 	/** Leave a warning of the kind any other plugin can raise earlier in the same request. */

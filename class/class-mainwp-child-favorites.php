@@ -760,7 +760,10 @@ class MainWP_Child_Favorites {
         $result = $installer->run(
             array(
                 'package'           => $path,
-                'destination'       => 'plugin' === $payload['type'] ? WP_PLUGIN_DIR : WP_CONTENT_DIR . '/themes',
+                // get_theme_root(), not the WP_CONTENT_DIR constant: a moved theme root announces
+                // itself through the theme_root filter, and core's Theme_Upgrader::install() honors
+                // it. Only the theme half moves; WP_PLUGIN_DIR is genuinely the one plugin root.
+                'destination'       => 'plugin' === $payload['type'] ? WP_PLUGIN_DIR : get_theme_root(),
                 'clear_destination' => $payload['overwrite'],
                 'clear_working'     => true,
                 'hook_extra'        => array(),

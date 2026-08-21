@@ -202,10 +202,15 @@ class MainWP_Child_Jetpack_Scan {
 
         $visibility = 'unknown';
         if ( 'active' === $plugin_state ) {
-            $hide_option = get_option( 'mainwp_child_jetpack_scan_hide_plugin', false );
-            if ( 'hide' === $hide_option ) {
+            // The plugin is hidden when EITHER option fires: this class hides on the scan option
+            // and MainWP_Child_Jetpack_Protect hides on the protect option, each behind its own
+            // all_plugins filter. Reading one would report visible for a plugin the admin cannot
+            // see, e.g. after the protect class's legacy set_showhide() which writes only its own.
+            $scan_option    = get_option( 'mainwp_child_jetpack_scan_hide_plugin', false );
+            $protect_option = get_option( 'mainwp_child_jetpack_protect_hide_plugin', false );
+            if ( 'hide' === $scan_option || 'hide' === $protect_option ) {
                 $visibility = 'hidden';
-            } elseif ( false === $hide_option || '' === $hide_option || 'show' === $hide_option ) {
+            } elseif ( $this->abilities_v2_option_shows( $scan_option ) && $this->abilities_v2_option_shows( $protect_option ) ) {
                 $visibility = 'visible';
             }
         }
@@ -242,27 +247,48 @@ class MainWP_Child_Jetpack_Scan {
             return $current;
         }
 
-        $option_name = 'mainwp_child_jetpack_scan_hide_plugin';
-        $old_value   = get_option( $option_name, false );
-        $new_value   = 'hidden' === $desired_state ? 'hide' : 'show';
-        $write_ok    = MainWP_Helper::update_option( $option_name, $new_value, 'yes' );
-        $stored      = $this->abilities_v2_visibility();
+        // Both options, like the legacy set_showhide(): either one hides the plugin, so writing
+        // only the scan option lets a legacy hide keep the plugin hidden after this ability
+        // reported it visible.
+        $option_names = array( 'mainwp_child_jetpack_scan_hide_plugin', 'mainwp_child_jetpack_protect_hide_plugin' );
+        $new_value    = 'hidden' === $desired_state ? 'hide' : 'show';
+        $old_values   = array();
+        $write_ok     = true;
+        foreach ( $option_names as $option_name ) {
+            $old_values[ $option_name ] = get_option( $option_name, false );
+            $write_ok                   = MainWP_Helper::update_option( $option_name, $new_value, 'yes' ) && $write_ok;
+        }
+        $stored = $this->abilities_v2_visibility();
         if ( $desired_state === $stored['visibility'] ) {
             $stored['operation'] = 'visibility_set';
             $stored['changed']   = true;
             return $stored;
         }
 
-        if ( false === $old_value ) {
-            $restored = delete_option( $option_name ) || false === get_option( $option_name, false );
-        } else {
-            $restored = MainWP_Helper::update_option( $option_name, $old_value, 'yes' ) || get_option( $option_name, false ) === $old_value;
+        $restored = true;
+        foreach ( $option_names as $option_name ) {
+            $old_value = $old_values[ $option_name ];
+            if ( false === $old_value ) {
+                $restored = ( delete_option( $option_name ) || false === get_option( $option_name, false ) ) && $restored;
+            } else {
+                $restored = ( MainWP_Helper::update_option( $option_name, $old_value, 'yes' ) || get_option( $option_name, false ) === $old_value ) && $restored;
+            }
         }
         if ( ! $restored ) {
             return $this->abilities_v2_error( 'visibility_set', 'outcome_unknown' );
         }
 
         return $this->abilities_v2_error( 'visibility_set', $write_ok ? 'contradictory_readback' : 'write_failed' );
+    }
+
+    /**
+     * Decide whether one hide-option value means the plugin is not being hidden by it.
+     *
+     * @param mixed $value Raw option value.
+     * @return bool
+     */
+    private function abilities_v2_option_shows( $value ) {
+        return false === $value || '' === $value || 'show' === $value;
     }
 
     /**

@@ -149,11 +149,17 @@ class Test_MainWP_Child_Jetpack_Scan_V2 extends WP_UnitTestCase {
 	public function test_visibility_set_reports_write_failure_and_restores_contradictory_readback() {
 		$this->subject->is_plugin_installed = true;
 		update_option( 'mainwp_child_jetpack_scan_hide_plugin', 'show' );
+		// Seeded, not absent: MainWP_Helper::update_option() tries add_option() first, which no
+		// pre_update_option filter can block, so only an existing option has a blockable write.
+		update_option( 'mainwp_child_jetpack_protect_hide_plugin', 'show' );
 		$current = $this->request( 'visibility_get', array() );
-		$block   = static function ( $value, $old_value ) {
+		// Both writes must be blocked: a hide that lands on either option genuinely hides the
+		// plugin, so one blocked write and one successful one is a success, not a failure.
+		$block = static function ( $value, $old_value ) {
 			return $old_value;
 		};
 		add_filter( 'pre_update_option_mainwp_child_jetpack_scan_hide_plugin', $block, 10, 2 );
+		add_filter( 'pre_update_option_mainwp_child_jetpack_protect_hide_plugin', $block, 10, 2 );
 		$failed = $this->request(
 			'visibility_set',
 			array(
@@ -162,19 +168,30 @@ class Test_MainWP_Child_Jetpack_Scan_V2 extends WP_UnitTestCase {
 			)
 		);
 		remove_filter( 'pre_update_option_mainwp_child_jetpack_scan_hide_plugin', $block, 10 );
+		remove_filter( 'pre_update_option_mainwp_child_jetpack_protect_hide_plugin', $block, 10 );
 		$this->assertFalse( $failed['ok'] );
 		$this->assertSame( 'write_failed', $failed['code'] );
 		$this->assertSame( 'show', get_option( 'mainwp_child_jetpack_scan_hide_plugin' ) );
+		$this->assertSame( 'show', get_option( 'mainwp_child_jetpack_protect_hide_plugin' ) );
 
-		$contradict = null;
-		$contradict = static function ( $value ) use ( &$contradict ) {
+		$contradict_scan    = null;
+		$contradict_scan    = static function ( $value ) use ( &$contradict_scan ) {
 			if ( 'hide' === $value ) {
-				remove_filter( 'option_mainwp_child_jetpack_scan_hide_plugin', $contradict );
+				remove_filter( 'option_mainwp_child_jetpack_scan_hide_plugin', $contradict_scan );
 				return 'show';
 			}
 			return $value;
 		};
-		add_filter( 'option_mainwp_child_jetpack_scan_hide_plugin', $contradict );
+		$contradict_protect = null;
+		$contradict_protect = static function ( $value ) use ( &$contradict_protect ) {
+			if ( 'hide' === $value ) {
+				remove_filter( 'option_mainwp_child_jetpack_protect_hide_plugin', $contradict_protect );
+				return 'show';
+			}
+			return $value;
+		};
+		add_filter( 'option_mainwp_child_jetpack_scan_hide_plugin', $contradict_scan );
+		add_filter( 'option_mainwp_child_jetpack_protect_hide_plugin', $contradict_protect );
 		$unknown = $this->request(
 			'visibility_set',
 			array(
@@ -182,10 +199,82 @@ class Test_MainWP_Child_Jetpack_Scan_V2 extends WP_UnitTestCase {
 				'if_match'      => $current['revision'],
 			)
 		);
-		remove_filter( 'option_mainwp_child_jetpack_scan_hide_plugin', $contradict );
+		remove_filter( 'option_mainwp_child_jetpack_scan_hide_plugin', $contradict_scan );
+		remove_filter( 'option_mainwp_child_jetpack_protect_hide_plugin', $contradict_protect );
 		$this->assertFalse( $unknown['ok'] );
 		$this->assertSame( 'contradictory_readback', $unknown['code'] );
 		$this->assertSame( 'show', get_option( 'mainwp_child_jetpack_scan_hide_plugin' ) );
+		$this->assertSame( 'show', get_option( 'mainwp_child_jetpack_protect_hide_plugin' ) );
+	}
+
+	/**
+	 * The plugin is hidden when EITHER hide option fires: this class reads the scan option and
+	 * MainWP_Child_Jetpack_Protect reads the protect option, each behind its own all_plugins
+	 * filter. The legacy set_showhide() writes both, so the ability writing one leaves a state
+	 * where the ability's answer and the admin screen disagree.
+	 */
+	public function test_visibility_set_writes_both_hide_options_like_the_legacy_action() {
+		$this->subject->is_plugin_installed = true;
+		update_option( 'mainwp_child_jetpack_scan_hide_plugin', 'hide' );
+		update_option( 'mainwp_child_jetpack_protect_hide_plugin', 'hide' );
+
+		$current = $this->request( 'visibility_get', array() );
+		$this->assertSame( 'hidden', $current['visibility'] );
+
+		$result = $this->request(
+			'visibility_set',
+			array(
+				'desired_state' => 'visible',
+				'if_match'      => $current['revision'],
+			)
+		);
+
+		$this->assertTrue( $result['ok'] );
+		$this->assertTrue( $result['changed'] );
+		$this->assertSame( 'visible', $result['visibility'] );
+		$this->assertSame( 'show', get_option( 'mainwp_child_jetpack_scan_hide_plugin' ) );
+		$this->assertSame( 'show', get_option( 'mainwp_child_jetpack_protect_hide_plugin' ) );
+
+		$hide = $this->request(
+			'visibility_set',
+			array(
+				'desired_state' => 'hidden',
+				'if_match'      => $result['revision'],
+			)
+		);
+
+		$this->assertTrue( $hide['ok'] );
+		$this->assertSame( 'hide', get_option( 'mainwp_child_jetpack_scan_hide_plugin' ) );
+		$this->assertSame( 'hide', get_option( 'mainwp_child_jetpack_protect_hide_plugin' ) );
+	}
+
+	/**
+	 * The protect class's own legacy set_showhide() writes only the protect option, so a site
+	 * can be hiding the plugin with the scan option clear. Reading the scan option alone would
+	 * report visible for a plugin the admin cannot see.
+	 */
+	public function test_visibility_get_reports_hidden_when_either_hide_option_is_set() {
+		$this->subject->is_plugin_installed = true;
+
+		update_option( 'mainwp_child_jetpack_scan_hide_plugin', 'show' );
+		update_option( 'mainwp_child_jetpack_protect_hide_plugin', 'hide' );
+		$divergent = $this->request( 'visibility_get', array() );
+		$this->assertSame( 'hidden', $divergent['visibility'] );
+
+		// A malformed value beside a live 'hide' does not soften the answer: the hide fires anyway.
+		update_option( 'mainwp_child_jetpack_scan_hide_plugin', 'hide' );
+		update_option( 'mainwp_child_jetpack_protect_hide_plugin', array( 'hide' ) );
+		$still_hidden = $this->request( 'visibility_get', array() );
+		$this->assertSame( 'hidden', $still_hidden['visibility'] );
+
+		// A malformed value with nothing hiding is not visible; it is unknown.
+		update_option( 'mainwp_child_jetpack_scan_hide_plugin', 'show' );
+		$malformed = $this->request( 'visibility_get', array() );
+		$this->assertSame( 'unknown', $malformed['visibility'] );
+
+		delete_option( 'mainwp_child_jetpack_protect_hide_plugin' );
+		$clean = $this->request( 'visibility_get', array() );
+		$this->assertSame( 'visible', $clean['visibility'] );
 	}
 
 	public function test_malformed_unknown_and_uuid_alias_requests_fail_closed() {

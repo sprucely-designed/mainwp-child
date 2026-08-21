@@ -428,6 +428,66 @@ class Test_MainWP_Child_Favorites_V2 extends WP_UnitTestCase {
 	}
 
 	/**
+	 * A moved theme root announces itself through the theme_root filter, which is all that
+	 * separates get_theme_root() from the WP_CONTENT_DIR constant; registering a second theme
+	 * directory alone never moves core's no-argument return. Core's Theme_Upgrader::install()
+	 * honors the filter, so a theme unpacked anywhere else is invisible to WordPress while the
+	 * install still reports success. The destination is read off core's own package-options
+	 * filter, before any download, so nothing between dispatch_install() and the upgrader is
+	 * stubbed.
+	 */
+	public function test_theme_install_destination_honors_a_moved_theme_root() {
+		global $wp_theme_directories;
+
+		$alt_root = WP_CONTENT_DIR . '/mainwp-favorites-alt-themes';
+		if ( ! is_dir( $alt_root ) ) {
+			mkdir( $alt_root );
+		}
+		register_theme_directory( $alt_root );
+		$move_root = static function () use ( $alt_root ) {
+			return $alt_root;
+		};
+		add_filter( 'theme_root', $move_root );
+
+		$destination = null;
+		$capture     = static function ( $options ) use ( &$destination ) {
+			$destination = isset( $options['destination'] ) ? $options['destination'] : null;
+			return $options;
+		};
+		add_filter( 'upgrader_package_options', $capture );
+		$halt = static function () {
+			return new \WP_Error( 'mainwp_favorites_test_halt', 'Halted before download.' );
+		};
+		add_filter( 'upgrader_pre_download', $halt );
+
+		$package = wp_tempnam( 'mainwp-favorites-theme-root.zip' );
+		$level   = ob_get_level();
+		ob_start();
+		try {
+			( new Upgrader_Probe_MainWP_Child_Favorites_V2() )->run_dispatch_install(
+				$package,
+				array( 'type' => 'theme', 'slug' => 'twentyalt', 'overwrite' => false, 'activate' => false )
+			);
+		} finally {
+			while ( ob_get_level() > $level ) {
+				ob_end_clean();
+			}
+			remove_filter( 'upgrader_pre_download', $halt );
+			remove_filter( 'upgrader_package_options', $capture );
+			remove_filter( 'theme_root', $move_root );
+			if ( is_array( $wp_theme_directories ) ) {
+				$wp_theme_directories = array_values( array_diff( $wp_theme_directories, array( untrailingslashit( $alt_root ) ) ) );
+			}
+			unlink( $package );
+			if ( is_dir( $alt_root ) ) {
+				rmdir( $alt_root );
+			}
+		}
+
+		$this->assertSame( $alt_root, $destination );
+	}
+
+	/**
 	 * A request reference is one-shot, so nothing ever comes back to the row it created and the
 	 * eviction on the install path only reaches the reference the current request names. Every
 	 * other expired row is left behind, and the index is what a later install finds them by.

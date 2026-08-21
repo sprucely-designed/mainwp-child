@@ -35,6 +35,38 @@ class Wordfence_V2_Protocol_Fixture extends MainWP_Child_Wordfence {
 	public function lock_name() {
 		return $this->abilities_v2_lock_name();
 	}
+
+	public function end_mutation_lock() {
+		return $this->abilities_v2_end_mutation_lock();
+	}
+}
+
+/** Answers RELEASE_LOCK() from a script, so each release attempt is observable. */
+class Wordfence_Release_Wpdb_Stub {
+
+	/** @var array Queries this substitute was asked to run. */
+	public $queries = array();
+
+	/** @var string */
+	public $last_error = '';
+
+	/** @var array One array( error, result ) per expected release attempt. */
+	private $answers;
+
+	public function __construct( $answers ) {
+		$this->answers = $answers;
+	}
+
+	public function prepare( $query, ...$args ) {
+		return $query;
+	}
+
+	public function get_var( $query ) {
+		$this->queries[]  = $query;
+		$answer           = array_shift( $this->answers );
+		$this->last_error = $answer[0];
+		return $answer[1];
+	}
 }
 
 /** Stand-in for the Wordfence issue store the file-deletion paths construct directly. */
@@ -214,6 +246,32 @@ class Test_MainWP_Child_Wordfence_V2 extends WP_UnitTestCase {
 		$this->assertSame( 0, $dispatched_calls );
 		$this->assertSame( array(), get_option( 'mainwp_wordfence_abilities_v2_receipts', array() ) );
 		$this->assertSame( 'provider_unavailable', $read['code'] );
+	}
+
+	public function test_release_reads_an_absent_lock_as_released_and_retries_a_failed_release_once() {
+		$fixture = new Wordfence_V2_Protocol_Fixture();
+		// The lock name reads home_url(), so it is resolved while the real connection is still in place.
+		$fixture->lock_name();
+		$real = $GLOBALS['wpdb'];
+
+		try {
+			$absent          = new Wordfence_Release_Wpdb_Stub( array( array( '', null ) ) );
+			$GLOBALS['wpdb'] = $absent;
+			$this->assertTrue( $fixture->end_mutation_lock() );
+			$this->assertCount( 1, $absent->queries );
+
+			$retried         = new Wordfence_Release_Wpdb_Stub( array( array( 'MySQL server has gone away', null ), array( '', '1' ) ) );
+			$GLOBALS['wpdb'] = $retried;
+			$this->assertTrue( $fixture->end_mutation_lock() );
+			$this->assertCount( 2, $retried->queries );
+
+			$failing         = new Wordfence_Release_Wpdb_Stub( array( array( 'Lost connection', null ), array( 'Lost connection', null ) ) );
+			$GLOBALS['wpdb'] = $failing;
+			$this->assertFalse( $fixture->end_mutation_lock() );
+			$this->assertCount( 2, $failing->queries );
+		} finally {
+			$GLOBALS['wpdb'] = $real;
+		}
 	}
 
 	public function test_a_failed_deletion_reports_its_own_error_and_not_an_earlier_warning() {

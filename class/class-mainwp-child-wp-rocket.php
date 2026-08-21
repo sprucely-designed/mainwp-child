@@ -1442,9 +1442,19 @@ class MainWP_Child_WP_Rocket {//phpcs:ignore -- NOSONAR - multi methods.
         if ( ! is_object( $wpdb ) || ! is_callable( array( $wpdb, 'prepare' ) ) || ! is_callable( array( $wpdb, 'get_var' ) ) ) {
             return false;
         }
-        $wpdb->last_error = '';
-        $released         = $wpdb->get_var( $wpdb->prepare( 'SELECT RELEASE_LOCK(%s)', $this->abilities_v2_lock_name() ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery -- Named lock release must be checked.
-        return empty( $wpdb->last_error ) && '1' === (string) $released;
+        // A lock this session fails to give back outlives the request on a persistent connection
+        // and blocks every later mutation with no way for an operator to clear it, so one failed
+        // release earns a second attempt before it is given up on.
+        for ( $attempt = 0; $attempt < 2; $attempt++ ) {
+            $wpdb->last_error = '';
+            $released         = $wpdb->get_var( $wpdb->prepare( 'SELECT RELEASE_LOCK(%s)', $this->abilities_v2_lock_name() ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery -- Named lock release must be checked.
+            // RELEASE_LOCK() answers NULL when the named lock does not exist, which is the state
+            // the caller asked for.
+            if ( empty( $wpdb->last_error ) && ( null === $released || '1' === (string) $released ) ) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**

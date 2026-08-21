@@ -1193,6 +1193,76 @@ class Test_MainWP_Child_Maintenance_V2 extends WP_UnitTestCase {
 	}
 
 	/**
+	 * The action loop exempts the first action from its budget break, on the understanding that a
+	 * destructive action decides for itself and reports the decision truthfully. A row delete that
+	 * skips that decision issues its DELETE on a request with nothing left, and no statement can be
+	 * interrupted once it is out: the margin that settles the record goes with it.
+	 */
+	public function test_row_delete_is_declined_when_the_budget_is_already_spent() {
+		global $wpdb;
+		self::factory()->post->create( array( 'post_status' => 'auto-draft' ) );
+		$auto_drafts = "SELECT COUNT(*) FROM $wpdb->posts WHERE post_status = 'auto-draft'";
+		$before      = (int) $wpdb->get_var( $auto_drafts );
+		$this->assertGreaterThan( 0, $before );
+
+		$this->spent_budget_execute( $this->real_subject(), 'autodraft', '123e4567-e89b-42d3-a456-426614174528' );
+
+		$this->assertSame( $before, (int) $wpdb->get_var( $auto_drafts ), 'The rows the delete would have taken are the evidence it never ran.' );
+	}
+
+	/**
+	 * The term loop deletes one term per iteration and holds no bound of its own, so a request that
+	 * arrives with its limit already spent has to decline before the first wp_delete_term rather
+	 * than partway through a taxonomy.
+	 */
+	public function test_term_delete_is_declined_when_the_budget_is_already_spent() {
+		$term_id = self::factory()->term->create( array( 'taxonomy' => 'post_tag' ) );
+
+		$this->spent_budget_execute( $this->real_subject(), 'tags', '123e4567-e89b-42d3-a456-426614174529' );
+
+		$this->assertInstanceOf( \WP_Term::class, get_term( $term_id, 'post_tag' ), 'The empty tag the loop would have deleted is the evidence it never ran.' );
+	}
+
+	/**
+	 * OPTIMIZE TABLE rebuilds a table and runs for as long as that takes, once per prefixed table.
+	 * Starting that series on an exhausted request is the fatal the deadline exists to prevent.
+	 */
+	public function test_table_optimize_is_declined_when_the_budget_is_already_spent() {
+		$optimizes = array();
+		$spy       = static function ( $query ) use ( &$optimizes ) {
+			if ( 1 === preg_match( '/^\s*OPTIMIZE\s+TABLE\b/i', $query ) ) {
+				$optimizes[] = $query;
+			}
+			return $query;
+		};
+
+		add_filter( 'query', $spy );
+		try {
+			$this->spent_budget_execute( $this->real_subject(), 'optimize', '123e4567-e89b-42d3-a456-426614174530' );
+		} finally {
+			remove_filter( 'query', $spy );
+		}
+
+		$this->assertSame( array(), $optimizes, 'No table may be rebuilt by a request that has nothing left to spend.' );
+	}
+
+	/**
+	 * A delete-all transient run walks every name it listed, with an option write per name and no
+	 * check between them, so the whole walk has to be declined up front.
+	 */
+	public function test_transient_delete_is_declined_when_the_budget_is_already_spent() {
+		if ( wp_using_ext_object_cache() ) {
+			$this->markTestSkipped( 'Transient maintenance reports unsupported behind an external object cache.' );
+		}
+		$this->clear_transients();
+		set_transient( 'mwp_budget_guard', 'survivor', HOUR_IN_SECONDS );
+
+		$this->spent_budget_execute( $this->real_subject(), 'transients_all', '123e4567-e89b-42d3-a456-426614174531' );
+
+		$this->assertSame( 'survivor', get_transient( 'mwp_budget_guard' ), 'The transient the run listed is the evidence it never started deleting.' );
+	}
+
+	/**
 	 * A terminal unknown record may hold fewer outcomes than actions, and every reader treats the
 	 * ones it holds as a prefix of the action list. The option behind it is untrusted - a hand edit
 	 * or a partial restore lands here - so a list keyed [1] rather than [0] pins its outcome to the
@@ -1346,6 +1416,55 @@ class Test_MainWP_Child_Maintenance_V2 extends WP_UnitTestCase {
 			)
 		);
 		return array( $preview, $result );
+	}
+
+	/**
+	 * Run one action as the only action of an operation whose budget is already gone, and assert
+	 * the durable record it leaves behind.
+	 *
+	 * The deadline is fixed the first time it is read, so it is pinned after the preview: that is
+	 * the state the operation reaches on its own once earlier work has spent the request. Only
+	 * action one is exercised, because the loop's own break covers every later one.
+	 */
+	private function spent_budget_execute( $subject, $action, $operation_ref ) {
+		$preview = $this->real_request(
+			$subject,
+			'ability_maintenance_preview_v2',
+			array(
+				'actions'            => array( $action ),
+				'revision_retention' => 5,
+			)
+		);
+		$this->assertTrue( $preview['ok'] );
+		$deadline = new \ReflectionProperty( MainWP_Child_Maintenance::class, 'abilities_v2_deadline' );
+		$deadline->setAccessible( true );
+		$deadline->setValue( $subject, time() - 1 );
+
+		$result = $this->real_request(
+			$subject,
+			'ability_maintenance_execute_v2',
+			array(
+				'operation_ref'      => $operation_ref,
+				'actions'            => array( $action ),
+				'revision_retention' => 5,
+				'snapshot_revision'  => $preview['snapshot_revision'],
+				'action_hash'        => hash( 'sha256', wp_json_encode( array( array( $action ), 5 ) ) ),
+			)
+		);
+
+		$this->assertTrue( $result['ok'] );
+		$stored = get_option( MainWP_Child_Maintenance::ABILITIES_V2_OPERATIONS_OPTION, array() );
+		$this->assertSame(
+			array(
+				'action'     => $action,
+				'status'     => 'unknown',
+				'affected'   => 0,
+				'error_code' => 'outcome_unknown',
+			),
+			$stored[ $operation_ref ]['outcomes'][0],
+			'Nothing was destroyed, and what the action would have removed is not known.'
+		);
+		$this->assertSame( 'unknown', $stored[ $operation_ref ]['status'] );
 	}
 
 	/** Build one durable record left in 'running' by a run that never came back. */

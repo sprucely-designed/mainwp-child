@@ -47,6 +47,51 @@ class Test_MainWP_Child_WP_Rocket_V2_Fixture extends MainWP_Child_WP_Rocket {
 	public function fixture_lock_name() {
 		return $this->abilities_v2_lock_name();
 	}
+
+	/** @return bool */
+	public function fixture_end_lock() {
+		return $this->abilities_v2_end_lock();
+	}
+}
+
+/** Answers RELEASE_LOCK() from a script, so each release attempt is observable. */
+class Test_MainWP_Child_WP_Rocket_V2_Release_Wpdb {
+
+	/** @var array Queries this substitute was asked to run. */
+	public $queries = array();
+
+	/** @var string */
+	public $last_error = '';
+
+	/** @var array One array( error, result ) per expected release attempt. */
+	private $answers;
+
+	/**
+	 * @param array $answers One array( error, result ) per expected release attempt.
+	 */
+	public function __construct( $answers ) {
+		$this->answers = $answers;
+	}
+
+	/**
+	 * @param string $query   Query.
+	 * @param mixed  ...$args Placeholder values.
+	 * @return string
+	 */
+	public function prepare( $query, ...$args ) {
+		return $query;
+	}
+
+	/**
+	 * @param string $query Query.
+	 * @return string|null
+	 */
+	public function get_var( $query ) {
+		$this->queries[]  = $query;
+		$answer           = array_shift( $this->answers );
+		$this->last_error = $answer[0];
+		return $answer[1];
+	}
 }
 
 /** A lock backend that cannot answer GET_LOCK(). */
@@ -653,6 +698,32 @@ class Test_MainWP_Child_WP_Rocket_V2 extends WP_UnitTestCase {
 		$this->assertSame( 'lock_busy', $held['error_code'] );
 		$this->assertSame( array(), $this->rocket->provider_calls );
 		$this->assertSame( array(), get_option( 'mainwp_wp_rocket_abilities_v2_receipts', array() ) );
+	}
+
+	/** An absent lock is already the state the caller asked for, and one failed release earns a retry. */
+	public function test_release_reads_an_absent_lock_as_released_and_retries_a_failed_release_once() {
+		// The lock name reads home_url(), so it is resolved while the real connection is still in place.
+		$this->rocket->fixture_lock_name();
+		$real = $GLOBALS['wpdb'];
+
+		try {
+			$absent          = new Test_MainWP_Child_WP_Rocket_V2_Release_Wpdb( array( array( '', null ) ) );
+			$GLOBALS['wpdb'] = $absent;
+			$this->assertTrue( $this->rocket->fixture_end_lock() );
+			$this->assertCount( 1, $absent->queries );
+
+			$retried         = new Test_MainWP_Child_WP_Rocket_V2_Release_Wpdb( array( array( 'MySQL server has gone away', null ), array( '', '1' ) ) );
+			$GLOBALS['wpdb'] = $retried;
+			$this->assertTrue( $this->rocket->fixture_end_lock() );
+			$this->assertCount( 2, $retried->queries );
+
+			$failing         = new Test_MainWP_Child_WP_Rocket_V2_Release_Wpdb( array( array( 'Lost connection', null ), array( 'Lost connection', null ) ) );
+			$GLOBALS['wpdb'] = $failing;
+			$this->assertFalse( $this->rocket->fixture_end_lock() );
+			$this->assertCount( 2, $failing->queries );
+		} finally {
+			$GLOBALS['wpdb'] = $real;
+		}
 	}
 
 	/**

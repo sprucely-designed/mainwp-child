@@ -1017,6 +1017,25 @@ class MainWP_Child_Maintenance {
     }
 
     /**
+     * Return the outcome of a destructive action that declined to start on a spent budget.
+     *
+     * Nothing can interrupt a DELETE, an OPTIMIZE TABLE or a term loop once it is issued, so
+     * declining to start is the only bound those actions have. A request with nothing left of its
+     * limit would spend the settle margin inside one and die with the record running and the lock
+     * held. Nothing was destroyed, which is what the zero affected count says, and what the action
+     * would have removed is not known, which is what the status says.
+     *
+     * @return array<string,int|string|null>
+     */
+    private function abilities_v2_budget_declined_outcome() {
+        return array(
+            'status'     => 'unknown',
+            'affected'   => 0,
+            'error_code' => 'outcome_unknown',
+        );
+    }
+
+    /**
      * Instant a revision sweep has to stop deleting at.
      *
      * @return int Unix timestamp.
@@ -1097,11 +1116,7 @@ class MainWP_Child_Maintenance {
         // and the lock held. Reported as the paged path reports an exhausted budget, because it is
         // the same stop: nothing was destroyed and what is left over retention is not known.
         if ( time() >= $deadline ) {
-            return array(
-                'status'     => 'unknown',
-                'affected'   => 0,
-                'error_code' => 'outcome_unknown',
-            );
+            return $this->abilities_v2_budget_declined_outcome();
         }
         if ( 0 === $revision_retention ) {
             return $this->abilities_v2_delete_rows( 'posts', "post_type = 'revision'" );
@@ -1281,6 +1296,9 @@ class MainWP_Child_Maintenance {
      */
     private function abilities_v2_delete_rows( $table_kind, $where ) {
         global $wpdb;
+        if ( $this->abilities_v2_budget_spent() ) {
+            return $this->abilities_v2_budget_declined_outcome();
+        }
         $table            = 'posts' === $table_kind ? $wpdb->posts : $wpdb->comments;
         $wpdb->last_error = '';
         // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- Table and predicate are selected only from the closed action map.
@@ -1302,6 +1320,9 @@ class MainWP_Child_Maintenance {
      * @return array<string,int|string|null>
      */
     private function abilities_v2_delete_terms( $taxonomy ) {
+        if ( $this->abilities_v2_budget_spent() ) {
+            return $this->abilities_v2_budget_declined_outcome();
+        }
         $terms = get_terms(
             array(
                 'taxonomy'   => $taxonomy,
@@ -1336,6 +1357,9 @@ class MainWP_Child_Maintenance {
     /** Optimize only exact current-blog-prefix tables. */
     private function abilities_v2_optimize_tables() {
         global $wpdb;
+        if ( $this->abilities_v2_budget_spent() ) {
+            return $this->abilities_v2_budget_declined_outcome();
+        }
         $wpdb->last_error = '';
         // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Reads current database table status for checked optimization.
         $tables = $wpdb->get_results( 'SHOW TABLE STATUS FROM `' . esc_sql( DB_NAME ) . '`', ARRAY_A );
@@ -1373,6 +1397,9 @@ class MainWP_Child_Maintenance {
      * @return array<string,int|string|null>
      */
     private function abilities_v2_delete_transients( $expired_only ) {
+        if ( $this->abilities_v2_budget_spent() ) {
+            return $this->abilities_v2_budget_declined_outcome();
+        }
         $names = $this->abilities_v2_transient_names( $expired_only );
         if ( false === $names ) {
             return $this->abilities_v2_failed_outcome();

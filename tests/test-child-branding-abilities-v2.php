@@ -66,6 +66,11 @@ class Test_MainWP_Child_Branding_V2_Fixture extends MainWP_Child_Branding {
 		return $this->abilities_v2_lock_name();
 	}
 
+	/** @return bool */
+	public function end_lock() {
+		return $this->abilities_v2_end_lock();
+	}
+
 	/** @return array */
 	protected function abilities_v2_read_receipts() {
 		return $this->stored_receipts;
@@ -97,6 +102,48 @@ class Test_MainWP_Child_Branding_V2_Fixture extends MainWP_Child_Branding {
 	protected function abilities_v2_delete_file( $path ) {
 		$this->deleted_files[] = $path;
 		return true;
+	}
+}
+
+/**
+ * Answers the named-lock statements from a script, so every attempt is observable.
+ */
+class Test_MainWP_Child_Branding_V2_Lock_Wpdb {
+
+	/** @var array Queries this substitute was asked to run. */
+	public $queries = array();
+
+	/** @var string */
+	public $last_error = '';
+
+	/** @var array One array( error, result ) per expected attempt. */
+	private $answers;
+
+	/**
+	 * @param array $answers One array( error, result ) per expected attempt.
+	 */
+	public function __construct( $answers ) {
+		$this->answers = $answers;
+	}
+
+	/**
+	 * @param string $query   Query.
+	 * @param mixed  ...$args Placeholder values.
+	 * @return string
+	 */
+	public function prepare( $query, ...$args ) {
+		return $query;
+	}
+
+	/**
+	 * @param string $query Query.
+	 * @return string|null
+	 */
+	public function get_var( $query ) {
+		$this->queries[]  = $query;
+		$answer           = array_shift( $this->answers );
+		$this->last_error = $answer[0];
+		return $answer[1];
 	}
 }
 
@@ -421,6 +468,71 @@ class Test_MainWP_Child_Branding_Abilities_V2 extends WP_UnitTestCase {
 		$this->assertSame( array(), $fixture->stored_settings );
 		$this->assertSame( array(), $fixture->stored_receipts );
 		$this->assertNull( $fixture->lock_free_during_write );
+	}
+
+	/**
+	 * An absent lock is already the state the caller asked for, and one failed release earns a retry.
+	 */
+	public function test_release_reads_an_absent_lock_as_released_and_retries_a_failed_release_once() {
+		$fixture = new Test_MainWP_Child_Branding_V2_Fixture();
+		// The lock name reads home_url(), so it is resolved while the real connection is still in place.
+		$fixture->lock_name();
+		$real = $GLOBALS['wpdb'];
+
+		try {
+			$absent          = new Test_MainWP_Child_Branding_V2_Lock_Wpdb( array( array( '', null ) ) );
+			$GLOBALS['wpdb'] = $absent;
+			$this->assertTrue( $fixture->end_lock() );
+			$this->assertCount( 1, $absent->queries );
+
+			$retried         = new Test_MainWP_Child_Branding_V2_Lock_Wpdb( array( array( 'MySQL server has gone away', null ), array( '', '1' ) ) );
+			$GLOBALS['wpdb'] = $retried;
+			$this->assertTrue( $fixture->end_lock() );
+			$this->assertCount( 2, $retried->queries );
+
+			$failing         = new Test_MainWP_Child_Branding_V2_Lock_Wpdb( array( array( 'Lost connection', null ), array( 'Lost connection', null ) ) );
+			$GLOBALS['wpdb'] = $failing;
+			$this->assertFalse( $fixture->end_lock() );
+			$this->assertCount( 2, $failing->queries );
+		} finally {
+			$GLOBALS['wpdb'] = $real;
+		}
+	}
+
+	/**
+	 * A lock backend that cannot answer is refused as a store failure, not as someone else's lock.
+	 */
+	public function test_an_unusable_lock_backend_is_refused_apart_from_a_held_lock() {
+		$fixture = new Test_MainWP_Child_Branding_V2_Fixture();
+		// The lock name reads home_url(), so it is resolved while the real connection is still in place.
+		$name    = $fixture->lock_name();
+		$request = $this->request( $this->desired_settings() );
+
+		$backends = array(
+			'driver error'     => array( array( 'MySQL server has gone away', null ) ),
+			'GET_LOCK is NULL' => array( array( '', null ) ),
+		);
+		foreach ( $backends as $label => $answers ) {
+			$real            = $GLOBALS['wpdb'];
+			$GLOBALS['wpdb'] = new Test_MainWP_Child_Branding_V2_Lock_Wpdb( $answers );
+			try {
+				$result = $this->invoke_v2( $fixture, $request );
+			} finally {
+				$GLOBALS['wpdb'] = $real;
+			}
+
+			$this->assertFalse( $result['ok'], $label );
+			$this->assertSame( 'storage_unavailable', $result['error']['code'], $label );
+		}
+
+		$holder = $this->hold_lock_elsewhere( $name );
+		$held   = $this->invoke_v2( $fixture, $request );
+		$this->release_lock_elsewhere( $holder, $name );
+
+		$this->assertFalse( $held['ok'] );
+		$this->assertSame( 'lock_busy', $held['error']['code'] );
+		$this->assertSame( array(), $fixture->stored_settings );
+		$this->assertSame( array(), $fixture->stored_receipts );
 	}
 
 	/**

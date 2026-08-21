@@ -258,7 +258,11 @@ class MainWP_Child_Branding { //phpcs:ignore -- NOSONAR - multi methods.
         // Everything below is a read-modify-write over one settings option plus staged and
         // deleted files; two concurrent applies would interleave and delete an asset the
         // other request just recorded as current.
-        if ( ! $this->abilities_v2_begin_lock() ) {
+        $lock = $this->abilities_v2_begin_lock();
+        if ( null === $lock ) {
+            return $this->abilities_v2_error( $operation_ref, 'storage_unavailable', 'The Branding operation lock could not be reached.' );
+        }
+        if ( true !== $lock ) {
             return $this->abilities_v2_error( $operation_ref, 'lock_busy', 'Another Branding operation is already running.' );
         }
         try {
@@ -397,16 +401,25 @@ class MainWP_Child_Branding { //phpcs:ignore -- NOSONAR - multi methods.
     /**
      * Acquire the Child-wide Branding mutation lock without waiting.
      *
-     * @return bool
+     * @return bool|null True when acquired, false when another session holds it, null when the lock backend could not answer.
      */
     protected function abilities_v2_begin_lock() {
         global $wpdb;
         if ( ! is_object( $wpdb ) || ! is_callable( array( $wpdb, 'prepare' ) ) || ! is_callable( array( $wpdb, 'get_var' ) ) ) {
-            return false;
+            return null;
         }
         $wpdb->last_error = '';
         $locked           = $wpdb->get_var( $wpdb->prepare( 'SELECT GET_LOCK(%s,0)', $this->abilities_v2_lock_name() ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery -- Named lock is the serialization primitive.
-        return empty( $wpdb->last_error ) && '1' === (string) $locked;
+        if ( ! empty( $wpdb->last_error ) ) {
+            return null;
+        }
+        if ( '1' === (string) $locked ) {
+            return true;
+        }
+        // Only '0' means someone else holds it. GET_LOCK() answers NULL on an error or an
+        // interrupted wait, which says nothing about who holds the lock, so it is not reported
+        // as contention the Child never observed.
+        return '0' === (string) $locked ? false : null;
     }
 
     /**
@@ -419,9 +432,19 @@ class MainWP_Child_Branding { //phpcs:ignore -- NOSONAR - multi methods.
         if ( ! is_object( $wpdb ) || ! is_callable( array( $wpdb, 'prepare' ) ) || ! is_callable( array( $wpdb, 'get_var' ) ) ) {
             return false;
         }
-        $wpdb->last_error = '';
-        $released         = $wpdb->get_var( $wpdb->prepare( 'SELECT RELEASE_LOCK(%s)', $this->abilities_v2_lock_name() ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery -- Named lock release must be checked.
-        return empty( $wpdb->last_error ) && '1' === (string) $released;
+        // A lock this session fails to give back outlives the request on a persistent connection
+        // and blocks every later mutation with no way for an operator to clear it, so one failed
+        // release earns a second attempt before it is given up on.
+        for ( $attempt = 0; $attempt < 2; $attempt++ ) {
+            $wpdb->last_error = '';
+            $released         = $wpdb->get_var( $wpdb->prepare( 'SELECT RELEASE_LOCK(%s)', $this->abilities_v2_lock_name() ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery -- Named lock release must be checked.
+            // RELEASE_LOCK() answers NULL when the named lock does not exist, which is the state
+            // the caller asked for.
+            if ( empty( $wpdb->last_error ) && ( null === $released || '1' === (string) $released ) ) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**

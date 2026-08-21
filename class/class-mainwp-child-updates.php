@@ -1105,6 +1105,8 @@ class MainWP_Child_Updates { //phpcs:ignore -- NOSONAR - multi methods.
         $legacy_action = '';
         $legacy_type   = '';
 
+        // Legacy process compatibility.
+        // phpcs:disable WordPress.Security.NonceVerification
         if ( isset( $_GET['_detect_plugins_updates'] ) && 'yes' === $_GET['_detect_plugins_updates'] ) {
             $legacy_action = 'detect_plugin';
         } elseif ( isset( $_GET['_detect_themes_updates'] ) && 'yes' === $_GET['_detect_themes_updates'] ) {

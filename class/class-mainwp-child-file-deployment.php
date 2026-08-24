@@ -104,6 +104,13 @@ class MainWP_Child_File_Deployment {
             if ( is_array( $existing ) ) {
                 return $this->replay_receipt( $existing, $effect_hash, 'deploy' );
             }
+            // Only a genuinely new effect is refused: a request the store already knows replays
+            // above, so a pre-ban deployment stays readable and rollbackable. The uploads lane is
+            // web-served, so server-executed or server-config content deployed there is refused
+            // before any write.
+            if ( ! $this->uploads_target_allowed( $payload['destination_class'], $destination ) ) {
+                return $this->error( 'deploy', 'destination_forbidden' );
+            }
             // Only a genuinely new effect sweeps the store, so a pruned file can never be one
             // this request still has to answer for.
             $this->prune_expired_storage();
@@ -631,6 +638,35 @@ class MainWP_Child_File_Deployment {
             'mu_plugins' => 'wp-content/mu-plugins/',
         );
         return isset( $prefixes[ $destination_class ] ) && 0 === strpos( $relative_destination, $prefixes[ $destination_class ] ) && strlen( $relative_destination ) > strlen( $prefixes[ $destination_class ] ) ? $relative_destination : false;
+    }
+
+    /**
+     * Refuse server-executed or server-config content in the web-served uploads lane.
+     *
+     * Only the uploads lane is guarded: the languages lane legitimately receives WP 6.5+
+     * performant-translation PHP (`wp-content/languages/**\/*.l10n.php`), and the code lanes
+     * (plugins/themes/mu_plugins) deploy PHP by design under their own Dashboard capability gate.
+     * The match is by any dot-token, not just the final extension, because a misconfigured Apache
+     * `AddHandler` selects a handler from any `.php` token in the name (`shell.php.jpg`), and a
+     * trailing dot or space is an IIS/Windows filesystem alias for the bare name.
+     *
+     * @param string $destination_class Normalized destination class.
+     * @param string $normalized        Normalized relative destination (already `.phpfile.txt`-decoded).
+     * @return bool True when the target may be written.
+     */
+    private function uploads_target_allowed( $destination_class, $normalized ) {
+        if ( 'uploads' !== $destination_class ) {
+            return true;
+        }
+        $basename = strtolower( basename( $normalized ) );
+        if ( '' === $basename || '.' === substr( $basename, -1 ) || ' ' === substr( $basename, -1 ) ) {
+            return false;
+        }
+        if ( in_array( $basename, array( '.htaccess', '.user.ini', 'web.config' ), true ) ) {
+            return false;
+        }
+        $executable = array( 'php', 'php2', 'php3', 'php4', 'php5', 'php6', 'php7', 'php8', 'phtml', 'phtm', 'pht', 'phar', 'phps' );
+        return array() === array_intersect( explode( '.', $basename ), $executable );
     }
 
     /** Return a contained absolute target path. */

@@ -83,6 +83,104 @@ class Test_MainWP_Child_File_Deployment_V2 extends WP_UnitTestCase {
 		$this->assertSame( 0, $subject->gateway_reads );
 	}
 
+	/**
+	 * The uploads lane is web-served, so a deploy of server-executed or server-config content
+	 * there is refused at the write. Every entry below reaches the guard (preflight is not
+	 * guarded, and the value survives the deploy-time equality check unchanged) and is refused
+	 * before any gateway read, write, or receipt.
+	 */
+	public function test_uploads_lane_refuses_executable_and_config_targets_at_deploy() {
+		foreach ( array(
+			'wp-content/uploads/shell.php',
+			'wp-content/uploads/shell.PHP',
+			'wp-content/uploads/evil.phtml',
+			'wp-content/uploads/legacy.pht',
+			'wp-content/uploads/app.phar',
+			'wp-content/uploads/src.phps',
+			'wp-content/uploads/shell.php.jpg',
+			'wp-content/uploads/shell.php.',
+			'wp-content/uploads/report.txt ',
+			'wp-content/uploads/.htaccess',
+			'wp-content/uploads/.user.ini',
+			'wp-content/uploads/web.config',
+		) as $target ) {
+			$subject                = new Testable_MainWP_Child_File_Deployment();
+			$bytes                  = 'verified fixture bytes';
+			$subject->gateway_bytes = $bytes;
+			$preflight              = $subject->preflight_v2( $this->preflight_request( 'uploads', $target ) );
+			$this->assertTrue( $preflight['ok'], $target . ' preflight must not be guarded' );
+
+			$result = $subject->deploy_v2( $this->deploy_request( $preflight, $bytes ) );
+			$this->assertFalse( $result['ok'], $target );
+			$this->assertSame( 'destination_forbidden', $result['code'], $target );
+			$this->assertSame( 0, $subject->gateway_reads, $target );
+			$this->assertSame( 0, $subject->writes, $target );
+			$this->assertSame( array(), $subject->receipts, $target );
+		}
+	}
+
+	/** A non-executable document in the uploads lane deploys unaffected by the guard. */
+	public function test_uploads_lane_allows_a_benign_document() {
+		$subject                = new Testable_MainWP_Child_File_Deployment();
+		$bytes                  = 'verified fixture bytes';
+		$subject->gateway_bytes = $bytes;
+		$preflight              = $subject->preflight_v2( $this->preflight_request( 'uploads', 'wp-content/uploads/quarterly.pdf' ) );
+
+		$result = $subject->deploy_v2( $this->deploy_request( $preflight, $bytes ) );
+		$this->assertTrue( $result['ok'] );
+		$this->assertSame( 'completed', $result['status'] );
+		$this->assertSame( 1, $subject->writes );
+	}
+
+	/**
+	 * The languages lane legitimately receives WP 6.5+ performant-translation PHP
+	 * (wp-content/languages/**\/*.l10n.php), so the guard is scoped to uploads and a language
+	 * pack deploys normally.
+	 */
+	public function test_languages_lane_allows_performant_translation_php() {
+		$subject                = new Testable_MainWP_Child_File_Deployment();
+		$bytes                  = 'verified fixture bytes';
+		$subject->gateway_bytes = $bytes;
+		$preflight              = $subject->preflight_v2( $this->preflight_request( 'languages', 'wp-content/languages/plugins/akismet-es_ES.l10n.php' ) );
+
+		$result = $subject->deploy_v2( $this->deploy_request( $preflight, $bytes ) );
+		$this->assertTrue( $result['ok'] );
+		$this->assertSame( 'completed', $result['status'] );
+		$this->assertSame( 1, $subject->writes );
+	}
+
+	/**
+	 * The guard sits on the new-effect path, after an existing receipt has already replayed. A
+	 * request the store already knows returns its receipt, not a fresh refusal, even for a name
+	 * the guard would otherwise reject.
+	 */
+	public function test_replay_short_circuits_before_the_uploads_denylist() {
+		$subject                = new Testable_MainWP_Child_File_Deployment();
+		$bytes                  = 'verified fixture bytes';
+		$subject->gateway_bytes = $bytes;
+		$preflight              = $subject->preflight_v2( $this->preflight_request( 'uploads', 'wp-content/uploads/legacy.php' ) );
+		$request                = $this->deploy_request( $preflight, $bytes );
+		$subject->seed_dispatching( $request );
+
+		$result = $subject->deploy_v2( $request );
+		$this->assertFalse( $result['ok'] );
+		$this->assertSame( 'outcome_unknown', $result['code'] );
+		$this->assertNotSame( 'destination_forbidden', $result['code'] );
+		$this->assertSame( 0, $subject->gateway_reads );
+	}
+
+	/**
+	 * The guard is deploy-only: preflight of an executable uploads target still succeeds, so the
+	 * extension's pre-rollback re-preflight of a stored pre-ban .php deployment keeps working.
+	 */
+	public function test_preflight_does_not_apply_the_uploads_denylist() {
+		$subject   = new Testable_MainWP_Child_File_Deployment();
+		$preflight = $subject->preflight_v2( $this->preflight_request( 'uploads', 'wp-content/uploads/legacy.php' ) );
+
+		$this->assertTrue( $preflight['ok'] );
+		$this->assertSame( 'wp-content/uploads/legacy.php', $preflight['relative_destination'] );
+	}
+
 	public function test_destination_lock_contention_is_non_mutating() {
 		$subject                 = new Testable_MainWP_Child_File_Deployment();
 		$subject->lock_available = false;
@@ -322,14 +420,14 @@ class Test_MainWP_Child_File_Deployment_V2 extends WP_UnitTestCase {
 		$this->assertSame( 'uploader_rollback_v2', $map['uploader_rollback_v2'] );
 	}
 
-	private function preflight_request() {
+	private function preflight_request( $destination_class = 'uploads', $relative_destination = 'wp-content/uploads/report.txt' ) {
 		return array(
 			'protocol'  => '2',
 			'operation' => 'preflight',
 			'payload'   => array(
 				'request_ref'         => '123e4567-e89b-42d3-a456-426614174200',
-				'destination_class'   => 'uploads',
-				'relative_destination' => 'wp-content/uploads/report.txt',
+				'destination_class'   => $destination_class,
+				'relative_destination' => $relative_destination,
 			),
 		);
 	}

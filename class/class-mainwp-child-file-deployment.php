@@ -646,9 +646,11 @@ class MainWP_Child_File_Deployment {
      * Only the uploads lane is guarded: the languages lane legitimately receives WP 6.5+
      * performant-translation PHP (`wp-content/languages/**\/*.l10n.php`), and the code lanes
      * (plugins/themes/mu_plugins) deploy PHP by design under their own Dashboard capability gate.
-     * The match is by any dot-token, not just the final extension, because a misconfigured Apache
-     * `AddHandler` selects a handler from any `.php` token in the name (`shell.php.jpg`), and a
-     * trailing dot or space is an IIS/Windows filesystem alias for the bare name.
+     * Refused: PHP handlers, server-side includes (a `.shtml` under `Options +Includes` runs
+     * `<!--#exec cmd>`), and the server-config drop-ins. The match is by any dot-token, not just
+     * the final extension, because a misconfigured Apache `AddHandler`/`AddOutputFilter` selects a
+     * handler from any matching token in the name (`shell.php.jpg`), and a trailing dot or space is
+     * an IIS/Windows filesystem alias for the bare name.
      *
      * @param string $destination_class Normalized destination class.
      * @param string $normalized        Normalized relative destination (already `.phpfile.txt`-decoded).
@@ -665,7 +667,7 @@ class MainWP_Child_File_Deployment {
         if ( in_array( $basename, array( '.htaccess', '.user.ini', 'web.config' ), true ) ) {
             return false;
         }
-        $executable = array( 'php', 'php2', 'php3', 'php4', 'php5', 'php6', 'php7', 'php8', 'phtml', 'phtm', 'pht', 'phar', 'phps' );
+        $executable = array( 'php', 'php2', 'php3', 'php4', 'php5', 'php6', 'php7', 'php8', 'phtml', 'phtm', 'pht', 'phar', 'phps', 'shtml', 'shtm', 'stm' );
         return array() === array_intersect( explode( '.', $basename ), $executable );
     }
 

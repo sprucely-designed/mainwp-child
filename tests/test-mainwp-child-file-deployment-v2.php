@@ -97,6 +97,8 @@ class Test_MainWP_Child_File_Deployment_V2 extends WP_UnitTestCase {
 			'wp-content/uploads/legacy.pht',
 			'wp-content/uploads/app.phar',
 			'wp-content/uploads/src.phps',
+			'wp-content/uploads/payload.shtml',
+			'wp-content/uploads/payload.shtml.jpg',
 			'wp-content/uploads/shell.php.jpg',
 			'wp-content/uploads/shell.php.',
 			'wp-content/uploads/report.txt ',

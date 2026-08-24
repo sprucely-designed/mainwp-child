@@ -646,11 +646,19 @@ class MainWP_Child_File_Deployment {
      * Only the uploads lane is guarded: the languages lane legitimately receives WP 6.5+
      * performant-translation PHP (`wp-content/languages/**\/*.l10n.php`), and the code lanes
      * (plugins/themes/mu_plugins) deploy PHP by design under their own Dashboard capability gate.
-     * Refused: PHP handlers, server-side includes (a `.shtml` under `Options +Includes` runs
-     * `<!--#exec cmd>`), and the server-config drop-ins. The match is by any dot-token, not just
-     * the final extension, because a misconfigured Apache `AddHandler`/`AddOutputFilter` selects a
-     * handler from any matching token in the name (`shell.php.jpg`), and a trailing dot or space is
-     * an IIS/Windows filesystem alias for the bare name.
+     *
+     * The guard matches the common WP-hostable server-executable page classes, not an exhaustive
+     * list: the PHP family (as a pattern, because LiteSpeed/cPanel map versioned handler ids like
+     * `php81`/`php85` as suffixes), server-side includes, IIS ASP/ASP.NET (WordPress does run on
+     * IIS behind PHP-FastCGI), and the server-config drop-ins. Deliberately excluded: JSP and
+     * ColdFusion (no WordPress-hostable stack executes them), CGI (`.pl`/`.cgi`/`.py` need
+     * `ExecCGI`, rare on an uploads dir, and are legitimate download payloads), and `.cer` (a
+     * certificate extension far more often than an IIS handler). The match is by any dot-token,
+     * not just the final extension, because a misconfigured `AddHandler`/`AddOutputFilter` selects
+     * a handler from any matching token (`shell.php.jpg`), and a trailing dot or space is an
+     * IIS/Windows filesystem alias for the bare name. This is defense-in-depth: the File Uploader
+     * path is full-admin gated Dashboard-side, so this is not the last line against a determined
+     * caller.
      *
      * @param string $destination_class Normalized destination class.
      * @param string $normalized        Normalized relative destination (already `.phpfile.txt`-decoded).
@@ -667,8 +675,29 @@ class MainWP_Child_File_Deployment {
         if ( in_array( $basename, array( '.htaccess', '.user.ini', 'web.config' ), true ) ) {
             return false;
         }
-        $executable = array( 'php', 'php2', 'php3', 'php4', 'php5', 'php6', 'php7', 'php8', 'phtml', 'phtm', 'pht', 'phar', 'phps', 'shtml', 'shtm', 'stm' );
-        return array() === array_intersect( explode( '.', $basename ), $executable );
+        $handlers = array(
+            'phtml',
+            'phtm',
+            'pht',
+            'phar',
+            'phps',
+            'shtml',
+            'shtm',
+            'stm',
+            'asp',
+            'aspx',
+            'asa',
+            'asax',
+            'ascx',
+            'ashx',
+            'asmx',
+        );
+        foreach ( explode( '.', $basename ) as $token ) {
+            if ( in_array( $token, $handlers, true ) || 1 === preg_match( '/^php[0-9]*$/', $token ) ) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /** Return a contained absolute target path. */

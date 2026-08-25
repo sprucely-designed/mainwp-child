@@ -291,6 +291,23 @@ class Test_MainWP_Child_Branding_Abilities_V2 extends WP_UnitTestCase {
 	}
 
 	/**
+	 * A setting string that is not valid UTF-8 is rejected without effects.
+	 *
+	 * Invalid UTF-8 makes wp_json_encode() return false, which would otherwise bypass
+	 * the byte cap (strlen(false)) and collapse the desired-hash conflict guard.
+	 */
+	public function test_apply_rejects_invalid_utf8_settings() {
+		$fixture  = new Test_MainWP_Child_Branding_V2_Fixture();
+		$settings = $this->desired_settings( array( 'child_plugin_name' => "Acme \xFF Connector" ) );
+
+		$result = $this->invoke_v2( $fixture, $this->request( $settings ) );
+
+		$this->assertFalse( $result['ok'] );
+		$this->assertSame( 'invalid_settings', $result['error']['code'] );
+		$this->assertSame( array(), $fixture->stored_receipts );
+	}
+
+	/**
 	 * A successful apply writes and verifies settings with structured output.
 	 */
 	public function test_apply_returns_structured_verified_result() {

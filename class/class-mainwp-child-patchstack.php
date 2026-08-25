@@ -177,7 +177,7 @@ class MainWP_Child_Patchstack { //phpcs:ignore -- NOSONAR - multi methods.
         }
 
         $raw = wp_unslash( $_POST['request'] ); // phpcs:ignore WordPress.Security.NonceVerification.Missing,WordPress.Security.ValidatedSanitizedInput.InputNotSanitized -- Closed JSON is validated below.
-        if ( '' === $raw || 4096 < strlen( $raw ) ) {
+        if ( '' === $raw || 16384 < strlen( $raw ) ) {
             return $this->abilities_v2_error( 'unknown', 'invalid_request' );
         }
 
@@ -706,9 +706,10 @@ class MainWP_Child_Patchstack { //phpcs:ignore -- NOSONAR - multi methods.
     /**
      * Return the bound local state revision.
      *
-     * @param array  $payload    Bound payload.
-     * @param string $state      Plugin state.
-     * @param string $visibility Visibility state.
+     * @param array  $payload       Bound payload.
+     * @param string $state         Plugin state.
+     * @param string $visibility    Visibility state.
+     * @param string $package_state Signed-package readiness.
      * @return string State digest.
      */
     private function abilities_v2_state_revision( $payload, $state, $visibility, $package_state = 'not_needed' ) {

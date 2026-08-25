@@ -508,7 +508,7 @@ class MainWP_Child_Back_WP_Up { //phpcs:ignore -- NOSONAR - multi methods.
         }
 
         $current = $this->abilities_v2_read_job_schedule( $payload['job_id'] );
-        if ( $current === $payload['schedule'] ) {
+        if ( $this->abilities_v2_schedule_matches( $current, $payload['schedule'] ) ) {
             return $this->abilities_v2_success(
                 $operation,
                 array(
@@ -535,7 +535,7 @@ class MainWP_Child_Back_WP_Up { //phpcs:ignore -- NOSONAR - multi methods.
         }
 
         $stored = $this->abilities_v2_read_job_schedule( $payload['job_id'] );
-        if ( $stored !== $payload['schedule'] ) {
+        if ( ! $this->abilities_v2_schedule_matches( $stored, $payload['schedule'] ) ) {
             $this->abilities_v2_restore_job_options( $payload['job_id'], $snapshot );
             return $this->abilities_v2_error( $operation, 'operation_failed', __( 'The job schedule could not be verified.', 'mainwp-child' ) );
         }
@@ -1902,6 +1902,27 @@ class MainWP_Child_Back_WP_Up { //phpcs:ignore -- NOSONAR - multi methods.
             }
         }
         return null;
+    }
+
+    /**
+     * Compare a stored schedule against a requested one independent of key order.
+     *
+     * The requested schedule arrives as decoded JSON, so the Dashboard controls its
+     * key order, while abilities_v2_read_job_schedule() always emits a fixed order. A
+     * strict compare would read an identical schedule sent in a different key order as
+     * a change and roll a successful write back.
+     *
+     * @param mixed $stored    Schedule read from storage.
+     * @param mixed $requested Schedule from the request payload.
+     * @return bool
+     */
+    private function abilities_v2_schedule_matches( $stored, $requested ) {
+        if ( ! is_array( $stored ) || ! is_array( $requested ) ) {
+            return false;
+        }
+        ksort( $stored );
+        ksort( $requested );
+        return $stored === $requested;
     }
 
     /**

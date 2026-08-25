@@ -41,7 +41,7 @@ class MainWP_Child_Branding { //phpcs:ignore -- NOSONAR - multi methods.
     /**
      * Public variable to hold the MainWP Child plugin branding options.
      *
-     * @var string Default null
+     * @var array|null Default null
      */
     public $child_branding_options = null;
 
@@ -536,11 +536,12 @@ class MainWP_Child_Branding { //phpcs:ignore -- NOSONAR - multi methods.
         sort( $expected );
         $actual = is_array( $settings ) ? array_keys( $settings ) : array();
         sort( $actual );
-        if ( $expected !== $actual || strlen( wp_json_encode( $settings ) ) > 262144 ) {
+        $encoded = wp_json_encode( $settings );
+        if ( $expected !== $actual || ! is_string( $encoded ) || strlen( $encoded ) > 262144 ) {
             return false;
         }
         foreach ( $string_bounds as $key => $maximum ) {
-            if ( ! is_string( $settings[ $key ] ) || strlen( $settings[ $key ] ) > $maximum || preg_match( '/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/', $settings[ $key ] ) ) {
+            if ( ! is_string( $settings[ $key ] ) || strlen( $settings[ $key ] ) > $maximum || preg_match( '/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/', $settings[ $key ] ) || wp_check_invalid_utf8( $settings[ $key ] ) !== $settings[ $key ] ) {
                 return false;
             }
         }

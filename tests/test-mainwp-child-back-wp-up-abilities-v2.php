@@ -445,6 +445,46 @@ class Test_MainWP_Child_Back_WP_Up_Abilities_V2 extends WP_UnitTestCase {
 	}
 
 	/**
+	 * A schedule whose keys arrive in a non-canonical order is accepted, not rolled back.
+	 *
+	 * The payload is decoded JSON, so the Dashboard controls key order; the read-back
+	 * projection is fixed-order. A strict compare would misread the verified write as a
+	 * mismatch and return operation_failed.
+	 */
+	public function test_update_job_schedule_matches_regardless_of_key_order() {
+		$fixture = $this->option_fixture( array( 7 => array( 'activetype' => '', 'ftppass' => 'encrypted-secret' ) ) );
+
+		$result = $this->invoke_v2(
+			array(
+				'operation' => 'update_job_schedule',
+				'payload'   => array(
+					'job_id'   => 7,
+					'schedule' => array( 'minute' => 15, 'hour' => 3, 'mode' => 'daily' ),
+				),
+			),
+			$fixture
+		);
+
+		$this->assertTrue( $result['ok'] );
+		$this->assertTrue( $result['data']['updated'] );
+		$this->assertSame( array( 'mode' => 'daily', 'hour' => 3, 'minute' => 15 ), $result['data']['schedule'] );
+
+		$replay = $this->invoke_v2(
+			array(
+				'operation' => 'update_job_schedule',
+				'payload'   => array(
+					'job_id'   => 7,
+					'schedule' => array( 'hour' => 3, 'minute' => 15, 'mode' => 'daily' ),
+				),
+			),
+			$fixture
+		);
+
+		$this->assertTrue( $replay['ok'] );
+		$this->assertFalse( $replay['data']['updated'] );
+	}
+
+	/**
 	 * Invalid schedule values are rejected before any option changes.
 	 */
 	public function test_update_job_schedule_rejects_invalid_values() {

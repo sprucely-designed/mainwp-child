@@ -757,7 +757,7 @@ class MainWP_Child_Early_Access_Release {
             }
         } catch ( \UnexpectedValueException $exception ) {
             // An unreadable directory makes the walk throw part-way through. The tree is then
-            // simply not removed, which is this method's own failure result - a cleanup must not
+            // left in place, which is this method's own failure result - a cleanup must not
             // take the transition that already succeeded down with it.
             return false;
         }

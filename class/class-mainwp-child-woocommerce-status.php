@@ -676,7 +676,7 @@ class MainWP_Child_WooCommerce_Status {
      * Count stock-managed products sitting at or below the store's low-stock threshold.
      *
      * Mirrors the v1 sync figure: WooCommerce has no low-stock query var, and its
-     * 'onbackorder' stock status counts a different thing entirely — stores that never
+     * 'onbackorder' stock status counts a different thing entirely - stores that never
      * enable backorders have none, which is how v2 came to report zero.
      *
      * @return int|false

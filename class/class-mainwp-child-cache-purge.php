@@ -253,7 +253,7 @@ class MainWP_Child_Cache_Purge { //phpcs:ignore -- NOSONAR - multi methods.
                         $information = $this->wprocket_auto_cache_purge();
                         break;
                     case 'AccelerateWP':
-                        $information = $this->acceleratewp_auto_purge_cache(); // The plugin is a clone of WP-Rocket, with identical functionality—only the name has been changed.
+                        $information = $this->acceleratewp_auto_purge_cache(); // The plugin is a clone of WP-Rocket, with identical functionality - only the name has been changed.
                         break;
                     case 'Breeze':
                         $information = $this->breeze_auto_purge_cache();

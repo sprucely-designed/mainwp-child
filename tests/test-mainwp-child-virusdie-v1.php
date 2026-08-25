@@ -429,7 +429,7 @@ class Test_MainWP_Child_Virusdie_V1 extends WP_UnitTestCase {
 			$this->assertSame( 1, $subject->installs );
 			$this->assertSame( $result, $this->cold_option( $key )['result'] );
 			// The sweep's delete was committed before its own rewrite threw, so it stands; this
-			// request's row is simply untracked, which is the leak the index reduces rather than a
+			// request's row is untracked, which is the leak the index reduces rather than a
 			// mutation refused over bookkeeping.
 			$this->assertNull( $this->cold_option( $leaked ) );
 			$this->assertSame( $seeded, $this->cold_option( 'mainwp_child_virusdie_receipt_index' ) );

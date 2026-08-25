@@ -142,7 +142,7 @@ class MainWP_Child_Receipt_Index {
             }
         } catch ( \Throwable $index_failed ) {
             // The rows counted so far are gone from the table, so the count reports them; the index
-            // simply keeps naming them until a later sweep reads them missing and drops the entries.
+            // keeps naming them until a later sweep reads them missing and drops the entries.
             // The throw ends the sweep instead of skipping the entry it landed on: a predicate that
             // threw said nothing about the row it was judging, and a delete decided after an unknown
             // failure is the one thing this class must never do.
@@ -155,7 +155,7 @@ class MainWP_Child_Receipt_Index {
      *
      * The index is stored input exactly as the receipts are, so an entry that does not name a key
      * in this protocol's own namespace is dropped rather than acted on. Dropping one touches no
-     * option row: the row it might have named simply stops being tracked, which is the leak this
+     * option row: the row it might have named stops being tracked, which is the leak this
      * class exists to reduce and never a deletion. An index that will not read at all is treated
      * as empty and written over, because refusing on behalf of an unreadable one would stall every
      * mutation behind it. An index holding more elements than any cap could have produced is

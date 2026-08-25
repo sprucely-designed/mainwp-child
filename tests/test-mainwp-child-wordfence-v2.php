@@ -778,6 +778,7 @@ class Test_MainWP_Child_Wordfence_V2 extends WP_UnitTestCase {
 			$this->raise_unrelated_warning();
 			$bulk = $this->subject->bulk_operation();
 		} finally {
+			remove_filter( 'wp_delete_file', '__return_empty_string' );
 			unset( $_POST['issueID'], $_POST['op'], $_POST['ids'] );
 			if ( file_exists( $victim ) ) {
 				unlink( $victim );

@@ -466,12 +466,10 @@ class Test_MainWP_Child_Virusdie_V1 extends WP_UnitTestCase {
 
 	public function test_the_staging_file_carries_a_php_suffix_in_the_web_root() {
 		$token = 'stagingsuffixprobe';
-		add_filter(
-			'random_password',
-			static function () use ( $token ) {
-				return $token;
-			}
-		);
+		$pin   = static function () use ( $token ) {
+			return $token;
+		};
+		add_filter( 'random_password', $pin );
 		$probe         = new Virusdie_Staging_Probe();
 		$extensionless = ABSPATH . '.mainwp-virusdie-' . $token;
 		$suffixed      = $extensionless . '.php';
@@ -489,6 +487,7 @@ class Test_MainWP_Child_Virusdie_V1 extends WP_UnitTestCase {
 			$this->assertTrue( $probe->stage( 'virusdie_staging_probe.php', '<?php // artifact' ) );
 			$this->assertSame( '<?php // artifact', file_get_contents( $target ) );
 		} finally {
+			remove_filter( 'random_password', $pin );
 			foreach ( array( $extensionless, $suffixed, $target ) as $leftover ) {
 				if ( file_exists( $leftover ) ) {
 					unlink( $leftover );

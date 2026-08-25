@@ -1105,6 +1105,8 @@ class MainWP_Child_Updates { //phpcs:ignore -- NOSONAR - multi methods.
         $legacy_action = '';
         $legacy_type   = '';
 
+        // Legacy process compatibility.
+        // phpcs:disable WordPress.Security.NonceVerification
         if ( isset( $_GET['_detect_plugins_updates'] ) && 'yes' === $_GET['_detect_plugins_updates'] ) {
             $legacy_action = 'detect_plugin';
         } elseif ( isset( $_GET['_detect_themes_updates'] ) && 'yes' === $_GET['_detect_themes_updates'] ) {
@@ -1115,6 +1117,10 @@ class MainWP_Child_Updates { //phpcs:ignore -- NOSONAR - multi methods.
 
         if ( ! in_array( $premium_action, array( 'detect_plugin', 'detect_theme', 'update_plugin', 'update_theme' ), true ) && ! in_array( $legacy_action, array( 'detect_plugin', 'detect_theme' ), true ) && ! in_array( $legacy_type, array( 'plugin', 'theme' ), true ) ) {
             return;
+        }
+
+        if ( 'update_plugin' === $premium_action || 'plugin' === $legacy_type ) {
+            MainWP_Child_Updraft_Plus_Backups::register_premium_update_guards();
         }
 
         // Legacy process compatibility.

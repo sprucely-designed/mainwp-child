@@ -331,55 +331,42 @@ class Changes_Logs_Logger { //phpcs:ignore -- NOSONAR -ok.
 
         $wp_user_info = array();
 
+        // 1. Resolve missing user ID if necessary.
         if ( ! isset( $log_data['username'] ) && ! isset( $log_data['currentuserid'] ) && function_exists( 'get_current_user_id' ) ) {
-            $log_data['currentuserid'] = \get_current_user_id();
-            if ( 0 !== $log_data['currentuserid'] ) {
-                $user = \get_user_by( 'ID', $log_data['currentuserid'] );
-                if ( \is_a( $user, '\WP_User' ) ) {
-                    $log_data['username']       = $user->user_login;
-                    $wp_user_info['first_name'] = get_user_meta( $user->ID, 'first_name', true );
-                    $wp_user_info['last_name']  = get_user_meta( $user->ID, 'last_name', true );
-                } else {
-                    $log_data['username'] = 'Unknown User';
-                }
-            }
-            if ( 0 === $log_data['currentuserid'] ) {
-                if ( 'system' === strtolower( $log_obj['context'] ) ) {
-                    $log_data['username'] = 'System';
-                } elseif ( str_starts_with( strtolower( $log_obj['context'] ), 'woocommerce' ) ) { // User added/removed a product from an order.
-                    $log_data['username'] = 'WooCommerce System';
-                } else {
-                    $log_data['username'] = 'Unknown User';
-                }
-            }
+            $log_data['currentuserid'] = (int) \get_current_user_id();
         }
-        if ( isset( $log_data['currentuserid'] ) && ! isset( $log_data['username'] ) ) {
-            if ( 0 === $log_data['currentuserid'] ) {
-                if ( 'system' === strtolower( $log_obj['context'] ) ) {
-                    $log_data['username'] = 'System';
-                } elseif ( str_starts_with( strtolower( $log_obj['context'] ), 'woocommerce' ) ) {
-                    $log_data['username'] = 'WooCommerce System';
-                } else {
-                    $log_data['username'] = 'Unknown User';
-                }
-            } else {
-                $user = \get_user_by( 'ID', $log_data['currentuserid'] );
-                if ( $user ) {
-                    $log_data['username']       = $user->user_login;
+
+        // 2. Fetch user metadata and set username if user ID exists.
+        if ( isset( $log_data['currentuserid'] ) ) {
+            $user_id = (int) $log_data['currentuserid'];
+
+            if ( $user_id > 0 ) {
+                $user = \get_user_by( 'ID', $user_id );
+
+                if ( $user instanceof \WP_User ) {
+                    if ( ! isset( $log_data['username'] ) ) {
+                        $log_data['username'] = $user->user_login;
+                    }
                     $wp_user_info['first_name'] = get_user_meta( $user->ID, 'first_name', true );
                     $wp_user_info['last_name']  = get_user_meta( $user->ID, 'last_name', true );
-                } else {
+                } elseif ( ! isset( $log_data['username'] ) ) {
                     $log_data['username'] = 'Deleted';
                 }
-            }
-        } elseif ( isset( $log_data['currentuserid'] ) ) { // to fix.
-            $user = \get_user_by( 'ID', $log_data['currentuserid'] );
-            if ( $user ) {
-                $wp_user_info['first_name'] = get_user_meta( $user->ID, 'first_name', true );
-                $wp_user_info['last_name']  = get_user_meta( $user->ID, 'last_name', true );
+            } elseif ( ! isset( $log_data['username'] ) ) {
+                // System / Guest contexts (user ID is 0).
+                $context = strtolower( $log_obj['context'] ?? '' );
+
+                if ( 'system' === $context ) {
+                    $log_data['username'] = 'System';
+                } elseif ( str_starts_with( $context, 'woocommerce' ) ) {
+                    $log_data['username'] = 'WooCommerce System';
+                } else {
+                    $log_data['username'] = 'Unknown User';
+                }
             }
         }
 
+        // 3. Fetch user roles if logged in and missing.
         if ( ! isset( $log_data['currentuserroles'] ) && function_exists( 'is_user_logged_in' ) && \is_user_logged_in() ) {
             $current_user_roles = Changes_Helper::get_user_roles();
             if ( ! empty( $current_user_roles ) ) {
@@ -426,7 +413,6 @@ class Changes_Logs_Logger { //phpcs:ignore -- NOSONAR -ok.
 
         static::insert_log( $type_id, $log_data );
     }
-
 
     /**
      * Method is_ignored_changes_log().

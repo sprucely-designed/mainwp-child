@@ -1297,12 +1297,15 @@ class MainWP_Connect { //phpcs:ignore -- NOSONAR - multi methods.
                 }
 
                 $auths[ $i ] = $auths[ $i + 1 ];
+
             }
+
             $newI = $this->maxHistory + 1;
             while ( isset( $auths[ $newI ] ) ) {
                 unset( $auths[ $newI++ ] );
             }
-            $auths[ $this->maxHistory ] = md5( MainWP_Helper::rand_string( 14 ) ); // NOSONAR - safe.
+
+            $auths[ $this->maxHistory ] = MainWP_Helper::rand_hmac_key();
             $auths['last']              = time();
             MainWP_Helper::update_option( 'mainwp_child_auth', $auths, 'yes' );
         }
@@ -1317,13 +1320,14 @@ class MainWP_Connect { //phpcs:ignore -- NOSONAR - multi methods.
      *
      * @return bool true|false If valid authentication, return true, if not, return false.
      */
-    public function is_valid_auth( $key ) {
+    public function is_valid_auth( $signature ) {
         $auths = get_option( 'mainwp_child_auth' );
-        if ( ! is_array( $auths ) ) {
+        if ( ! is_array( $auths ) || ! is_string( $signature ) ) {
             return false;
         }
-        for ( $i = 0; $i <= $this->maxHistory; $i++ ) {
-            if ( isset( $auths[ $i ] ) && ( $auths[ $i ] === $key ) ) {
+
+        foreach ( $auths as $auth ) {
+            if ( is_string( $auth ) && hash_equals( $auth, $signature ) ) {
                 return true;
             }
         }

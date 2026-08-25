@@ -3404,7 +3404,9 @@ class MainWP_Child_Back_Up_Buddy { //phpcs:ignore -- NOSONAR - multi methods.
      * @uses \pb_backupbuddy::flush()
      */
     public function view_log() {
-        $serial  = isset( $_POST['serial'] ) ? sanitize_text_field( wp_unslash( $_POST['serial'] ) ) : '';
+        $serial = isset( $_POST['serial'] ) ? sanitize_text_field( wp_unslash( $_POST['serial'] ) ) : '';
+        // The serial becomes part of the log path below; restrict it to BackupBuddy's serial alphabet so it cannot traverse out of the log directory.
+        $serial  = preg_replace( '/[^a-zA-Z0-9_-]/', '', $serial );
         $logFile = \backupbuddy_core::getLogDirectory() . 'status-' . $serial . '_sum_' . \pb_backupbuddy::$options['log_serial'] . '.txt';
 
         if ( ! file_exists( $logFile ) ) {
@@ -3425,18 +3427,18 @@ class MainWP_Child_Back_Up_Buddy { //phpcs:ignore -- NOSONAR - multi methods.
                 if ( isset( $line['u'] ) ) {
                     $u = '.' . $line['u'];
                 }
-                echo \pb_backupbuddy::$format->date( $line['time'], 'G:i:s' ) . $u . "\t\t";
-                echo $line['run'] . "sec\t";
-                echo $line['mem'] . "MB\t";
-                echo $line['event'] . "\t";
-                echo $line['data'] . "\n";
+                echo esc_html( \pb_backupbuddy::$format->date( $line['time'], 'G:i:s' ) . $u ) . "\t\t";
+                echo esc_html( $line['run'] ) . "sec\t";
+                echo esc_html( $line['mem'] ) . "MB\t";
+                echo esc_html( $line['event'] ) . "\t";
+                echo esc_html( $line['data'] ) . "\n";
             } else {
-                echo $rawline . "\n";
+                echo esc_html( $rawline ) . "\n";
             }
         }
         ?>
             </textarea><br><br>
-        <small>Log file: <?php echo $logFile; ?></small>
+        <small>Log file: <?php echo esc_html( $logFile ); ?></small>
         <br>
         <?php
         echo '<small>Last modified: ' . \pb_backupbuddy::$format->date( filemtime( $logFile ) ) . ' (' . \pb_backupbuddy::$format->time_ago( filemtime( $logFile ) ) . ' ago)'; // NOSONAR .

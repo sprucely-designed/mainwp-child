@@ -1140,7 +1140,7 @@ class MainWP_Child_Stats { //phpcs:ignore -- NOSONAR - multi methods.
             if ( MainWP_Helper::funct_exists( 'popen' ) ) {
                 $uploadDir   = MainWP_Helper::get_mainwp_dir();
                 $uploadDir   = $uploadDir[0];
-                $popenHandle = popen( 'du -s ' . $directory . ' --exclude "' . str_replace( ABSPATH, '', $uploadDir ) . '"', 'r' ); // phpcs:ignore -- run if enabled.
+                $popenHandle = popen( 'du -s ' . escapeshellarg( $directory ) . ' --exclude ' . escapeshellarg( str_replace( ABSPATH, '', $uploadDir ) ), 'r' ); // phpcs:ignore -- run if enabled.
                 if ( 'resource' === gettype( $popenHandle ) ) {
                     $size = fread( $popenHandle, 1024 ); //phpcs:ignore -- custom read file.
                     pclose( $popenHandle );
@@ -1154,7 +1154,7 @@ class MainWP_Child_Stats { //phpcs:ignore -- NOSONAR - multi methods.
             if ( MainWP_Helper::funct_exists( 'shell_exec' ) ) {
                 $uploadDir = MainWP_Helper::get_mainwp_dir();
                 $uploadDir = $uploadDir[0];
-                $size      = shell_exec( 'du -s ' . $directory . ' --exclude "' . str_replace( ABSPATH, '', $uploadDir ) . '"' ); // phpcs:ignore -- run if enabled.
+                $size      = shell_exec( 'du -s ' . escapeshellarg( $directory ) . ' --exclude ' . escapeshellarg( str_replace( ABSPATH, '', $uploadDir ) ) ); // phpcs:ignore -- run if enabled.
                 if ( null !== $size ) {
                     $size = substr( $size, 0, strpos( $size, "\t" ) );
                     if ( $size && MainWP_Helper::ctype_digit( $size ) ) {

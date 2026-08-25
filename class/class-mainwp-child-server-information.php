@@ -378,6 +378,12 @@ class MainWP_Child_Server_Information extends MainWP_Child_Server_Information_Ba
                 float: right;
                 margin:  5px 0 5px;
             }
+
+            #mwp_child_download_srv_info,
+            #mwp_child_close_srv_info {
+                position: relative;
+                z-index: 10000;
+            }
         </style>
         <div class="wrap">
             <div class="updated below-h2">

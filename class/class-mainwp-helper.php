@@ -570,6 +570,21 @@ class MainWP_Helper { //phpcs:ignore -- NOSONAR - multi methods.
         return \wp_generate_password( $length, false );
     }
 
+
+    /**
+     * Method rand_hmac_key()
+     *
+     * Generate key for hash_hmac signature.
+     *
+     * @param int $length Contains the string lenghts.
+     *
+     * @return string Generated random key string.
+     */
+    public static function rand_hmac_key( $length = 32 ) {
+        return bin2hex( random_bytes( $length ) );
+    }
+
+
     /**
      * Method rand_str_key()
      *

@@ -5,9 +5,9 @@ Author: mainwp
 Author URI: https://mainwp.com
 Plugin URI: https://mainwp.com
 Requires at least: 6.2
-Tested up to: 7.0.2
+Tested up to: 7.1
 Requires PHP: 7.4
-Stable tag: 6.1.7
+Stable tag: 6.1.8
 License: GPLv3 or later
 License URI: https://www.gnu.org/licenses/gpl-3.0.html
 
@@ -114,6 +114,13 @@ Please report security bugs found in the source code of the MainWP Child plugin 
 11. Dashboard Insights
 
 == Changelog ==
+
+= 6.1.8 - 8-25-2026 =
+
+* Fixed: "Download" and "Hide" buttons in the System Report are now clickable.
+* Fixed: Theme updates performed through WP Admin are now correctly logged in Network Activity.
+* Fixed: Improved BackWPup backup job handling across modern and legacy versions, including validation, progress reporting, and backup start and stop actions.
+* Updated: Improved Clone session authentication and validation for stronger session security.
 
 = 6.1.7 - 8-18-2026 =
 

@@ -23,7 +23,7 @@ class Changes_Handle_WP_Plugins_Themes {
      *
      * @var array
      */
-    private static $current_themes = null;
+    private static $current_themes_info = null;
 
     /**
      * Store Plugins.
@@ -147,11 +147,20 @@ class Changes_Handle_WP_Plugins_Themes {
      * @return array
      */
     private static function get_current_themes(): array {
-        if ( null === self::$current_themes ) {
-            self::$current_themes = \wp_get_themes();
+        if ( null === self::$current_themes_info ) {
+            self::$current_themes_info = array();
+            $current_themes            = \wp_get_themes();
+            if ( is_array( $current_themes ) ) {
+                foreach ( $current_themes as $slug => $theme ) {
+                    self::$current_themes_info[ $slug ] = array(
+                        'version'    => $theme->get( 'Version' ),
+                        'name'       => $theme->get( 'Name' ),
+                        'stylesheet' => $theme->get_stylesheet(),
+                    );
+                }
+            }
         }
-
-        return self::$current_themes;
+        return self::$current_themes_info;
     }
 
     /**
@@ -291,8 +300,9 @@ class Changes_Handle_WP_Plugins_Themes {
             $old_theme = isset( $old_themes[ $one_updated_theme ] ) ? $old_themes[ $one_updated_theme ] : false;
 
             $old_version = '';
-            if ( ! empty( $old_theme ) && $old_theme instanceof \WP_Theme ) {
-                $old_version = $old_theme->get( 'Version' );
+
+            if ( ! empty( $old_theme ) && is_array( $old_theme ) && ! empty( $old_theme['version'] ) ) {
+                $old_version = $old_theme['version'];
             }
 
             $theme_name    = $theme->get( 'Name' );

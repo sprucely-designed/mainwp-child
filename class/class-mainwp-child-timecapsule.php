@@ -1019,8 +1019,9 @@ class MainWP_Child_Timecapsule { //phpcs:ignore -- NOSONAR - multi methods.
         // The count doubles as the existence check. SHOW TABLES cannot serve here: it never lists
         // temporary tables, so it answers "absent" for a table the very next query reads fine.
         // A query error means the preview cannot answer, which is not the same as counting zero files.
-        $suppress = $wpdb->suppress_errors( true );
-        $count    = $wpdb->get_var( //phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Provider-owned table, count changes with every backup run.
+        $suppress         = $wpdb->suppress_errors( true );
+        $wpdb->last_error = '';
+        $count            = $wpdb->get_var( //phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Provider-owned table, count changes with every backup run.
             $wpdb->prepare(
                 "SELECT COUNT(*) FROM {$wpdb->base_prefix}wptc_processed_files WHERE backupID = %d",
                 (int) $raw_id

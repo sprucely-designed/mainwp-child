@@ -1216,6 +1216,62 @@ class Test_MainWP_Child_Back_WP_Up_Abilities_V2 extends WP_UnitTestCase {
 	}
 
 	/**
+	 * A log that changed since it was listed is a conflict, not a silent success.
+	 *
+	 * resolve_log_target answers null both for a missing file and for one whose size or mtime no
+	 * longer matches the token. Reporting a changed file absent would claim a deletion that never
+	 * happened, so the delete path tells the two apart: a real conflict, and a real absence.
+	 */
+	public function test_provider_delete_log_reports_a_changed_file_as_a_conflict() {
+		$temp_dir = wp_tempnam( 'mainwp-backwpup-v2-delete-log' );
+		$this->assertIsString( $temp_dir );
+		wp_delete_file( $temp_dir );
+		$this->assertTrue( wp_mkdir_p( $temp_dir ) );
+		$log_file = trailingslashit( $temp_dir ) . 'backwpup_log_changed.html';
+		$content  = '<meta name="backwpup_jobname" content="Nightly" />' .
+			'<meta name="backwpup_jobtime" content="200" />' .
+			'<meta name="backwpup_jobruntime" content="5" />' .
+			'<meta name="backwpup_errors" content="0" />' .
+			'<meta name="backwpup_warnings" content="0" />' .
+			'<meta name="backwpup_jobtype" content="DBDUMP" /><body>log</body>';
+		file_put_contents( $log_file, $content ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_file_put_contents -- Disposable fixture.
+
+		$fixture = new class( $temp_dir ) extends MainWP_Child_Back_WP_Up {
+			/** @var string */
+			private $directory;
+
+			/** @param string $directory Directory. */
+			public function __construct( $directory ) {
+				$this->directory = $directory;
+			}
+
+			/** @return string */
+			protected function abilities_v2_log_directory() {
+				return $this->directory;
+			}
+		};
+
+		$rows = $this->invoke_provider( $fixture, 'abilities_v2_provider_list_logs', array( 'all' ) );
+		$this->assertCount( 1, $rows );
+		$target = $rows[0]['target'];
+
+		// BackWPup appends to the still-open log after the Dashboard listed it, so the token's
+		// size no longer matches what is on disk.
+		file_put_contents( $log_file, ' more', FILE_APPEND ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_file_put_contents -- Disposable fixture.
+
+		$conflict = $this->invoke_provider( $fixture, 'abilities_v2_provider_delete_log', array( $target ) );
+		$this->assertInstanceOf( WP_Error::class, $conflict );
+		$this->assertSame( 'not_found', $conflict->get_error_code() );
+		$this->assertFileExists( $log_file );
+
+		// A genuinely missing file is still reported as an idempotent absence, not a conflict.
+		wp_delete_file( $log_file );
+		$this->assertSame( 'absent', $this->invoke_provider( $fixture, 'abilities_v2_provider_delete_log', array( $target ) ) );
+
+		$this->assertTrue( rmdir( $temp_dir ) );
+	}
+
+	/**
 	 * Plain and gzip logs are streamed without whole-file allocation.
 	 */
 	public function test_provider_log_streams_plain_and_gzip() {

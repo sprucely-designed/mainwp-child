@@ -598,7 +598,7 @@ class MainWP_Child_Branding { //phpcs:ignore -- NOSONAR - multi methods.
         $target['remove_restore']           = $settings['child_remove_restore'];
         $target['remove_setting']           = $settings['child_remove_setting'];
         $target['remove_server_info']       = $settings['child_remove_server_info'];
-        $target['remove_connection_detail'] = 0;
+        $target['remove_connection_detail'] = isset( $current['remove_connection_detail'] ) ? $current['remove_connection_detail'] : 0;
         $target['remove_wp_tools']          = $settings['child_remove_wp_tools'];
         $target['remove_wp_setting']        = $settings['child_remove_wp_setting'];
         $target['remove_permalink']         = $settings['child_remove_permalink'];

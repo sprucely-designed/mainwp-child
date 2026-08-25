@@ -553,6 +553,50 @@ class Test_MainWP_Child_WooCommerce_Status_V2 extends WP_UnitTestCase {
 		$this->assertSame( $lease, get_option( 'mainwp_wc_status_db_update_v2_lease' ) );
 	}
 
+	/**
+	 * Receipt eviction drops only entries past the retry horizon and fails closed otherwise.
+	 *
+	 * Insertion-order trimming could discard a receipt db_update_v2_status or the terminal-lease
+	 * release still needs. A full store whose every receipt is inside the horizon refuses the write
+	 * instead; a single aged receipt frees exactly one slot; a key no request could present goes
+	 * first.
+	 */
+	public function test_db_receipt_eviction_is_horizon_bound_and_fails_closed() {
+		$reflection = new ReflectionClass( MainWP_Child_WooCommerce_Status::class );
+		$evict      = $reflection->getMethod( 'abilities_v2_evict_db_receipts' );
+		$evict->setAccessible( true );
+		$subject = $reflection->newInstanceWithoutConstructor();
+
+		$fresh = time();
+		$stale = time() - ( 2 * DAY_IN_SECONDS );
+
+		$full = array();
+		for ( $i = 1; $i <= 100; $i++ ) {
+			$full[ sprintf( '123e4567-e89b-42d3-a456-%012d', $i ) ] = array( 'requested_at' => $fresh );
+		}
+		$this->assertFalse( $evict->invoke( $subject, $full ), 'A store at cap with only live receipts cannot free a slot.' );
+
+		$victim          = sprintf( '123e4567-e89b-42d3-a456-%012d', 1 );
+		$full[ $victim ] = array( 'requested_at' => $stale );
+		$freed           = $evict->invoke( $subject, $full );
+		$this->assertIsArray( $freed );
+		$this->assertArrayNotHasKey( $victim, $freed );
+		$this->assertCount( 99, $freed );
+
+		$mixed = array();
+		for ( $i = 1; $i <= 99; $i++ ) {
+			$mixed[ sprintf( '123e4567-e89b-42d3-a456-%012d', $i ) ] = array( 'requested_at' => $fresh );
+		}
+		$mixed['not-a-uuid'] = array( 'requested_at' => $fresh );
+		$dropped_key         = $evict->invoke( $subject, $mixed );
+		$this->assertIsArray( $dropped_key );
+		$this->assertArrayNotHasKey( 'not-a-uuid', $dropped_key );
+		$this->assertCount( 99, $dropped_key );
+
+		$under_cap = array_slice( $mixed, 0, 50, true );
+		$this->assertSame( $under_cap, $evict->invoke( $subject, $under_cap ), 'A store below cap is returned untouched.' );
+	}
+
 	private function seed_db_lease( $request_ref, $target_version ) {
 		update_option( 'mainwp_wc_status_db_update_v2_lease', array( 'request_ref' => $request_ref, 'expires_at' => time() + 3600 ), false );
 		update_option(
@@ -783,6 +827,9 @@ class Test_MainWP_Child_WooCommerce_Status_V2 extends WP_UnitTestCase {
 		$decimal    = $reflection->getMethod( 'abilities_v2_decimal_to_minor' );
 		$add        = $reflection->getMethod( 'abilities_v2_integer_add' );
 		$subtract   = $reflection->getMethod( 'abilities_v2_integer_subtract' );
+		$decimal->setAccessible( true );
+		$add->setAccessible( true );
+		$subtract->setAccessible( true );
 
 		$this->assertSame( '125050', $decimal->invoke( $this->subject, '1250.50', 2 ) );
 		$this->assertSame( '-5', $decimal->invoke( $this->subject, '-0.05', 2 ) );

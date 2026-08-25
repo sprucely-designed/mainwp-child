@@ -149,6 +149,8 @@ class MainWP_Child_Jetpack_Protect {
                 }
             } catch ( MainWP_Exception $e ) {
                 // error!
+            } catch ( \Throwable $e ) {
+                // error!
             }
         }
         return $information;
@@ -200,6 +202,8 @@ class MainWP_Child_Jetpack_Protect {
                         break;
                 }
             } catch ( MainWP_Exception $e ) {
+                $information = array( 'error' => $e->getMessage() );
+            } catch ( \Throwable $e ) {
                 $information = array( 'error' => $e->getMessage() );
             }
         }
@@ -614,6 +618,8 @@ class MainWP_Child_Jetpack_Protect {
                     $connection = $manager->is_connected() ? 'connected' : 'disconnected';
                 }
             } catch ( MainWP_Exception $e ) {
+                $manager = null;
+            } catch ( \Throwable $e ) {
                 $manager = null;
             }
             if ( null === $manager ) {

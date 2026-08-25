@@ -894,6 +894,45 @@ class Test_MainWP_Child_BackupBuddy_V2_Provider_Boundary extends WP_UnitTestCase
 	}
 
 	/**
+	 * A malformed stored lock value is cleared so acquisition is not wedged into permanent lock_busy.
+	 *
+	 * The acquire path only deleted a well-formed expired lock, so a non-array value, or an array
+	 * missing an int expires_at, survived every request and add_option() failed against it forever.
+	 * The fix drops any unusable stored value while still refusing to evict a live holder.
+	 */
+	public function test_acquire_effect_lock_clears_an_unusable_stored_value() {
+		$subject = new class() extends MainWP_Child_Back_Up_Buddy {
+			/** Skip the product hooks the real constructor wires. */
+			public function __construct() {
+				$this->is_backupbuddy_installed = true;
+			}
+
+			/** @return string|false */
+			public function call_acquire() {
+				return $this->abilities_v2_acquire_effect_lock();
+			}
+		};
+
+		// A non-array value is unusable and must be cleared rather than wedge the lock.
+		update_option( 'mainwp_backupbuddy_ability_effect_lock_v1', 'corrupt-not-an-array' );
+		$owner = $subject->call_acquire();
+		$this->assertIsString( $owner );
+		$stored = get_option( 'mainwp_backupbuddy_ability_effect_lock_v1' );
+		$this->assertIsArray( $stored );
+		$this->assertSame( $owner, $stored['owner'] );
+
+		// The live lock just taken is still refused: the malformed-clear path must not evict a holder.
+		$this->assertFalse( $subject->call_acquire() );
+
+		// An array missing an int expires_at is equally unusable and is cleared the same way.
+		delete_option( 'mainwp_backupbuddy_ability_effect_lock_v1' );
+		update_option( 'mainwp_backupbuddy_ability_effect_lock_v1', array( 'owner' => 'stale', 'expires_at' => 'soon' ) );
+		$reacquired = $subject->call_acquire();
+		$this->assertIsString( $reacquired );
+		$this->assertSame( $reacquired, get_option( 'mainwp_backupbuddy_ability_effect_lock_v1' )['owner'] );
+	}
+
+	/**
 	 * @param Test_MainWP_Child_BackupBuddy_V2_Effect_Fixture $fixture Fixture.
 	 * @return string
 	 */

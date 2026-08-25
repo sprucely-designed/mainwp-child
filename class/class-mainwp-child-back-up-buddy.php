@@ -874,7 +874,8 @@ class MainWP_Child_Back_Up_Buddy { //phpcs:ignore -- NOSONAR - multi methods.
         $now      = $this->abilities_v2_now();
         $owner    = wp_generate_uuid4();
         $existing = get_option( $key, false );
-        if ( is_array( $existing ) && isset( $existing['expires_at'] ) && is_int( $existing['expires_at'] ) && $existing['expires_at'] <= $now ) {
+        $usable   = is_array( $existing ) && isset( $existing['expires_at'] ) && is_int( $existing['expires_at'] );
+        if ( false !== $existing && ( ! $usable || $existing['expires_at'] <= $now ) ) {
             delete_option( $key );
         }
         $value = array( 'owner' => $owner, 'expires_at' => $now + 120 );

@@ -458,6 +458,38 @@ class Test_MainWP_Child_Branding_Abilities_V2 extends WP_UnitTestCase {
 	}
 
 	/**
+	 * A v2 apply preserves a stored remove_connection_detail the v2 schema does not carry.
+	 *
+	 * The projection used to force the field to 0 on every apply, silently clearing a site that had
+	 * it set to 1. The field is not part of the v2 settings map, so the current stored value is kept.
+	 */
+	public function test_apply_preserves_stored_remove_connection_detail() {
+		$fixture = new Test_MainWP_Child_Branding_V2_Fixture(
+			array(
+				'remove_connection_detail' => 1,
+				'extra_settings'           => array(),
+			)
+		);
+
+		$result = $this->invoke_v2( $fixture, $this->request( $this->desired_settings() ) );
+
+		$this->assertTrue( $result['ok'] );
+		$this->assertSame( 1, $fixture->stored_settings['remove_connection_detail'] );
+	}
+
+	/**
+	 * With no stored value, the field still defaults to 0.
+	 */
+	public function test_apply_defaults_remove_connection_detail_to_zero_when_absent() {
+		$fixture = new Test_MainWP_Child_Branding_V2_Fixture();
+
+		$result = $this->invoke_v2( $fixture, $this->request( $this->desired_settings() ) );
+
+		$this->assertTrue( $result['ok'] );
+		$this->assertSame( 0, $fixture->stored_settings['remove_connection_detail'] );
+	}
+
+	/**
 	 * The apply runs inside the named mutation lock and releases it afterwards.
 	 */
 	public function test_apply_holds_the_named_mutation_lock_and_releases_it() {

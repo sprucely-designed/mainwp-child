@@ -50,6 +50,13 @@ class MainWP_Child_WooCommerce_Status {
     private $abilities_v2_inventory_memo = null;
 
     /**
+     * Largest number of database-update receipts the store keeps.
+     *
+     * @var int
+     */
+    private const ABILITIES_V2_MAX_DB_RECEIPTS = 100;
+
+    /**
      * Method instance()
      *
      * Create a public static instance.
@@ -892,17 +899,64 @@ class MainWP_Child_WooCommerce_Status {
         if ( ! is_array( $receipts ) ) {
             return false;
         }
+        // Room is made before the new receipt is written. Insertion-order trimming could drop a
+        // receipt db_update_v2_status or the terminal-lease release still needs, so a store that
+        // cannot free a slot refuses the write instead.
+        $receipts = $this->abilities_v2_evict_db_receipts( $receipts );
+        if ( false === $receipts ) {
+            return false;
+        }
         $receipts[ $request_ref ] = array(
             'request_hash' => hash( 'sha256', wp_json_encode( $payload ) ),
             'response'     => $response,
             'requested_at' => time(),
         );
-        if ( 100 < count( $receipts ) ) {
-            $receipts = array_slice( $receipts, -100, null, true );
-        }
-        $written  = update_option( 'mainwp_wc_status_db_update_v2_receipts', $receipts, false );
+        // An unchanged-value write returns false from update_option, so the readback is the
+        // authority on whether the store now holds exactly these receipts.
+        update_option( 'mainwp_wc_status_db_update_v2_receipts', $receipts, false );
         $readback = get_option( 'mainwp_wc_status_db_update_v2_receipts', null );
-        return ( $written || $readback === $receipts ) && $readback === $receipts;
+        return $readback === $receipts;
+    }
+
+    /**
+     * Free one receipt slot without discarding an outcome a retry could still ask for.
+     *
+     * A malformed entry still gates db_update_v2_start with storage_unavailable, so it is evidence
+     * a request_ref was used and cannot be dropped on an age it does not carry. Only entries whose
+     * own requested_at proves them past the retry horizon are given up, oldest first, and a key no
+     * request could ever present is dropped outright. A store that still cannot free a slot returns
+     * false so the caller refuses the write rather than evict a live receipt.
+     *
+     * @param array $receipts Stored receipts.
+     * @return array|false Receipts with room for one more, or false when no slot can be freed.
+     */
+    private function abilities_v2_evict_db_receipts( $receipts ) {
+        if ( self::ABILITIES_V2_MAX_DB_RECEIPTS > count( $receipts ) ) {
+            return $receipts;
+        }
+        $horizon   = time() - ( DAY_IN_SECONDS + 60 );
+        $evictable = array();
+        foreach ( $receipts as $reference => $receipt ) {
+            if ( ! $this->abilities_v2_uuid( $reference ) ) {
+                // No request can present a reference this handler would accept, so nothing will ever
+                // come back for this entry. Array keys are not always strings either, so this is also
+                // what stops a non-string key being read as a live reference.
+                $evictable[ $reference ] = 0;
+                continue;
+            }
+            $requested_at = is_array( $receipt ) && isset( $receipt['requested_at'] ) && is_int( $receipt['requested_at'] ) ? $receipt['requested_at'] : null;
+            if ( null !== $requested_at && 0 < $requested_at && $requested_at < $horizon ) {
+                $evictable[ $reference ] = $requested_at;
+            }
+        }
+        asort( $evictable, SORT_NUMERIC );
+        foreach ( array_keys( $evictable ) as $reference ) {
+            if ( self::ABILITIES_V2_MAX_DB_RECEIPTS > count( $receipts ) ) {
+                break;
+            }
+            unset( $receipts[ $reference ] );
+        }
+        return self::ABILITIES_V2_MAX_DB_RECEIPTS > count( $receipts ) ? $receipts : false;
     }
 
     /**

@@ -1687,7 +1687,12 @@ class MainWP_Child_Back_WP_Up { //phpcs:ignore -- NOSONAR - multi methods.
     protected function abilities_v2_provider_delete_log( $target ) {
         $file = $this->abilities_v2_resolve_log_target( $target );
         if ( ! is_string( $file ) ) {
-            return 'absent';
+            // resolve_log_target answers null both for a genuinely missing file and for one whose
+            // size or mtime no longer matches the token. A log BackWPup appended to since it was
+            // listed still exists, so reporting it absent would claim a deletion that never happened.
+            // Only a file that is really gone is absent; a changed one is a conflict the Dashboard
+            // must re-list before it can act.
+            return $this->abilities_v2_log_target_present( $target ) ? new \WP_Error( 'not_found' ) : 'absent';
         }
         if ( ! is_writable( dirname( $file ) ) ) { // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_is_writable -- Exact local BackWPup log directory check.
             return new \WP_Error( 'operation_failed' );
@@ -1800,6 +1805,25 @@ class MainWP_Child_Back_WP_Up { //phpcs:ignore -- NOSONAR - multi methods.
             return null;
         }
         return $file;
+    }
+
+    /**
+     * Whether a path-contained log file for this token still exists on disk.
+     *
+     * Deliberately ignores the token's size and mtime: this answers "is the file gone" so the delete
+     * path can tell a genuinely absent log apart from one that merely changed since it was listed.
+     *
+     * @param array $target Internal target.
+     * @return bool
+     */
+    private function abilities_v2_log_target_present( $target ) {
+        if ( ! is_array( $target ) || ! isset( $target['basename'] ) || ! is_string( $target['basename'] ) || 1 !== preg_match( '/^backwpup_log_[A-Za-z0-9_.-]+\.html(?:\.gz|\.bz2)?$/D', $target['basename'] ) ) {
+            return false;
+        }
+        $directory = $this->abilities_v2_log_directory();
+        $root      = is_string( $directory ) ? realpath( $directory ) : false;
+        $file      = false === $root ? false : realpath( trailingslashit( $root ) . $target['basename'] );
+        return false !== $file && 0 === strpos( wp_normalize_path( $file ), trailingslashit( wp_normalize_path( $root ) ) ) && is_file( $file );
     }
 
     /**

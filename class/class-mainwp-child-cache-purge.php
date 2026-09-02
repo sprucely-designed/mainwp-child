@@ -52,6 +52,13 @@ class MainWP_Child_Cache_Purge { //phpcs:ignore -- NOSONAR - multi methods.
     public $wp_optimize_class = '\WP_Optimize';
 
     /**
+     * Whether a successful Cloudflare purge may update the shared last-purged timestamp.
+     *
+     * @var bool
+     */
+    protected $should_update_cloudflare_last_purged = true;
+
+    /**
      * Method instance()
      *
      * Create a public static instance.
@@ -338,7 +345,14 @@ class MainWP_Child_Cache_Purge { //phpcs:ignore -- NOSONAR - multi methods.
 
             // Fire off CloudFlare purge if enabled & not using a CDN Cache Plugin. ( Stops double purging Cloudflare ).
             if ( '1' === get_option( 'mainwp_child_cloud_flair_enabled' ) && 'CDN Cache Plugin' !== $cache_plugin_solution ) {
-                $information['cloudflare'] = $this->cloudflair_auto_purge_cache();
+                $previous_update_setting                    = $this->should_update_cloudflare_last_purged;
+                $this->should_update_cloudflare_last_purged = isset( $information['action'] ) && 'SUCCESS' === $information['action'];
+
+                try {
+                    $information['cloudflare'] = $this->cloudflair_auto_purge_cache();
+                } finally {
+                    $this->should_update_cloudflare_last_purged = $previous_update_setting;
+                }
             }
         } else {
             // If Cache Control is disabled, set status to disabled but still pass "SUCCESS" action because it did not fail.
@@ -402,7 +416,7 @@ class MainWP_Child_Cache_Purge { //phpcs:ignore -- NOSONAR - multi methods.
             $failed_layers[] = 'Batcache';
         }
 
-        if ( $object_cache_flushed && $batcache_flushed ) {
+        if ( $object_cache_flushed ) {
             update_option( 'flush-obj-cache-time-stamp', gmdate( 'j M Y, g:ia' ) . ' UTC' );
             do_action( 'pcm_after_object_cache_flush' );
         }
@@ -1170,8 +1184,10 @@ class MainWP_Child_Cache_Purge { //phpcs:ignore -- NOSONAR - multi methods.
             $errors = isset( $result['errors'] ) ? wp_json_encode( $result['errors'], JSON_UNESCAPED_SLASHES ) : 'Unknown error';
             return $this->purge_result( 'Cloudflare => There was an issue purging the cache. ' . $errors, 'ERROR' );
         }
-        // Save last purge time to database on success.
-        update_option( 'mainwp_cache_control_last_purged', time() );
+        // Save last purge time to database when the primary cache purge also succeeded.
+        if ( $this->should_update_cloudflare_last_purged ) {
+            update_option( 'mainwp_cache_control_last_purged', time() );
+        }
         return $this->purge_result( 'Cloudflare => Cache auto cleared on: (' . current_time( 'mysql' ) . ')', 'SUCCESS' );
     }
 

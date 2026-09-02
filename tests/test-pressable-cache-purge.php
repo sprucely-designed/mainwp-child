@@ -8,6 +8,8 @@
 use MainWP\Child\MainWP_Child_Cache_Purge;
 
 if ( ! class_exists( 'Edge_Cache_Plugin' ) ) {
+	define( 'MAINWP_PRESSABLE_EDGE_CACHE_TEST_FIXTURE', true );
+
 	/**
 	 * Minimal Pressable Edge Cache test fixture.
 	 */
@@ -137,6 +139,81 @@ class MainWP_Child_Cache_Purge_Pressable_Status_Test_Double extends MainWP_Child
 }
 
 /**
+ * Test double for Pressable and Cloudflare result aggregation.
+ */
+class MainWP_Child_Cache_Purge_Pressable_Cloudflare_Test_Double extends MainWP_Child_Cache_Purge {
+
+	/**
+	 * Pressable purge action.
+	 *
+	 * @var string
+	 */
+	public $pressable_action = 'ERROR';
+
+	/**
+	 * Whether Cloudflare was allowed to update the shared timestamp.
+	 *
+	 * @var bool|null
+	 */
+	public $cloudflare_update_last_purged;
+
+	/**
+	 * Information passed to the result recorder.
+	 *
+	 * @var array|null
+	 */
+	public $recorded_information;
+
+	/**
+	 * Return the configured Pressable result.
+	 *
+	 * @return array Pressable purge result.
+	 */
+	public function pressable_cache_management_auto_purge_cache() {
+		return $this->purge_result( 'Pressable purge result.', $this->pressable_action );
+	}
+
+	/**
+	 * Return a Cloudflare success and record the timestamp-update instruction.
+	 *
+	 * @return array Cloudflare purge result.
+	 */
+	public function cloudflair_auto_purge_cache() {
+		$this->cloudflare_update_last_purged = $this->should_update_cloudflare_last_purged;
+
+		if ( $this->should_update_cloudflare_last_purged ) {
+			update_option( 'mainwp_cache_control_last_purged', 67890 );
+		}
+
+		return $this->purge_result( 'Cloudflare purge succeeded.', 'SUCCESS' );
+	}
+
+	/**
+	 * Capture the aggregate result.
+	 *
+	 * @param array $information Purge result information.
+	 */
+	public function record_results( $information ) {
+		$this->recorded_information = $information;
+	}
+}
+
+/**
+ * Test double using the original public Cloudflare override signature.
+ */
+class MainWP_Child_Cache_Purge_Legacy_Cloudflare_Override_Test_Double extends MainWP_Child_Cache_Purge {
+
+	/**
+	 * Return a successful legacy override result.
+	 *
+	 * @return array Cloudflare purge result.
+	 */
+	public function cloudflair_auto_purge_cache() {
+		return $this->purge_result( 'Legacy Cloudflare override succeeded.', 'SUCCESS' );
+	}
+}
+
+/**
  * Pressable Cache Management purge test case.
  */
 class Pressable_Cache_Purge_Test extends WP_UnitTestCase {
@@ -149,7 +226,14 @@ class Pressable_Cache_Purge_Test extends WP_UnitTestCase {
 		delete_option( 'flush-obj-cache-time-stamp' );
 		delete_option( 'edge-cache-purge-time-stamp' );
 		delete_option( 'edge-cache-enabled' );
-		Edge_Cache_Plugin::$status = Edge_Cache_Plugin::EC_ENABLED;
+		delete_option( 'mainwp_cache_control_cache_solution' );
+		delete_option( 'mainwp_child_auto_purge_cache' );
+		delete_option( 'mainwp_child_cloud_flair_enabled' );
+		delete_option( 'mainwp_cache_control_log' );
+
+		if ( defined( 'MAINWP_PRESSABLE_EDGE_CACHE_TEST_FIXTURE' ) ) {
+			Edge_Cache_Plugin::$status = Edge_Cache_Plugin::EC_ENABLED;
+		}
 
 		parent::tear_down();
 	}
@@ -199,7 +283,85 @@ class Pressable_Cache_Purge_Test extends WP_UnitTestCase {
 		$this->assertNotFalse( strpos( $result['result'], 'Batcache' ) );
 		$this->assertNotFalse( strpos( $result['result'], 'Edge Cache' ) );
 		$this->assertSame( 12345, get_option( 'mainwp_cache_control_last_purged' ) );
-		$this->assertFalse( get_option( 'flush-obj-cache-time-stamp', false ) );
+		$this->assertNotFalse( get_option( 'flush-obj-cache-time-stamp', false ) );
+	}
+
+	/**
+	 * Test that an object-cache success is recorded when Batcache fails later.
+	 */
+	public function test_records_object_cache_success_when_batcache_fails() {
+		update_option( 'mainwp_cache_control_last_purged', 12345 );
+
+		$hook_calls = 0;
+		$callback   = static function () use ( &$hook_calls ) {
+			++$hook_calls;
+		};
+		add_action( 'pcm_after_object_cache_flush', $callback );
+
+		$purger                     = new MainWP_Child_Cache_Purge_Pressable_Test_Double();
+		$purger->batcache_result    = false;
+		$purger->edge_cache_enabled = false;
+		$result                     = $purger->pressable_cache_management_auto_purge_cache();
+
+		remove_action( 'pcm_after_object_cache_flush', $callback );
+
+		$this->assertSame( 'ERROR', $result['action'] );
+		$this->assertNotFalse( strpos( $result['result'], 'Batcache' ) );
+		$this->assertNotFalse( get_option( 'flush-obj-cache-time-stamp', false ) );
+		$this->assertSame( 1, $hook_calls );
+		$this->assertSame( 12345, get_option( 'mainwp_cache_control_last_purged' ) );
+	}
+
+	/**
+	 * Test that Cloudflare success cannot advance the timestamp after Pressable fails.
+	 */
+	public function test_cloudflare_success_does_not_mask_pressable_failure() {
+		update_option( 'mainwp_cache_control_last_purged', 12345 );
+		update_option( 'mainwp_child_auto_purge_cache', 1 );
+		update_option( 'mainwp_cache_control_cache_solution', 'Pressable Cache Management' );
+		update_option( 'mainwp_child_cloud_flair_enabled', '1' );
+
+		$purger = new MainWP_Child_Cache_Purge_Pressable_Cloudflare_Test_Double();
+		$purger->auto_purge_cache();
+
+		$this->assertFalse( $purger->cloudflare_update_last_purged );
+		$this->assertSame( 'ERROR', $purger->recorded_information['action'] );
+		$this->assertSame( 'SUCCESS', $purger->recorded_information['cloudflare']['action'] );
+		$this->assertSame( 12345, get_option( 'mainwp_cache_control_last_purged' ) );
+
+		$purger->cloudflair_auto_purge_cache();
+
+		$this->assertTrue( $purger->cloudflare_update_last_purged );
+		$this->assertSame( 67890, get_option( 'mainwp_cache_control_last_purged' ) );
+	}
+
+	/**
+	 * Test that Cloudflare can advance the timestamp after Pressable succeeds.
+	 */
+	public function test_cloudflare_success_updates_timestamp_after_pressable_success() {
+		update_option( 'mainwp_cache_control_last_purged', 12345 );
+		update_option( 'mainwp_child_auto_purge_cache', 1 );
+		update_option( 'mainwp_cache_control_cache_solution', 'Pressable Cache Management' );
+		update_option( 'mainwp_child_cloud_flair_enabled', '1' );
+
+		$purger                   = new MainWP_Child_Cache_Purge_Pressable_Cloudflare_Test_Double();
+		$purger->pressable_action = 'SUCCESS';
+		$purger->auto_purge_cache();
+
+		$this->assertTrue( $purger->cloudflare_update_last_purged );
+		$this->assertSame( 'SUCCESS', $purger->recorded_information['action'] );
+		$this->assertSame( 'SUCCESS', $purger->recorded_information['cloudflare']['action'] );
+		$this->assertSame( 67890, get_option( 'mainwp_cache_control_last_purged' ) );
+	}
+
+	/**
+	 * Test that existing zero-argument Cloudflare overrides remain compatible.
+	 */
+	public function test_legacy_cloudflare_override_signature_remains_compatible() {
+		$purger = new MainWP_Child_Cache_Purge_Legacy_Cloudflare_Override_Test_Double();
+		$result = $purger->cloudflair_auto_purge_cache();
+
+		$this->assertSame( 'SUCCESS', $result['action'] );
 	}
 
 	/**
@@ -220,6 +382,10 @@ class Pressable_Cache_Purge_Test extends WP_UnitTestCase {
 	 * Test that an authoritative disabled status overrides a stale enabled option.
 	 */
 	public function test_live_disabled_edge_cache_overrides_stale_enabled_option() {
+		if ( ! defined( 'MAINWP_PRESSABLE_EDGE_CACHE_TEST_FIXTURE' ) ) {
+			$this->markTestSkipped( 'The Pressable Edge Cache fixture is unavailable because the production class is already loaded.' );
+		}
+
 		update_option( 'edge-cache-enabled', 'enabled' );
 		Edge_Cache_Plugin::$status = Edge_Cache_Plugin::EC_DISABLED;
 

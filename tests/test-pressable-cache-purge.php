@@ -179,9 +179,9 @@ class MainWP_Child_Cache_Purge_Pressable_Cloudflare_Test_Double extends MainWP_C
 	 * @return array Cloudflare purge result.
 	 */
 	public function cloudflair_auto_purge_cache() {
-		$this->cloudflare_update_last_purged = $this->should_update_cloudflare_last_purged;
+		$this->cloudflare_update_last_purged = $this->update_cf_timestamp;
 
-		if ( $this->should_update_cloudflare_last_purged ) {
+		if ( $this->update_cf_timestamp ) {
 			update_option( 'mainwp_cache_control_last_purged', 67890 );
 		}
 

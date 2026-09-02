@@ -56,7 +56,7 @@ class MainWP_Child_Cache_Purge { //phpcs:ignore -- NOSONAR - multi methods.
      *
      * @var bool
      */
-    protected $should_update_cloudflare_last_purged = true;
+    protected $update_cf_timestamp = true;
 
     /**
      * Method instance()
@@ -345,13 +345,13 @@ class MainWP_Child_Cache_Purge { //phpcs:ignore -- NOSONAR - multi methods.
 
             // Fire off CloudFlare purge if enabled & not using a CDN Cache Plugin. ( Stops double purging Cloudflare ).
             if ( '1' === get_option( 'mainwp_child_cloud_flair_enabled' ) && 'CDN Cache Plugin' !== $cache_plugin_solution ) {
-                $previous_update_setting                    = $this->should_update_cloudflare_last_purged;
-                $this->should_update_cloudflare_last_purged = isset( $information['action'] ) && 'SUCCESS' === $information['action'];
+                $prior_cf_update           = $this->update_cf_timestamp;
+                $this->update_cf_timestamp = isset( $information['action'] ) && 'SUCCESS' === $information['action'];
 
                 try {
                     $information['cloudflare'] = $this->cloudflair_auto_purge_cache();
                 } finally {
-                    $this->should_update_cloudflare_last_purged = $previous_update_setting;
+                    $this->update_cf_timestamp = $prior_cf_update;
                 }
             }
         } else {
@@ -476,6 +476,10 @@ class MainWP_Child_Cache_Purge { //phpcs:ignore -- NOSONAR - multi methods.
     /**
      * Check whether Pressable Edge Cache is enabled.
      *
+     * Pressable exposes its live status through a static singleton accessor.
+     *
+     * @SuppressWarnings(PHPMD.StaticAccess)
+     *
      * @return bool Whether Edge Cache is enabled.
      */
     protected function pressable_edge_cache_is_enabled() {
@@ -508,6 +512,10 @@ class MainWP_Child_Cache_Purge { //phpcs:ignore -- NOSONAR - multi methods.
 
     /**
      * Purge Pressable Edge Cache.
+     *
+     * Pressable exposes its purge method through a static singleton accessor.
+     *
+     * @SuppressWarnings(PHPMD.StaticAccess)
      *
      * @return bool Whether the Edge Cache purge completed successfully.
      */
@@ -1185,7 +1193,7 @@ class MainWP_Child_Cache_Purge { //phpcs:ignore -- NOSONAR - multi methods.
             return $this->purge_result( 'Cloudflare => There was an issue purging the cache. ' . $errors, 'ERROR' );
         }
         // Save last purge time to database when the primary cache purge also succeeded.
-        if ( $this->should_update_cloudflare_last_purged ) {
+        if ( $this->update_cf_timestamp ) {
             update_option( 'mainwp_cache_control_last_purged', time() );
         }
         return $this->purge_result( 'Cloudflare => Cache auto cleared on: (' . current_time( 'mysql' ) . ')', 'SUCCESS' );

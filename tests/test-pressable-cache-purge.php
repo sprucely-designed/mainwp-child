@@ -42,6 +42,16 @@ if ( ! class_exists( 'Edge_Cache_Plugin' ) ) {
 		public function get_ec_status() {
 			return self::$status;
 		}
+
+		/**
+		 * Simulate a successful domain purge.
+		 *
+		 * @param string $reason Reason for the purge.
+		 * @return bool Purge result.
+		 */
+		public function purge_domain_now( $reason ) {
+			return true;
+		}
 	}
 }
 
@@ -86,6 +96,13 @@ class MainWP_Child_Cache_Purge_Pressable_Test_Double extends MainWP_Child_Cache_
 	public $edge_cache_purge_calls = 0;
 
 	/**
+	 * Whether to run the real Edge helper against the fixture.
+	 *
+	 * @var bool
+	 */
+	public $use_edge_cache_fixture = false;
+
+	/**
 	 * Return the configured object cache result.
 	 *
 	 * @return bool Object cache result.
@@ -119,6 +136,9 @@ class MainWP_Child_Cache_Purge_Pressable_Test_Double extends MainWP_Child_Cache_
 	 */
 	protected function pressable_purge_edge_cache() {
 		++$this->edge_cache_purge_calls;
+		if ( $this->use_edge_cache_fixture ) {
+			return parent::pressable_purge_edge_cache();
+		}
 		return $this->edge_cache_result;
 	}
 }
@@ -310,6 +330,127 @@ class Pressable_Cache_Purge_Test extends WP_UnitTestCase {
 		$this->assertNotFalse( get_option( 'flush-obj-cache-time-stamp', false ) );
 		$this->assertSame( 1, $hook_calls );
 		$this->assertSame( 12345, get_option( 'mainwp_cache_control_last_purged' ) );
+	}
+
+	/**
+	 * Test that either kind of hook failure leaves Edge Cache reachable.
+	 */
+	public function test_object_hook_failure_does_not_prevent_edge_purge() {
+		foreach ( array( new RuntimeException( 'Private callback details' ), new Error( 'Private callback details' ) ) as $failure ) {
+			update_option( 'mainwp_cache_control_last_purged', 12345 );
+			$callback = static function () use ( $failure ) {
+				throw $failure;
+			};
+			add_action( 'pcm_after_object_cache_flush', $callback );
+			$purger = new MainWP_Child_Cache_Purge_Pressable_Test_Double();
+
+			try {
+				$result = $purger->pressable_cache_management_auto_purge_cache();
+			} finally {
+				remove_action( 'pcm_after_object_cache_flush', $callback );
+			}
+
+			$this->assertSame( 'ERROR', $result['action'] );
+			$this->assertNotFalse( strpos( $result['result'], 'Object Cache post-purge hook' ) );
+			$this->assertFalse( strpos( $result['result'], 'Private callback details' ) );
+			$this->assertSame( 1, $purger->edge_cache_purge_calls );
+			$this->assertNotFalse( get_option( 'flush-obj-cache-time-stamp', false ) );
+			$this->assertSame( 12345, get_option( 'mainwp_cache_control_last_purged' ) );
+
+			// A later successful invocation must not retain the earlier hook failure.
+			$result = $purger->pressable_cache_management_auto_purge_cache();
+			$this->assertSame( 'SUCCESS', $result['action'] );
+			$this->assertSame( 2, $purger->edge_cache_purge_calls );
+		}
+	}
+
+	/**
+	 * Test that an Edge notification failure returns an incomplete result.
+	 */
+	public function test_edge_hook_failure_returns_an_error() {
+		if ( ! defined( 'MAINWP_PRESSABLE_EDGE_CACHE_TEST_FIXTURE' ) ) {
+			$this->markTestSkipped( 'The Pressable Edge Cache fixture is unavailable because the production class is already loaded.' );
+		}
+
+		foreach ( array( new RuntimeException( 'Private callback details' ), new Error( 'Private callback details' ) ) as $failure ) {
+			update_option( 'mainwp_cache_control_last_purged', 12345 );
+			$callback = static function () use ( $failure ) {
+				throw $failure;
+			};
+			add_action( 'pcm_after_edge_cache_purge', $callback );
+			$purger                         = new MainWP_Child_Cache_Purge_Pressable_Test_Double();
+			$purger->use_edge_cache_fixture = true;
+
+			try {
+				$result = $purger->pressable_cache_management_auto_purge_cache();
+			} finally {
+				remove_action( 'pcm_after_edge_cache_purge', $callback );
+			}
+
+			$this->assertSame( 'ERROR', $result['action'] );
+			$this->assertNotFalse( strpos( $result['result'], 'Edge Cache post-purge hook' ) );
+			$this->assertNotFalse( get_option( 'edge-cache-purge-time-stamp', false ) );
+			$this->assertFalse( strpos( $result['result'], 'Private callback details' ) );
+			$this->assertSame( 1, $purger->edge_cache_purge_calls );
+			$this->assertSame( 12345, get_option( 'mainwp_cache_control_last_purged' ) );
+		}
+	}
+
+	/**
+	 * Test that hook failures and independent cache failures are all reported.
+	 */
+	public function test_reports_hook_and_cache_failures_together() {
+		update_option( 'mainwp_cache_control_last_purged', 12345 );
+		$callback = static function () {
+			throw new RuntimeException( 'Callback failed' );
+		};
+		add_action( 'pcm_after_object_cache_flush', $callback );
+		$purger                    = new MainWP_Child_Cache_Purge_Pressable_Test_Double();
+		$purger->batcache_result   = false;
+		$purger->edge_cache_result = false;
+
+		try {
+			$result = $purger->pressable_cache_management_auto_purge_cache();
+		} finally {
+			remove_action( 'pcm_after_object_cache_flush', $callback );
+		}
+
+		$this->assertSame( 'ERROR', $result['action'] );
+		$this->assertNotFalse( strpos( $result['result'], 'Batcache' ) );
+		$this->assertNotFalse( strpos( $result['result'], 'Object Cache post-purge hook' ) );
+		$this->assertNotFalse( strpos( $result['result'], 'Edge Cache' ) );
+		$this->assertSame( 1, $purger->edge_cache_purge_calls );
+		$this->assertSame( 12345, get_option( 'mainwp_cache_control_last_purged' ) );
+	}
+
+	/**
+	 * Test that notifications run only for successfully purged active layers.
+	 */
+	public function test_skips_hooks_for_failed_or_disabled_cache_layers() {
+		$callback = static function () {
+			throw new RuntimeException( 'This notification must not run' );
+		};
+		add_action( 'pcm_after_object_cache_flush', $callback );
+		add_action( 'pcm_after_edge_cache_purge', $callback );
+
+		try {
+			foreach ( array( true, false ) as $edge_enabled ) {
+				update_option( 'mainwp_cache_control_last_purged', 12345 );
+				$purger                      = new MainWP_Child_Cache_Purge_Pressable_Test_Double();
+				$purger->object_cache_result = false;
+				$purger->edge_cache_result   = false;
+				$purger->edge_cache_enabled  = $edge_enabled;
+				$result                      = $purger->pressable_cache_management_auto_purge_cache();
+
+				$this->assertSame( 'ERROR', $result['action'] );
+				$this->assertFalse( strpos( $result['result'], 'post-purge hook' ) );
+				$this->assertSame( $edge_enabled ? 1 : 0, $purger->edge_cache_purge_calls );
+				$this->assertSame( 12345, get_option( 'mainwp_cache_control_last_purged' ) );
+			}
+		} finally {
+			remove_action( 'pcm_after_object_cache_flush', $callback );
+			remove_action( 'pcm_after_edge_cache_purge', $callback );
+		}
 	}
 
 	/**

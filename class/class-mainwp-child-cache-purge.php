@@ -402,31 +402,43 @@ class MainWP_Child_Cache_Purge { //phpcs:ignore -- NOSONAR - multi methods.
      */
     public function pressable_cache_management_auto_purge_cache() {
 
-        $success_message = 'Pressable Cache Management => Cache auto cleared on: (' . current_time( 'mysql' ) . ')';
-        $failed_layers   = array();
+        $success_message   = 'Pressable Cache Management => Cache auto cleared on: (' . current_time( 'mysql' ) . ')';
+        $failed_operations = array();
 
         $object_cache_flushed = $this->pressable_flush_object_cache();
         $batcache_flushed     = $this->pressable_flush_batcache();
 
         if ( ! $object_cache_flushed ) {
-            $failed_layers[] = 'Object Cache';
+            $failed_operations[] = 'Object Cache';
         }
 
         if ( ! $batcache_flushed ) {
-            $failed_layers[] = 'Batcache';
+            $failed_operations[] = 'Batcache';
         }
 
         if ( $object_cache_flushed ) {
             update_option( 'flush-obj-cache-time-stamp', gmdate( 'j M Y, g:ia' ) . ' UTC' );
-            do_action( 'pcm_after_object_cache_flush' );
+            try {
+                do_action( 'pcm_after_object_cache_flush' );
+            } catch ( \Throwable $e ) {
+                $failed_operations[] = 'Object Cache post-purge hook';
+            }
         }
 
-        if ( $this->pressable_edge_cache_is_enabled() && ! $this->pressable_purge_edge_cache() ) {
-            $failed_layers[] = 'Edge Cache';
+        if ( $this->pressable_edge_cache_is_enabled() ) {
+            if ( ! $this->pressable_purge_edge_cache() ) {
+                $failed_operations[] = 'Edge Cache';
+            } else {
+                try {
+                    do_action( 'pcm_after_edge_cache_purge' );
+                } catch ( \Throwable $e ) {
+                    $failed_operations[] = 'Edge Cache post-purge hook';
+                }
+            }
         }
 
-        if ( ! empty( $failed_layers ) ) {
-            $error_message = 'Pressable Cache Management => Cache purge incomplete. Failed layers: ' . implode( ', ', $failed_layers ) . '.';
+        if ( ! empty( $failed_operations ) ) {
+            $error_message = 'Pressable Cache Management => Cache purge incomplete. Failed operations: ' . implode( ', ', $failed_operations ) . '.';
             return $this->purge_result( $error_message, 'ERROR' );
         }
 
@@ -535,7 +547,6 @@ class MainWP_Child_Cache_Purge { //phpcs:ignore -- NOSONAR - multi methods.
         }
 
         update_option( 'edge-cache-purge-time-stamp', gmdate( 'j M Y, g:ia' ) . ' UTC' );
-        do_action( 'pcm_after_edge_cache_purge' );
 
         return true;
     }

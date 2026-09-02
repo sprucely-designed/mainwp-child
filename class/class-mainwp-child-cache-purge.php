@@ -389,13 +389,133 @@ class MainWP_Child_Cache_Purge { //phpcs:ignore -- NOSONAR - multi methods.
     public function pressable_cache_management_auto_purge_cache() {
 
         $success_message = 'Pressable Cache Management => Cache auto cleared on: (' . current_time( 'mysql' ) . ')';
+        $failed_layers   = array();
 
-        if ( is_callable( 'flush_pressable_cache_callback' ) ) {
-            flush_pressable_cache_callback();
+        $object_cache_flushed = $this->pressable_flush_object_cache();
+        $batcache_flushed     = $this->pressable_flush_batcache();
+
+        if ( ! $object_cache_flushed ) {
+            $failed_layers[] = 'Object Cache';
         }
+
+        if ( ! $batcache_flushed ) {
+            $failed_layers[] = 'Batcache';
+        }
+
+        if ( $object_cache_flushed && $batcache_flushed ) {
+            update_option( 'flush-obj-cache-time-stamp', gmdate( 'j M Y, g:ia' ) . ' UTC' );
+            do_action( 'pcm_after_object_cache_flush' );
+        }
+
+        if ( $this->pressable_edge_cache_is_enabled() && ! $this->pressable_purge_edge_cache() ) {
+            $failed_layers[] = 'Edge Cache';
+        }
+
+        if ( ! empty( $failed_layers ) ) {
+            $error_message = 'Pressable Cache Management => Cache purge incomplete. Failed layers: ' . implode( ', ', $failed_layers ) . '.';
+            return $this->purge_result( $error_message, 'ERROR' );
+        }
+
         // record results.
         update_option( 'mainwp_cache_control_last_purged', time() );
         return $this->purge_result( $success_message, 'SUCCESS' );
+    }
+
+    /**
+     * Flush the WordPress persistent object cache.
+     *
+     * @return bool Whether the cache flush completed successfully.
+     */
+    protected function pressable_flush_object_cache() {
+        try {
+            $result = wp_cache_flush();
+        } catch ( \Throwable $e ) {
+            return false;
+        }
+
+        if ( false === $result ) {
+            return false;
+        }
+
+        return true;
+    }
+
+    /**
+     * Flush Pressable Batcache when it is active.
+     *
+     * @return bool Whether Batcache was unavailable or flushed successfully.
+     */
+    protected function pressable_flush_batcache() {
+        if ( ! function_exists( 'batcache_clear_cache' ) ) {
+            return true;
+        }
+
+        try {
+            $result = batcache_clear_cache();
+        } catch ( \Throwable $e ) {
+            return false;
+        }
+
+        return false !== $result;
+    }
+
+    /**
+     * Check whether Pressable Edge Cache is enabled.
+     *
+     * @return bool Whether Edge Cache is enabled.
+     */
+    protected function pressable_edge_cache_is_enabled() {
+        $edge_cache_enabled = 'enabled' === get_option( 'edge-cache-enabled' );
+
+        if ( ! class_exists( 'Edge_Cache_Plugin' ) || ! is_callable( array( '\\Edge_Cache_Plugin', 'get_instance' ) ) ) {
+            return $edge_cache_enabled;
+        }
+
+        try {
+            $edge_cache = \Edge_Cache_Plugin::get_instance();
+
+            if ( method_exists( $edge_cache, 'get_ec_status' ) ) {
+                $edge_cache_status = $edge_cache->get_ec_status();
+
+                if ( defined( 'Edge_Cache_Plugin::EC_ENABLED' ) && \Edge_Cache_Plugin::EC_ENABLED === $edge_cache_status ) {
+                    return true;
+                }
+
+                if ( defined( 'Edge_Cache_Plugin::EC_DISABLED' ) && \Edge_Cache_Plugin::EC_DISABLED === $edge_cache_status ) {
+                    return false;
+                }
+            }
+        } catch ( \Throwable $e ) {
+            return $edge_cache_enabled;
+        }
+
+        return $edge_cache_enabled;
+    }
+
+    /**
+     * Purge Pressable Edge Cache.
+     *
+     * @return bool Whether the Edge Cache purge completed successfully.
+     */
+    protected function pressable_purge_edge_cache() {
+        if ( ! class_exists( 'Edge_Cache_Plugin' ) || ! is_callable( array( '\\Edge_Cache_Plugin', 'get_instance' ) ) ) {
+            return false;
+        }
+
+        try {
+            $edge_cache = \Edge_Cache_Plugin::get_instance();
+
+            if ( ! method_exists( $edge_cache, 'purge_domain_now' ) || ! $edge_cache->purge_domain_now( 'mainwp-cache-control-purge' ) ) {
+                return false;
+            }
+        } catch ( \Throwable $e ) {
+            return false;
+        }
+
+        update_option( 'edge-cache-purge-time-stamp', gmdate( 'j M Y, g:ia' ) . ' UTC' );
+        do_action( 'pcm_after_edge_cache_purge' );
+
+        return true;
     }
 
     /**

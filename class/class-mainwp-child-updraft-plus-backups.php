@@ -329,6 +329,9 @@ class MainWP_Child_Updraft_Plus_Backups { //phpcs:ignore -- NOSONAR - multi meth
                     case 'set_showhide':
                         $information = $this->set_showhide();
                         break;
+                    case 'abilities_v2':
+                        $information = $this->abilities_v2_action();
+                        break;
                     case 'save_settings':
                         $information = $this->save_settings();
                         break;
@@ -394,6 +397,286 @@ class MainWP_Child_Updraft_Plus_Backups { //phpcs:ignore -- NOSONAR - multi meth
             }
         }
         MainWP_Helper::write( $information );
+    }
+
+    /**
+     * Decode one additive UpdraftPlus abilities-v2 request.
+     *
+     * @return array Closed protocol response.
+     */
+    private function abilities_v2_action() {
+        // phpcs:ignore WordPress.Security.NonceVerification.Missing -- Authenticated MainWP Child callable.
+        if ( ! isset( $_POST['request'] ) || ! is_string( $_POST['request'] ) ) {
+            return $this->abilities_v2_error( 'unknown' );
+        }
+
+        // phpcs:ignore WordPress.Security.NonceVerification.Missing,WordPress.Security.ValidatedSanitizedInput.InputNotSanitized -- Closed JSON is validated below.
+        $raw = wp_unslash( $_POST['request'] );
+        if ( '' === $raw || 65536 < strlen( $raw ) ) {
+            return $this->abilities_v2_error( 'unknown' );
+        }
+
+        return $this->abilities_v2( json_decode( $raw, true ) );
+    }
+
+    /** @param mixed $request Decoded request. @return array Closed protocol response. */
+    public function abilities_v2( $request ) {
+        $operation = is_array( $request ) && isset( $request['operation'] ) && is_string( $request['operation'] ) ? $request['operation'] : 'unknown';
+        $mutations = array( 'replace_policy', 'start_backup', 'cancel_operation', 'prepare_download', 'delete_backup', 'restore_backup' );
+        $keys      = in_array( $operation, $mutations, true ) ? array( 'protocol', 'operation', 'request_ref', 'payload' ) : array( 'protocol', 'operation', 'payload' );
+        if ( ! is_array( $request ) || ! $this->abilities_v2_exact_keys( $request, $keys ) || '2' !== $request['protocol'] || ! is_array( $request['payload'] ) ) {
+            return $this->abilities_v2_error( $operation );
+        }
+
+        if ( 'capabilities' === $operation ) {
+            if ( array() !== $request['payload'] ) {
+                return $this->abilities_v2_error( $operation );
+            }
+            $supported = $this->abilities_v2_supported_operations();
+            return array(
+                'protocol'           => '2',
+                'operation'          => 'capabilities',
+                'ok'                 => true,
+                'operations'         => $supported,
+                'mutation_supported' => array() !== array_intersect( $mutations, $supported ) && $this->abilities_v2_provider_supports_mutation(),
+            );
+        }
+        // Anything this Child cannot execute is refused by name, whether the protocol knows it or not.
+        if ( ! in_array( $operation, $this->abilities_v2_supported_operations(), true ) ) {
+            return $this->abilities_v2_error( $operation, 'unsupported_operation' );
+        }
+        if ( ! $this->abilities_v2_valid_payload( $operation, $request['payload'] ) || ( in_array( $operation, $mutations, true ) && ! $this->abilities_v2_valid_request_ref( $request['request_ref'] ) ) ) {
+            return $this->abilities_v2_error( $operation );
+        }
+
+        $receipts    = array();
+        // The reference is validated case-insensitively, so it has to be folded before it keys a receipt.
+        $request_ref = in_array( $operation, $mutations, true ) ? strtolower( $request['request_ref'] ) : null;
+        $effect_hash = hash( 'sha256', wp_json_encode( array( $operation, $request['payload'] ) ) );
+        if ( in_array( $operation, $mutations, true ) ) {
+            $receipts = get_option( 'mainwp_updraftplus_abilities_v2_receipts', array() );
+            if ( ! is_array( $receipts ) ) {
+                return $this->abilities_v2_error( $operation, 'storage_unavailable' );
+            }
+            if ( isset( $receipts[ $request_ref ] ) ) {
+                $receipt = $receipts[ $request_ref ];
+                if ( ! is_array( $receipt ) || ! $this->abilities_v2_exact_keys( $receipt, array( 'effect_hash', 'response' ) ) || ! is_string( $receipt['effect_hash'] ) || ! is_array( $receipt['response'] ) ) {
+                    return $this->abilities_v2_error( $operation, 'storage_unavailable' );
+                }
+                return hash_equals( $receipt['effect_hash'], $effect_hash ) ? $receipt['response'] : $this->abilities_v2_error( $operation, 'request_conflict' );
+            }
+            if ( ! $this->abilities_v2_provider_supports_mutation() ) {
+                return $this->abilities_v2_error( $operation, 'provider_unavailable' );
+            }
+        }
+
+        try {
+            $result = $this->abilities_v2_provider_operation( $operation, $request['payload'] );
+        } catch ( \Throwable $throwable ) {
+            return $this->abilities_v2_error( $operation, in_array( $operation, $mutations, true ) ? 'outcome_unknown' : 'provider_unavailable' );
+        }
+        if ( is_wp_error( $result ) ) {
+            $code = $result->get_error_code();
+            return $this->abilities_v2_error( $operation, in_array( $code, array( 'provider_unavailable', 'provider_schema_invalid', 'target_not_found', 'state_conflict', 'stale_generation', 'outcome_unknown', 'storage_unavailable' ), true ) ? $code : 'provider_unavailable' );
+        }
+        if ( ! $this->abilities_v2_valid_result( $operation, $result ) ) {
+            return $this->abilities_v2_error( $operation, 'provider_schema_invalid' );
+        }
+        $response = array_merge( array( 'protocol' => '2', 'operation' => $operation, 'ok' => true ), in_array( $operation, $mutations, true ) ? array( 'request_ref' => $request_ref ) : array(), $result );
+        if ( in_array( $operation, $mutations, true ) ) {
+            if ( 100 <= count( $receipts ) ) {
+                array_shift( $receipts );
+            }
+            $receipts[ $request_ref ] = array( 'effect_hash' => $effect_hash, 'response' => $response );
+            if ( ! update_option( 'mainwp_updraftplus_abilities_v2_receipts', $receipts, false ) && $receipts !== get_option( 'mainwp_updraftplus_abilities_v2_receipts', array() ) ) {
+                return $this->abilities_v2_error( $operation, 'outcome_unknown' );
+            }
+        }
+        return $response;
+    }
+
+    /**
+     * List the operations this Child can actually execute.
+     *
+     * No UpdraftPlus adapter is wired here: the protocol is defined but nothing on the
+     * Child can answer a single operation, so none are advertised and each one is
+     * refused by name instead of blaming an absent provider. A build that wires the
+     * adapter extends this list.
+     *
+     * @return array Executable operation names.
+     */
+    protected function abilities_v2_supported_operations() {
+        return array();
+    }
+
+    /** @return bool Whether the installed provider exposes typed mutation support. */
+    protected function abilities_v2_provider_supports_mutation() {
+        return false;
+    }
+
+    /** @param string $operation Operation. @param array $payload Payload. @return array|WP_Error */
+    protected function abilities_v2_provider_operation( $operation, $payload ) {
+        unset( $operation, $payload );
+        return new \WP_Error( 'provider_unavailable' );
+    }
+
+    /** @param string $operation Operation. @param array $payload Payload. @return bool */
+    private function abilities_v2_valid_payload( $operation, $payload ) { // phpcs:ignore Generic.Metrics.CyclomaticComplexity.TooHigh -- Closed operation schemas.
+        $hash       = static function ( $value ) { return is_string( $value ) && 1 === preg_match( '/^[a-f0-9]{64}$/D', $value ); };
+        $components = static function ( $value ) {
+            return is_array( $value ) && 1 <= count( $value ) && 6 >= count( $value ) && count( $value ) === count( array_unique( $value ) ) && array() === array_diff( $value, array( 'database', 'plugins', 'themes', 'uploads', 'others', 'core' ) );
+        };
+        if ( in_array( $operation, array( 'site', 'policy' ), true ) ) {
+            return array() === $payload;
+        }
+        if ( 'replace_policy' === $operation ) {
+            return $this->abilities_v2_exact_keys( $payload, array( 'files_interval', 'database_interval', 'retain_files', 'retain_database', 'components', 'if_match' ) ) && $this->abilities_v2_valid_interval( $payload['files_interval'] ) && $this->abilities_v2_valid_interval( $payload['database_interval'] ) && is_int( $payload['retain_files'] ) && 1 <= $payload['retain_files'] && 365 >= $payload['retain_files'] && is_int( $payload['retain_database'] ) && 1 <= $payload['retain_database'] && 365 >= $payload['retain_database'] && $components( $payload['components'] ) && $hash( $payload['if_match'] );
+        }
+        if ( 'list_backups' === $operation ) {
+            return $this->abilities_v2_exact_keys( $payload, array( 'limit', 'after_backup_ref' ) ) && is_int( $payload['limit'] ) && 1 <= $payload['limit'] && 100 >= $payload['limit'] && ( null === $payload['after_backup_ref'] || $hash( $payload['after_backup_ref'] ) );
+        }
+        if ( 'backup_manifest' === $operation ) {
+            return $this->abilities_v2_exact_keys( $payload, array( 'backup_ref' ) ) && $hash( $payload['backup_ref'] );
+        }
+        if ( 'start_backup' === $operation ) {
+            return $this->abilities_v2_exact_keys( $payload, array( 'components', 'placement', 'policy_generation' ) ) && $components( $payload['components'] ) && in_array( $payload['placement'], array( 'local', 'remote', 'both' ), true ) && $hash( $payload['policy_generation'] );
+        }
+        if ( 'operation_status' === $operation ) {
+            return $this->abilities_v2_exact_keys( $payload, array( 'operation_ref' ) ) && $hash( $payload['operation_ref'] );
+        }
+        if ( 'cancel_operation' === $operation ) {
+            return $this->abilities_v2_exact_keys( $payload, array( 'operation_ref', 'if_match' ) ) && $hash( $payload['operation_ref'] ) && $hash( $payload['if_match'] );
+        }
+        if ( 'prepare_download' === $operation ) {
+            return $this->abilities_v2_exact_keys( $payload, array( 'backup_ref', 'component_ref', 'manifest_generation' ) ) && $hash( $payload['backup_ref'] ) && $hash( $payload['component_ref'] ) && $hash( $payload['manifest_generation'] );
+        }
+        if ( 'delete_backup' === $operation ) {
+            return $this->abilities_v2_exact_keys( $payload, array( 'backup_ref', 'manifest_generation', 'locations' ) ) && $hash( $payload['backup_ref'] ) && $hash( $payload['manifest_generation'] ) && is_array( $payload['locations'] ) && 1 <= count( $payload['locations'] ) && 2 >= count( $payload['locations'] ) && count( $payload['locations'] ) === count( array_unique( $payload['locations'] ) ) && array() === array_diff( $payload['locations'], array( 'local', 'remote' ) );
+        }
+        if ( 'preview_restore' === $operation ) {
+            return $this->abilities_v2_exact_keys( $payload, array( 'backup_ref', 'manifest_generation', 'component_refs' ) ) && $hash( $payload['backup_ref'] ) && $hash( $payload['manifest_generation'] ) && $this->abilities_v2_valid_component_refs( $payload['component_refs'] );
+        }
+        return 'restore_backup' === $operation && $this->abilities_v2_exact_keys( $payload, array( 'backup_ref', 'manifest_generation', 'component_refs', 'preview_token' ) ) && $hash( $payload['backup_ref'] ) && $hash( $payload['manifest_generation'] ) && $this->abilities_v2_valid_component_refs( $payload['component_refs'] ) && is_string( $payload['preview_token'] ) && 1 === preg_match( '/^[A-Za-z0-9_-]{43,128}$/D', $payload['preview_token'] );
+    }
+
+    /** @param mixed $value Component references. @return bool */
+    private function abilities_v2_valid_component_refs( $value ) {
+        if ( ! is_array( $value ) || 1 > count( $value ) || 1000 < count( $value ) || count( $value ) !== count( array_unique( $value ) ) ) {
+            return false;
+        }
+        foreach ( $value as $ref ) {
+            if ( ! is_string( $ref ) || 1 !== preg_match( '/^[a-f0-9]{64}$/D', $ref ) ) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** @param mixed $value Interval. @return bool */
+    private function abilities_v2_valid_interval( $value ) {
+        return is_string( $value ) && in_array( $value, array( 'manual', 'every2hours', 'every4hours', 'every8hours', 'twicedaily', 'daily', 'weekly', 'fortnightly', 'monthly' ), true );
+    }
+
+    /** @param mixed $value Request reference. @return bool */
+    private function abilities_v2_valid_request_ref( $value ) {
+        return is_string( $value ) && 1 === preg_match( '/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/Di', $value );
+    }
+
+    /** @param string $operation Operation. @param mixed $result Result. @return bool */
+    private function abilities_v2_valid_result( $operation, $result ) {
+        if ( ! is_array( $result ) ) {
+            return false;
+        }
+        $keys = array(
+            'site'              => array( 'plugin_state', 'premium', 'last_attempt_at', 'last_verified_at', 'active_operation_count', 'observed_at', 'generation' ),
+            'policy'            => array( 'files_interval', 'database_interval', 'retain_files', 'retain_database', 'components', 'remote_enabled', 'policy_generation' ),
+            'replace_policy'    => array( 'schedule_changed', 'policy_generation' ),
+            'list_backups'      => array( 'backups', 'snapshot_generation', 'next_after_backup_ref', 'truncated' ),
+            'backup_manifest'   => array( 'backup_ref', 'created_at', 'components', 'complete', 'manifest_generation' ),
+            'start_backup'      => array( 'operation_ref', 'state', 'component_count', 'placement' ),
+            'operation_status'  => array( 'operation_ref', 'kind', 'state', 'progress_percent', 'started_at', 'finished_at', 'result_ref', 'generation' ),
+            'cancel_operation'  => array( 'operation_ref', 'state', 'quiescent' ),
+            'prepare_download'  => array( 'download_ref', 'download_token', 'expires_at', 'bytes', 'checksum_verified' ),
+            'delete_backup'     => array( 'operation_ref', 'backup_ref', 'component_count', 'locations', 'state' ),
+            'preview_restore'   => array( 'preview_token', 'expires_at', 'backup_ref', 'component_count', 'overwrite_expected', 'preflight' ),
+            'restore_backup'    => array( 'operation_ref', 'backup_ref', 'component_count', 'state' ),
+        );
+        return isset( $keys[ $operation ] ) && $this->abilities_v2_exact_keys( $result, $keys[ $operation ] ) && $this->abilities_v2_result_scalars_valid( $operation, $result );
+    }
+
+    /** @param string $operation Operation. @param array $result Result. @return bool */
+    private function abilities_v2_result_scalars_valid( $operation, $result ) { // phpcs:ignore Generic.Metrics.CyclomaticComplexity.TooHigh -- Closed result schemas.
+        $hash = static function ( $value ) { return is_string( $value ) && 1 === preg_match( '/^[a-f0-9]{64}$/D', $value ); };
+        if ( 'start_backup' === $operation ) {
+            return $hash( $result['operation_ref'] ) && in_array( $result['state'], array( 'queued', 'running', 'reconciliation_required' ), true ) && is_int( $result['component_count'] ) && 1 <= $result['component_count'] && 6 >= $result['component_count'] && in_array( $result['placement'], array( 'local', 'remote', 'both' ), true );
+        }
+        if ( 'operation_status' === $operation ) {
+            return $hash( $result['operation_ref'] ) && in_array( $result['kind'], array( 'backup', 'download', 'delete', 'restore' ), true ) && in_array( $result['state'], array( 'queued', 'running', 'verifying', 'succeeded', 'failed', 'cancelled', 'uncertain', 'reconciliation_required' ), true ) && is_int( $result['progress_percent'] ) && 0 <= $result['progress_percent'] && 100 >= $result['progress_percent'] && $hash( $result['generation'] );
+        }
+        if ( in_array( $operation, array( 'replace_policy', 'list_backups', 'backup_manifest', 'site', 'policy' ), true ) ) {
+            return $this->abilities_v2_result_generations_valid( $operation, $result );
+        }
+        if ( 'cancel_operation' === $operation ) {
+            return $hash( $result['operation_ref'] ) && in_array( $result['state'], array( 'running', 'cancelled', 'reconciliation_required' ), true ) && is_bool( $result['quiescent'] );
+        }
+        if ( 'prepare_download' === $operation ) {
+            return $hash( $result['download_ref'] ) && is_string( $result['download_token'] ) && 1 === preg_match( '/^[A-Za-z0-9_-]{43,128}$/D', $result['download_token'] ) && is_int( $result['bytes'] ) && 0 <= $result['bytes'] && is_bool( $result['checksum_verified'] );
+        }
+        if ( 'delete_backup' === $operation || 'restore_backup' === $operation ) {
+            return $hash( $result['operation_ref'] ) && $hash( $result['backup_ref'] ) && is_int( $result['component_count'] ) && 0 <= $result['component_count'] && 1000 >= $result['component_count'] && in_array( $result['state'], array( 'queued', 'running', 'reconciliation_required' ), true );
+        }
+        return 'preview_restore' === $operation && is_string( $result['preview_token'] ) && 1 === preg_match( '/^[A-Za-z0-9_-]{43,128}$/D', $result['preview_token'] ) && $hash( $result['backup_ref'] ) && is_int( $result['component_count'] ) && 1 <= $result['component_count'] && 1000 >= $result['component_count'] && is_bool( $result['overwrite_expected'] ) && in_array( $result['preflight'], array( 'ready', 'blocked' ), true );
+    }
+
+    /** @param string $operation Operation. @param array $result Result. @return bool */
+    private function abilities_v2_result_generations_valid( $operation, $result ) {
+        $hash = static function ( $value ) { return is_string( $value ) && 1 === preg_match( '/^[a-f0-9]{64}$/D', $value ); };
+        if ( 'replace_policy' === $operation ) {
+            return is_bool( $result['schedule_changed'] ) && $hash( $result['policy_generation'] );
+        }
+        if ( 'list_backups' === $operation ) {
+            return is_array( $result['backups'] ) && 100 >= count( $result['backups'] ) && $hash( $result['snapshot_generation'] ) && ( null === $result['next_after_backup_ref'] || $hash( $result['next_after_backup_ref'] ) ) && is_bool( $result['truncated'] );
+        }
+        if ( 'backup_manifest' === $operation ) {
+            return $hash( $result['backup_ref'] ) && is_array( $result['components'] ) && 1000 >= count( $result['components'] ) && is_bool( $result['complete'] ) && $hash( $result['manifest_generation'] );
+        }
+        if ( 'policy' === $operation ) {
+            return $this->abilities_v2_valid_interval( $result['files_interval'] ) && $this->abilities_v2_valid_interval( $result['database_interval'] ) && is_int( $result['retain_files'] ) && is_int( $result['retain_database'] ) && is_array( $result['components'] ) && is_bool( $result['remote_enabled'] ) && $hash( $result['policy_generation'] );
+        }
+        return 'site' === $operation && in_array( $result['plugin_state'], array( 'ready', 'inactive', 'missing', 'unsupported', 'unavailable' ), true ) && is_bool( $result['premium'] ) && is_int( $result['active_operation_count'] ) && is_string( $result['observed_at'] ) && $hash( $result['generation'] );
+    }
+
+    /**
+     * Compare an exact object key set.
+     *
+     * @param mixed $value Value to inspect.
+     * @param array $keys Expected keys.
+     * @return bool Whether the keys match exactly.
+     */
+    private function abilities_v2_exact_keys( $value, $keys ) {
+        if ( ! is_array( $value ) ) {
+            return false;
+        }
+        $actual = array_keys( $value );
+        sort( $actual );
+        sort( $keys );
+        return $actual === $keys;
+    }
+
+    /**
+     * Return a stable non-reflective protocol error.
+     *
+     * @param string $operation Requested operation.
+     * @param string $code Stable error code.
+     * @return array Closed protocol response.
+     */
+    private function abilities_v2_error( $operation, $code = 'invalid_request' ) {
+        return array(
+            'protocol'  => '2',
+            'operation' => is_string( $operation ) && 1 === preg_match( '/^[a-z_]{1,32}$/D', $operation ) ? $operation : 'unknown',
+            'ok'        => false,
+            'code'      => $code,
+        );
     }
 
     /**
@@ -2227,8 +2510,14 @@ class MainWP_Child_Updraft_Plus_Backups { //phpcs:ignore -- NOSONAR - multi meth
                 $files = array( $files );
             }
             foreach ( $files as $file ) {
-                if ( is_file( $updraft_dir . '/' . $file ) && wp_delete_file( $updraft_dir . '/' . $file ) ) {
-                    $local_deleted ++;
+                // wp_delete_file() only gained a return value in WP 6.7 and we support 6.2+, so the
+                // count has to come from the file being gone, not from the call's return.
+                if ( is_file( $updraft_dir . '/' . $file ) ) {
+                    wp_delete_file( $updraft_dir . '/' . $file );
+                    clearstatcache( true, $updraft_dir . '/' . $file );
+                    if ( ! is_file( $updraft_dir . '/' . $file ) ) {
+                        $local_deleted ++;
+                    }
                 }
             }
             if ( 'log' !== $key && ! empty( $delete_from_service ) ) {

@@ -483,7 +483,7 @@ class MainWP_Child_Stats { //phpcs:ignore -- NOSONAR - multi methods.
 
         if ( isset( $_POST['syncdata'] ) ) {
 
-            $update_list = wp_unslash( $_POST['syncdata'] );
+            $update_list = wp_unslash( $_POST['syncdata'] ); // phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized -- JSON payload; only the json_decode-validated, re-encoded array is persisted below, the raw string never is.
             $update      = false;
 
             if ( $update_list !== $sync_data_settings ) {
@@ -1140,7 +1140,7 @@ class MainWP_Child_Stats { //phpcs:ignore -- NOSONAR - multi methods.
             if ( MainWP_Helper::funct_exists( 'popen' ) ) {
                 $uploadDir   = MainWP_Helper::get_mainwp_dir();
                 $uploadDir   = $uploadDir[0];
-                $popenHandle = popen( 'du -s ' . $directory . ' --exclude "' . str_replace( ABSPATH, '', $uploadDir ) . '"', 'r' ); // phpcs:ignore -- run if enabled.
+                $popenHandle = popen( 'du -s ' . escapeshellarg( $directory ) . ' --exclude ' . escapeshellarg( str_replace( ABSPATH, '', $uploadDir ) ), 'r' ); // phpcs:ignore -- run if enabled.
                 if ( 'resource' === gettype( $popenHandle ) ) {
                     $size = fread( $popenHandle, 1024 ); //phpcs:ignore -- custom read file.
                     pclose( $popenHandle );
@@ -1154,7 +1154,7 @@ class MainWP_Child_Stats { //phpcs:ignore -- NOSONAR - multi methods.
             if ( MainWP_Helper::funct_exists( 'shell_exec' ) ) {
                 $uploadDir = MainWP_Helper::get_mainwp_dir();
                 $uploadDir = $uploadDir[0];
-                $size      = shell_exec( 'du -s ' . $directory . ' --exclude "' . str_replace( ABSPATH, '', $uploadDir ) . '"' ); // phpcs:ignore -- run if enabled.
+                $size      = shell_exec( 'du -s ' . escapeshellarg( $directory ) . ' --exclude ' . escapeshellarg( str_replace( ABSPATH, '', $uploadDir ) ) ); // phpcs:ignore -- run if enabled.
                 if ( null !== $size ) {
                     $size = substr( $size, 0, strpos( $size, "\t" ) );
                     if ( $size && MainWP_Helper::ctype_digit( $size ) ) {
@@ -1185,7 +1185,7 @@ class MainWP_Child_Stats { //phpcs:ignore -- NOSONAR - multi methods.
     /**
      * Get total directory size safely.
      *
-     * @param string $directory
+     * @param string $directory Directory to measure.
      * @return float Size in MB
      */
     public function get_total_file_size_recursive( $directory ) {
@@ -1227,7 +1227,7 @@ class MainWP_Child_Stats { //phpcs:ignore -- NOSONAR - multi methods.
                         $size += $file->getSize();
                     }
                 } catch ( \Throwable $e ) {
-                    // Prevent crashes on permission issues (Windows / shared hosts)
+                    // Prevent crashes on permission issues (Windows / shared hosts).
                     continue;
                 }
             }
@@ -1235,7 +1235,7 @@ class MainWP_Child_Stats { //phpcs:ignore -- NOSONAR - multi methods.
             return 0;
         }
 
-        // Convert bytes → MB
+        // Convert bytes → MB.
         return $size > 0 ? round( $size / 1024 / 1024, 2 ) : 0;
     }
 

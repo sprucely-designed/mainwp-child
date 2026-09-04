@@ -457,8 +457,6 @@ class Changes_Logs_Logger { //phpcs:ignore -- NOSONAR -ok.
 
     /**
      * Method register_changes_logs().
-     *
-     * @return array data.
      */
     public static function register_logs() { //phpcs:ignore -- NOSONAR - long function.
         $defaults = Changes_Logs_Helper::get_changes_logs_types();

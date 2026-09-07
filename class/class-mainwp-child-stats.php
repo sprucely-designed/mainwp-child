@@ -113,6 +113,9 @@ class MainWP_Child_Stats { //phpcs:ignore -- NOSONAR - multi methods.
         $information['wpversion'] = MainWP_Child_Server_Information_Base::get_wordpress_version();
         $information['wpe']       = MainWP_Helper::is_wp_engine() ? 1 : 0;
         $information['wphost']    = MainWP_Helper::get_wp_host();
+
+        $information['support_advanced_sign'] = 1;
+
         MainWP_Helper::write( $information );
     }
 
@@ -444,7 +447,14 @@ class MainWP_Child_Stats { //phpcs:ignore -- NOSONAR - multi methods.
             );
         }
 
+        $saved_premium_updates = get_option( 'mainwp_child_premium_updates_result' );
+        if ( ! empty( $saved_premium_updates ) && is_array( $saved_premium_updates ) ) {
+            $information['premium_updates_results'] = $saved_premium_updates;
+            delete_option( 'mainwp_child_premium_updates_result' );
+        }
+
         if ( $exit_done ) {
+            $information['support_advanced_sign'] = 1;
             MainWP_Helper::write( $information );
         }
         // phpcs:enable WordPress.WP.AlternativeFunctions

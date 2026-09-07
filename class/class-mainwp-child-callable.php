@@ -1331,13 +1331,16 @@ class MainWP_Child_Callable { //phpcs:ignore -- NOSONAR - multi methods.
      * Method process_premium_updates()
      */
     public function process_premium_updates() {
-        $response_error = MainWP_Child_Updates::get_instance()->process_premium_updates();
-        if ( ! is_array( $response_error ) ) {
-            $response_error = array();
+        $response = MainWP_Child_Updates::get_instance()->process_premium_updates();
+        if ( ! is_array( $response ) ) {
+            $response = array();
         }
-        if ( empty( $response_error['success'] ) ) {
-            $response_error['error_code'] = 'PREMIUM_ACTION_ERROR';
+        if ( empty( $response ) ) {
+            $response['error_code'] = 'PREMIUM_ACTION_ERROR';
+            $response['error']      = esc_html__( 'An error occurred while processing the premium updates. Please try again later.', 'mainwp-child' );
+        } elseif ( ! empty( $response['error'] ) && empty( $response['error_code'] ) ) {
+            $response['error_code'] = 'PREMIUM_ACTION_ERROR';
         }
-        MainWP_Helper::write( $response_error );
+        MainWP_Helper::write( $response );
     }
 }

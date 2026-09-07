@@ -94,7 +94,7 @@ class MainWP_Child_Updraft_Plus_Backups { //phpcs:ignore -- NOSONAR - multi meth
 
         if ( isset( $last_backup['backup_time'] ) ) {
             $backup_time = $last_backup['backup_time'];
-            if ( $last_backup['success'] ) {
+            if ( !empty( $last_backup['success'] ) ) {
                 MainWP_Utility::update_lasttime_backup( 'updraftplus', $backup_time );
             }
         }
@@ -1142,7 +1142,16 @@ class MainWP_Child_Updraft_Plus_Backups { //phpcs:ignore -- NOSONAR - multi meth
         }
 
         if ( ! empty( $_REQUEST['onlythesetableentities'] ) && is_array( $_REQUEST['onlythesetableentities'] ) ) {
-            $options['onlythesetableentities'] = $_REQUEST['onlythesetableentities'];
+            $options['onlythesetableentities'] = array_values(
+                array_filter(
+                    array_map(
+                        static function( $table ) {
+                            return sanitize_text_field( wp_unslash( $table ) );
+                        },
+                        $_REQUEST['onlythesetableentities']
+                    )
+                )
+            );
         }
 
         do_action( $event, apply_filters( 'updraft_backupnow_options', $options, array() ) );
@@ -4319,7 +4328,7 @@ ENDHERE;
     public function get_backup_now_data() {
         global $updraftplus;
         if ( empty( $updraftplus ) || ! is_object( $updraftplus ) ) {
-            return '';
+            return array( 'error' => __( 'Error empty updraftplus', 'mainwp-child' ) );
         }
         MainWP_Helper::instance()->check_methods( $updraftplus, array( 'get_backupable_file_entities', 'get_database_tables', 'get_table_prefix', 'get_canonical_service_list' ) );
         MainWP_Helper::instance()->check_classes_exists( array( '\UpdraftPlus_Options', '\UpdraftPlus_Manipulation_Functions', '\UpdraftPlus_Storage_Methods_Interface' ) );
@@ -4335,7 +4344,7 @@ ENDHERE;
         }
 
         if ( empty( $updraftplus_admin ) || ! is_object( $updraftplus_admin ) ) {
-            return '';
+            return array( 'error' => __( 'Error empty updraftplus_admin', 'mainwp-child')  );
         }
 
         MainWP_Helper::instance()->check_methods( $updraftplus_admin, 'include_template' );
@@ -4449,6 +4458,7 @@ ENDHERE;
                         'instance_label' => $updraftplus->backup_methods[ $method ],
                     );
                 }
+                continue;
             } elseif ( empty( $sinfo['object'] ) || empty( $sinfo['instance_settings'] ) || ! is_callable( array( $sinfo['object'], 'options_exist' ) ) ) {
                 continue;
             }

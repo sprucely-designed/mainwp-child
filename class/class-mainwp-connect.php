@@ -36,6 +36,13 @@ class MainWP_Connect { //phpcs:ignore -- NOSONAR - multi methods.
     private $connect_user = null;
 
     /**
+     * Private variable to hold the signature checkedr.
+     *
+     * @var mixed Default null
+     */
+    private static $signature_checked = null;
+
+    /**
      * Private variable to hold the max history value.
      *
      * @var int $maxHistory Max history.
@@ -129,17 +136,24 @@ class MainWP_Connect { //phpcs:ignore -- NOSONAR - multi methods.
         if ( ! empty( $_POST['user'] ) && ! $this->is_verified_register( wp_unslash( $_POST['user'] ) ) ) {
             if ( isset( $_POST['regverify'] ) && empty( $_POST['userpwd'] ) ) { // without passwd, it is not force reconnect.
                 MainWP_Helper::instance()->error( esc_html__( 'Failed to reconnect to the site. Please remove the site and add it again.', 'mainwp-child' ), 'reconnect_failed' );
+            } elseif ( ! $this->is_enabled_user_passwd_auth( wp_unslash( $_POST['user'] ) ) ) {
+                MainWP_Helper::instance()->error( esc_html__( 'Unable to connect to the site. Password Authentication is disabled, so please verify that the Unique Security ID is correct and try again.', 'mainwp-child' ), 'REG_ERROR7' );
             } else {
                 MainWP_Helper::instance()->error( esc_html__( 'Unable to connect to the site. Please verify that your Admin Username and Password are correct and try again.', 'mainwp-child' ), 'REG_ERROR7' );
             }
         }
 
         // Check if the user exists and if yes, check if it's administartor user.
-        if ( empty( $_POST['user'] ) || ! $this->login( wp_unslash( $_POST['user'] ) ) ) {
+        $register_user_name = ! empty( $_POST['user'] ) ? wp_unslash( $_POST['user'] ) : '';
+        $register_user      = get_user_by( 'login', $register_user_name );
+        if ( ! $register_user ) {
             MainWP_Helper::instance()->error( esc_html__( 'Administrator user does not exist. Please verify that the user is an existing administrator.', 'mainwp-child' ), 'REG_ERROR8' );
         }
-        if ( ! MainWP_Helper::is_admin() ) {
+        if ( ! MainWP_Helper::is_admin( $register_user ) ) {
             MainWP_Helper::instance()->error( esc_html__( 'User is not an administrator. Please use an administrator user to establish the connection.', 'mainwp-child' ), 'REG_ERROR9' );
+        }
+        if ( ! $this->login( $register_user->user_login ) ) {
+            MainWP_Helper::instance()->error( esc_html__( 'Administrator user does not exist. Please verify that the user is an existing administrator.', 'mainwp-child' ), 'REG_ERROR8' );
         }
 
         // Update the mainwp_child_pubkey option.
@@ -257,7 +271,26 @@ class MainWP_Connect { //phpcs:ignore -- NOSONAR - multi methods.
     public function is_verified_register( $user_name ) { // phpcs:ignore -- NOSONAR - Current complexity is the only way to achieve desired results, pull request solutions appreciated.
 
         if ( ! $this->is_enabled_user_passwd_auth( $user_name ) ) {
-            return true; // not enable passwd auth, then return true.
+            //phpcs:disable WordPress.Security.NonceVerification
+            $user_pwd   = isset( $_POST['userpwd'] ) ? trim( rawurldecode( $_POST['userpwd'] ) ) : ''; //phpcs:ignore -- NOSONAR - ok.
+            $reg_verify = isset( $_POST['regverify'] ) ? sanitize_text_field( wp_unslash( $_POST['regverify'] ) ) : ''; //phpcs:ignore -- NOSONAR - ok.
+            $unique_id  = MainWP_Helper::get_site_unique_id();
+            $posted_id  = isset( $_POST['uniqueId'] ) && ! is_array( $_POST['uniqueId'] ) ? wp_unslash( $_POST['uniqueId'] ) : ''; //phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized -- Compared only.
+
+            if ( ! empty( $user_pwd ) ) {
+                return $this->is_valid_user_pwd( $user_name, $user_pwd ) ? true : false;
+            }
+
+            if ( ! empty( $reg_verify ) && $this->validate_register( $reg_verify, 'verify', $user_name ) ) {
+                return true;
+            }
+
+            if ( '' !== $unique_id && hash_equals( $unique_id, $posted_id ) ) {
+                return true;
+            }
+            //phpcs:enable WordPress.Security.NonceVerification
+
+            return false;
         }
 
         //phpcs:disable WordPress.Security.NonceVerification
@@ -271,7 +304,8 @@ class MainWP_Connect { //phpcs:ignore -- NOSONAR - multi methods.
             return $is_valid_pwd ? true : false;
         }
 
-        $is_dash_version_older_than_ver53 = empty( $_POST['mainwpver'] ) || version_compare( $_POST['mainwpver'], '5.3', '<' ) ? true : false;
+        $mainwp_ver                       = isset( $_POST['mainwpver'] ) ? sanitize_text_field( wp_unslash( $_POST['mainwpver'] ) ) : '';
+        $is_dash_version_older_than_ver53 = empty( $mainwp_ver ) || version_compare( $mainwp_ver, '5.3', '<' ) ? true : false;
 
         if ( empty( $reg_verify ) && $is_dash_version_older_than_ver53 ) {
             MainWP_Helper::instance()->error( esc_html__( 'Your current MainWP Dashboard version is not compatible with the new connection protocol. To add a site using Password Authentication, please update the MainWP Dashboard to the latest version.', 'mainwp-child' ), 'REG_ERROR10' );
@@ -330,7 +364,8 @@ class MainWP_Connect { //phpcs:ignore -- NOSONAR - multi methods.
      */
     private function may_be_generate_register_verify() { // phpcs:ignore -- NOSONAR - Current complexity is the only way to achieve desired results, pull request solutions appreciated.
         //phpcs:disable WordPress.Security.NonceVerification
-        $is_dash_version_older_than_ver53 = empty( $_POST['mainwpver'] ) || version_compare( $_POST['mainwpver'], '5.3', '<' ) ? true : false;
+        $mainwp_ver                       = isset( $_POST['mainwpver'] ) ? sanitize_text_field( wp_unslash( $_POST['mainwpver'] ) ) : '';
+        $is_dash_version_older_than_ver53 = empty( $mainwp_ver ) || version_compare( $mainwp_ver, '5.3', '<' ) ? true : false;
 
         if ( $is_dash_version_older_than_ver53 ) {
             return false; // not genereate verify registers for dashboard version before 5.2.
@@ -503,25 +538,161 @@ class MainWP_Connect { //phpcs:ignore -- NOSONAR - multi methods.
      * @param  string $signature MainWP Dashboard signature.
      * @param  string $func      Function to run.
      * @param  string $nonce     Security nonce.
+     * @param  string $connect_sign Connect sign json string encoded.
      *
      * @return int|bool $auth  Returns 1 if authenticated, false if authentication fails.
      */
-    public function auth( $signature, $func, $nonce ) {
+    public function auth( $signature, $func, $nonce, $connect_sign = '' ) { // phpcs:ignore -- NOSONAR -complex.
         // phpcs:disable WordPress.Security.NonceVerification
         if ( empty( $signature ) || ! isset( $func ) || ! get_option( 'mainwp_child_pubkey' ) ) {
             $auth = false;
         } else {
-                $algo = false;
+            $algo = false;
             if ( isset( $_REQUEST['sign_algo'] ) ) {
                 $algo = sanitize_text_field( wp_unslash( $_REQUEST['sign_algo'] ) );
             }
-            $auth = static::connect_verify( $func . $nonce, base64_decode( $signature ), base64_decode( get_option( 'mainwp_child_pubkey' ) ), $algo ); // phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions -- trust value.
+
+            $decode_connect_sign = ! empty( $connect_sign ) ? json_decode( $connect_sign, true ) : ''; // If it is not a valid JSON-encoded array, it is a legacy signature.
+
+            if ( $this->is_single_signature( $decode_connect_sign ) ) {
+                $data = $func . $nonce; // Legacy signature data.
+            } elseif ( true !== $this->valid_signature_fields( $decode_connect_sign ) ) {
+                $auth = false;
+                static::handle_signature_error( 'AUTH_WARNING_VERSION', true, true ); // Exit with an error response.
+                MainWP_Helper::instance()->error( esc_html__( 'Invalid request!', 'mainwp-child' ) ); // for sure.
+            } else {
+                $data = $connect_sign;
+            }
+
+            $auth = static::connect_verify( $data, base64_decode( $signature ), base64_decode( get_option( 'mainwp_child_pubkey' ) ), $algo ); // phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions -- trust value.
             if ( 1 !== $auth ) {
                 $auth = false;
+            } elseif ( null === static::$signature_checked ) {
+                if ( ! $this->is_single_signature( $decode_connect_sign ) ) {
+                    $valid_code = $this->verify_authed_request( $decode_connect_sign ); // The signature is verified only once per request.
+                    if ( true !== $valid_code ) {
+                        $auth = false;
+                        static::handle_signature_error( $valid_code );
+                    }
+                }
+                static::$signature_checked = true;
             }
         }
         // phpcs:enable
         return $auth;
+    }
+
+
+    /**
+     * Method is_single_signature()
+     *
+     * @param mixed $sign_data Signature data sign.
+     *
+     * @return bool True if singl legacy signature data.
+     */
+    private function is_single_signature( $sign_data ) {
+        return ! is_array( $sign_data ); // Process non-array data as a single signature.
+    }
+
+    /**
+     * Method valid_signature_fields()
+     *
+     * @param array $sign_data Signature data sign.
+     *
+     * @return bool True if valid signature fields.
+     */
+    private function valid_signature_fields( $sign_data ) {
+        if ( empty( $_REQUEST['request_id'] )  || ! is_array( $sign_data ) || empty( $sign_data['base_function'] ) || empty( $sign_data['user'] ) || empty( $sign_data['nonce'] ) || empty( $sign_data['expires'] ) ) { // phpcs:ignore -- NOSONAR -ok
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * Method verify_authed_request()
+     *
+     * Verify connect.
+     *
+     * @param array $sign_data Signature data sign.
+     *
+     * @return string|bool True if valid request.
+     */
+    private function verify_authed_request( $sign_data ) { // phpcs:ignore --NOSONAR - complex.
+
+        if ( ! $this->valid_signature_fields( $sign_data  ) ) { // phpcs:ignore -- NOSONAR -ok
+            return 'AUTH_WARNING_VERSION';
+        }
+
+        $request_id = !empty( $_REQUEST['request_id']) ? sanitize_text_field( wp_unslash( $_REQUEST['request_id'] )): ''; // phpcs:ignore -- NOSONAR -ok
+        $request_function   = ! empty( $_REQUEST['function'] ) ? sanitize_text_field( wp_unslash( $_REQUEST['function'] ) ) : ''; // phpcs:ignore -- NOSONAR -ok
+        $request_nonce   = ! empty( $_REQUEST['nonce'] ) ? sanitize_text_field( wp_unslash( $_REQUEST['nonce'] ) ) : ''; // phpcs:ignore -- NOSONAR -ok
+        $request_user   = ! empty( $_REQUEST['user'] ) ? sanitize_text_field( wp_unslash( $_REQUEST['user'] ))  : ''; // phpcs:ignore -- NOSONAR -ok
+
+        if ( empty( $request_function ) && ! empty( $sign_data['where'] ) ) {
+            $request_function = ! empty( $_REQUEST[ $sign_data['where'] ] ) ? $_REQUEST[ $sign_data['where'] ] : ''; // phpcs:ignore -- NOSONAR -ok
+        }
+
+        $error_code = '';
+
+        if ( $request_function !== $sign_data['base_function'] || $request_nonce !== (string) $sign_data['nonce'] || $request_user !== $sign_data['user'] ) {
+            $error_code = 'AUTH_INVALID_SIGN';
+        } elseif ( time() > (int) $sign_data['expires'] ) {
+            $error_code = 'AUTH_ERROR1';
+        } else {
+            $option_request_id = 'mainwp_child_request_id_' . hash( 'sha256', $request_id );
+            if ( ! add_option( $option_request_id, time(), '', false ) ) {
+                $error_code = 'AUTH_ERROR2';
+            }
+        }
+
+        return ! empty( $error_code ) ? $error_code : true;
+    }
+
+
+
+    /**
+     * Method handle_signature_error()
+     *
+     * Verify connect.
+     *
+     * @param string $error_code Error code.
+     * @param bool   $exit_error Wether exit error.
+     * @param bool   $check_login_required Wether check login requires request.
+     *
+     * @return string|void Error message when $exit_error is false, otherwise the request is terminated.
+     */
+    public static function handle_signature_error( $error_code, $exit_error = true, $check_login_required = true ) {
+        $err_msg = '';
+        switch ( $error_code ) {
+            case 'AUTH_WARNING_VERSION':
+                $err_msg = __( 'Please update your MainWP Dashboard to the latest version to access the new features.', 'mainwp-child' );
+                break;
+            case 'AUTH_INVALID_SIGN':
+                $err_msg = __( 'Invalid signature data. Please try again.', 'mainwp-child' );
+                break;
+            case 'AUTH_ERROR1':
+                $err_msg = __( 'This request has already expired.', 'mainwp-child' );
+                break;
+            case 'AUTH_ERROR2':
+                $err_msg = __( 'This request has already been used.', 'mainwp-child' );
+                break;
+            default:
+                $err_msg = __( 'Bad signature data. Please try again.', 'mainwp-child' );
+                // Nothing.
+                break;
+
+        }
+
+        if ( $exit_error ) {
+            if ( $check_login_required && isset( $_REQUEST['login_required'] ) && '1' === $_REQUEST['login_required'] ) { // phpcs:ignore -- NOSONAR -ok.
+                status_header( 403 );
+                exit( esc_html( $err_msg ) );
+            } else {
+                MainWP_Helper::instance()->error( esc_html( $err_msg ), $error_code );
+            }
+        } else {
+            return $err_msg;
+        }
     }
 
     /**
@@ -683,7 +854,7 @@ class MainWP_Connect { //phpcs:ignore -- NOSONAR - multi methods.
         }
 
         if ( is_user_logged_in() && ! MainWP_Helper::is_admin() ) {
-            do_action( 'wp_logout' );
+            $this->destroy_user_session();
         }
 
         $signature = rawurldecode( isset( $_REQUEST['mainwpsignature'] ) ? wp_unslash( $_REQUEST['mainwpsignature'] ) : '' ); //phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized
@@ -694,8 +865,10 @@ class MainWP_Connect { //phpcs:ignore -- NOSONAR - multi methods.
         $function = ! empty( $_POST['function'] ) ? sanitize_text_field( wp_unslash( $_POST['function'] ) ) : rawurldecode( $where ); //phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized
         $nonce    = isset( $_REQUEST['nonce'] ) ? sanitize_text_field( wp_unslash( $_REQUEST['nonce'] ) ) : '';
 
+        $connect_sign = isset( $_REQUEST['data_signature'] ) ? wp_unslash( $_REQUEST['data_signature'] ) : null; //phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized
+
         try {
-            $auth = $this->auth( $signature, $function, $nonce );
+            $auth = $this->auth( $signature, $function, $nonce, $connect_sign );
         } catch ( MainWP_Exception $ex ) {
             $auth = false;
         }
@@ -713,7 +886,7 @@ class MainWP_Connect { //phpcs:ignore -- NOSONAR - multi methods.
             // it is connected admin login.
             if ( ! MainWP_Helper::is_admin() && ! $alter_login_required ) {
                 // log out if connected admin is not admin level 10.
-                do_action( 'wp_logout' );
+                $this->destroy_user_session();
 
                 return false;
             }
@@ -948,9 +1121,10 @@ class MainWP_Connect { //phpcs:ignore -- NOSONAR - multi methods.
         $mainwpsignature = isset( $_POST['mainwpsignature'] ) ? rawurldecode( wp_unslash( $_POST['mainwpsignature'] ) ) : ''; //phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized
         $function        = ! empty( $_POST['function'] ) ? sanitize_text_field( wp_unslash( $_POST['function'] ) ) : rawurldecode( $where );
         $nonce           = MainWP_System::instance()->validate_params( 'nonce' );
+        $connect_sign    = isset( $_POST['data_signature'] ) ? wp_unslash( $_POST['data_signature'] ) : null; //phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized
 
         try {
-            $auth = $this->auth( $mainwpsignature, $function, $nonce );
+            $auth = $this->auth( $mainwpsignature, $function, $nonce, $connect_sign );
         } catch ( MainWP_Exception $ex ) {
             $error = $ex->getMessage();
             if ( ! empty( $error ) && is_string( $error ) ) {
@@ -1068,7 +1242,7 @@ class MainWP_Connect { //phpcs:ignore -- NOSONAR - multi methods.
                 $this->check_compatible_connect_info();
                 return true;
             }
-            do_action( 'wp_logout' );
+            $this->destroy_user_session();
         }
 
         $user = get_user_by( 'login', $username );
@@ -1123,12 +1297,15 @@ class MainWP_Connect { //phpcs:ignore -- NOSONAR - multi methods.
                 }
 
                 $auths[ $i ] = $auths[ $i + 1 ];
+
             }
+
             $newI = $this->maxHistory + 1;
             while ( isset( $auths[ $newI ] ) ) {
                 unset( $auths[ $newI++ ] );
             }
-            $auths[ $this->maxHistory ] = md5( MainWP_Helper::rand_string( 14 ) ); // NOSONAR - safe.
+
+            $auths[ $this->maxHistory ] = MainWP_Helper::rand_hmac_key();
             $auths['last']              = time();
             MainWP_Helper::update_option( 'mainwp_child_auth', $auths, 'yes' );
         }
@@ -1143,13 +1320,14 @@ class MainWP_Connect { //phpcs:ignore -- NOSONAR - multi methods.
      *
      * @return bool true|false If valid authentication, return true, if not, return false.
      */
-    public function is_valid_auth( $key ) {
+    public function is_valid_auth( $signature ) {
         $auths = get_option( 'mainwp_child_auth' );
-        if ( ! is_array( $auths ) ) {
+        if ( ! is_array( $auths ) || ! is_string( $signature ) ) {
             return false;
         }
-        for ( $i = 0; $i <= $this->maxHistory; $i++ ) {
-            if ( isset( $auths[ $i ] ) && ( $auths[ $i ] === $key ) ) {
+
+        foreach ( $auths as $auth ) {
+            if ( is_string( $auth ) && hash_equals( $auth, $signature ) ) {
                 return true;
             }
         }
@@ -1181,5 +1359,17 @@ class MainWP_Connect { //phpcs:ignore -- NOSONAR - multi methods.
                 MainWP_Helper::update_option( 'mainwp_child_connected_admin', $con_username, 'yes' );
             }
         }
+    }
+
+    /**
+     * Method destroy_user_session()
+     *
+     * End the current session and clear its auth cookies.
+     *
+     * @return void
+     */
+    private function destroy_user_session() {
+        wp_destroy_current_session();
+        wp_clear_auth_cookie();
     }
 }

@@ -699,7 +699,10 @@ class MainWP_Client_Report_Base { //phpcs:ignore -- NOSONAR - multi methods.
         $loop_count = 0;
 
         $max_items_get    = ( isset( $_POST['max_items_get'] ) && ! empty( $_POST['max_items_get'] ) ) ? intval( $_POST['max_items_get'] ) : 0;
-        $limit_connectors = ( isset( $_POST['limit_reports'] ) && ! empty( $_POST['limit_reports'] ) ) ? intval( $_POST['limit_reports'] ) : array();
+        $limit_connectors = isset( $_POST['limit_reports'] ) && is_array( $_POST['limit_reports'] )
+        ? array_map( 'sanitize_text_field', wp_unslash( $_POST['limit_reports'] ) )
+        : array();
+
         // phpcs:enable
         if ( ! is_array( $limit_connectors ) || empty( $limit_connectors ) ) {
             $limit_connectors = array( 'mainwp_sucuri', 'mainwp_maintenance', 'mainwp_backups' );
@@ -1143,16 +1146,16 @@ class MainWP_Client_Report_Base { //phpcs:ignore -- NOSONAR - multi methods.
     private function get_mainwp_maintenance_token_value( $record, $data ) {
 
         $maintenance_details = array(
-            'revisions'     => esc_html__( 'Delete all post revisions', 'mainwp-child' ),
-            'revisions_max' => esc_html__( 'Delete all post revisions, except for the last:', 'mainwp-child' ),
-            'autodraft'     => esc_html__( 'Delete all auto draft posts', 'mainwp-child' ),
-            'trashpost'     => esc_html__( 'Delete trash posts', 'mainwp-child' ),
-            'spam'          => esc_html__( 'Delete spam comments', 'mainwp-child' ),
-            'pending'       => esc_html__( 'Delete pending comments', 'mainwp-child' ),
-            'trashcomment'  => esc_html__( 'Delete trash comments', 'mainwp-child' ),
-            'tags'          => esc_html__( 'Delete tags with 0 posts associated', 'mainwp-child' ),
-            'categories'    => esc_html__( 'Delete categories with 0 posts associated', 'mainwp-child' ),
-            'optimize'      => esc_html__( 'Optimize database tables', 'mainwp-child' ),
+            'revisions'          => esc_html__( 'Delete all post revisions', 'mainwp-child' ),
+            'revisions_max'      => esc_html__( 'Delete all post revisions, except for the last:', 'mainwp-child' ),
+            'autodraft'          => esc_html__( 'Delete all auto draft posts', 'mainwp-child' ),
+            'trashpost'          => esc_html__( 'Delete trash posts', 'mainwp-child' ),
+            'spam'               => esc_html__( 'Delete spam comments', 'mainwp-child' ),
+            'pending'            => esc_html__( 'Delete pending comments', 'mainwp-child' ),
+            'trashcomment'       => esc_html__( 'Delete trash comments', 'mainwp-child' ),
+            'tags'               => esc_html__( 'Delete tags with 0 posts associated', 'mainwp-child' ),
+            'categories'         => esc_html__( 'Delete categories with 0 posts associated', 'mainwp-child' ),
+            'optimize'           => esc_html__( 'Optimize database tables', 'mainwp-child' ),
             'transients_expired' => esc_html__( 'Delete expired transients', 'mainwp-child' ),
             'transients_all'     => esc_html__( 'Delete all transients', 'mainwp-child' ),
         );

@@ -59,10 +59,10 @@ class Changes_Handle_ACF_Helper {
      * @return mixed
      */
     public static function callback_change_before_relationship_update_check( $check, $value, $post_id, $field ) { //phpcs:ignore --NOSONAR -requires param.
-        if ( 'relationship' === $field['type'] ) {
+        if ( 'relationship' === $field['type'] && get_post( $post_id ) ) {
             self::$old_meta[ $field['name'] ] = array(
                 'field'   => $field,
-                'value'   => \get_field( $field['name'] ),
+                'value'   => \get_field( $field['name'], $post_id ),
                 'post_id' => $post_id,
             );
         }
@@ -76,7 +76,7 @@ class Changes_Handle_ACF_Helper {
      * @param int    $meta_id ID of metadata.
      * @param int    $object_id ID of the object.
      * @param string $meta_key Metadata key.
-     * @param mixed  $_meta_value Metadata value
+     * @param mixed  $_meta_value Metadata value.
      */
     public static function callback_change_field_updated( $meta_id, $object_id, $meta_key, $_meta_value ) {
         if ( in_array( $meta_key, array_keys( self::$old_meta ) ) ) { // phpcs:ignore -- ok.

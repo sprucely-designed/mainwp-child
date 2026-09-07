@@ -436,6 +436,14 @@ class MainWP_Child_Stats { //phpcs:ignore -- NOSONAR - multi methods.
             $information['password_policy_options'] = MainWP_Child_Password_Policy::instance()->get_policy_options();
         }
 
+        if ( class_exists( '\MainWP\Child\SystemMonitor\MainWP_Child_System_Monitor_Storage' ) && class_exists( '\MainWP\Child\SystemMonitor\MainWP_Child_System_Monitor_Runner' ) ) {
+            $information['child_monitor_data'] = array(
+                'issues'                => \MainWP\Child\SystemMonitor\MainWP_Child_System_Monitor_Storage::get_issues( 'cron' ),
+                'last_monitor_run'      => \MainWP\Child\SystemMonitor\MainWP_Child_System_Monitor_Runner::get_last_run(),
+                'last_monitor_cron_run' => \MainWP\Child\SystemMonitor\MainWP_Child_System_Monitor_Runner::get_last_cron_run(),
+            );
+        }
+
         if ( $exit_done ) {
             MainWP_Helper::write( $information );
         }
@@ -475,7 +483,7 @@ class MainWP_Child_Stats { //phpcs:ignore -- NOSONAR - multi methods.
 
         if ( isset( $_POST['syncdata'] ) ) {
 
-            $update_list = wp_unslash( $_POST['syncdata'] );
+            $update_list = wp_unslash( $_POST['syncdata'] ); // phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized -- JSON payload; only the json_decode-validated, re-encoded array is persisted below, the raw string never is.
             $update      = false;
 
             if ( $update_list !== $sync_data_settings ) {
@@ -630,6 +638,27 @@ class MainWP_Child_Stats { //phpcs:ignore -- NOSONAR - multi methods.
                 if ( isset( $results[ $slug ] ) ) {
                     continue;
                 }
+
+                // The cached info can be up to a day old; do not re-add an update that
+                // has been applied since it was cached (MWP-1660 / C1).
+                if ( is_array( $theme_update ) ) {
+                    $update_data = isset( $theme_update['update'] ) ? $theme_update['update'] : null;
+                } else {
+                    $update_data = isset( $theme_update->update ) ? $theme_update->update : null;
+                }
+                $new_version = '';
+                if ( is_array( $update_data ) && ! empty( $update_data['new_version'] ) ) {
+                    $new_version = $update_data['new_version'];
+                } elseif ( is_object( $update_data ) && ! empty( $update_data->new_version ) ) {
+                    $new_version = $update_data->new_version;
+                }
+                if ( '' !== $new_version ) {
+                    $installed_theme = wp_get_theme( $slug );
+                    if ( $installed_theme->exists() && version_compare( $installed_theme->get( 'Version' ), $new_version, '>=' ) ) {
+                        continue;
+                    }
+                }
+
                 $results[ $slug ] = $theme_update;
             }
         }
@@ -866,18 +895,24 @@ class MainWP_Child_Stats { //phpcs:ignore -- NOSONAR - multi methods.
         // Fixes premium plugins update.
         $cached_plugins_update = get_site_transient( 'mainwp_update_plugins_cached' );
         if ( is_array( $cached_plugins_update ) && ( count( $cached_plugins_update ) > 0 ) ) {
+            $installed_plugins = function_exists( 'get_plugins' ) ? get_plugins() : array();
             foreach ( $cached_plugins_update as $slug => $plugin_update ) {
 
                 // Fixes incorrect info.
-                if ( ! property_exists( $plugin_update, 'new_version' ) || empty( $plugin_update->new_version ) ) { // may do not need to check this?
+                $new_version = '';
+                if ( property_exists( $plugin_update, 'new_version' ) && ! empty( $plugin_update->new_version ) ) {
+                    $new_version = $plugin_update->new_version;
+                } elseif ( property_exists( $plugin_update, 'update' ) && is_object( $plugin_update->update ) && property_exists( $plugin_update->update, 'new_version' ) && ! empty( $plugin_update->update->new_version ) ) {
                     // Fixes some premiums update info.
-                    if ( property_exists( $plugin_update, 'update' ) ) {
-                        if ( ! property_exists( $plugin_update->update, 'new_version' ) || empty( $plugin_update->update->new_version ) ) {
-                            continue;
-                        }
-                    } else {
-                        continue;
-                    }
+                    $new_version = $plugin_update->update->new_version;
+                } else {
+                    continue;
+                }
+
+                // The cached info can be up to a day old; do not re-add an update that
+                // has been applied since it was cached (MWP-1660 / C1).
+                if ( isset( $installed_plugins[ $slug ]['Version'] ) && version_compare( $installed_plugins[ $slug ]['Version'], $new_version, '>=' ) ) {
+                    continue;
                 }
 
                 if ( ! isset( $results[ $slug ] ) ) {
@@ -1105,7 +1140,7 @@ class MainWP_Child_Stats { //phpcs:ignore -- NOSONAR - multi methods.
             if ( MainWP_Helper::funct_exists( 'popen' ) ) {
                 $uploadDir   = MainWP_Helper::get_mainwp_dir();
                 $uploadDir   = $uploadDir[0];
-                $popenHandle = popen( 'du -s ' . $directory . ' --exclude "' . str_replace( ABSPATH, '', $uploadDir ) . '"', 'r' ); // phpcs:ignore -- run if enabled.
+                $popenHandle = popen( 'du -s ' . escapeshellarg( $directory ) . ' --exclude ' . escapeshellarg( str_replace( ABSPATH, '', $uploadDir ) ), 'r' ); // phpcs:ignore -- run if enabled.
                 if ( 'resource' === gettype( $popenHandle ) ) {
                     $size = fread( $popenHandle, 1024 ); //phpcs:ignore -- custom read file.
                     pclose( $popenHandle );
@@ -1119,7 +1154,7 @@ class MainWP_Child_Stats { //phpcs:ignore -- NOSONAR - multi methods.
             if ( MainWP_Helper::funct_exists( 'shell_exec' ) ) {
                 $uploadDir = MainWP_Helper::get_mainwp_dir();
                 $uploadDir = $uploadDir[0];
-                $size      = shell_exec( 'du -s ' . $directory . ' --exclude "' . str_replace( ABSPATH, '', $uploadDir ) . '"' ); // phpcs:ignore -- run if enabled.
+                $size      = shell_exec( 'du -s ' . escapeshellarg( $directory ) . ' --exclude ' . escapeshellarg( str_replace( ABSPATH, '', $uploadDir ) ) ); // phpcs:ignore -- run if enabled.
                 if ( null !== $size ) {
                     $size = substr( $size, 0, strpos( $size, "\t" ) );
                     if ( $size && MainWP_Helper::ctype_digit( $size ) ) {
@@ -1150,7 +1185,7 @@ class MainWP_Child_Stats { //phpcs:ignore -- NOSONAR - multi methods.
     /**
      * Get total directory size safely.
      *
-     * @param string $directory
+     * @param string $directory Directory to measure.
      * @return float Size in MB
      */
     public function get_total_file_size_recursive( $directory ) {
@@ -1192,7 +1227,7 @@ class MainWP_Child_Stats { //phpcs:ignore -- NOSONAR - multi methods.
                         $size += $file->getSize();
                     }
                 } catch ( \Throwable $e ) {
-                    // Prevent crashes on permission issues (Windows / shared hosts)
+                    // Prevent crashes on permission issues (Windows / shared hosts).
                     continue;
                 }
             }
@@ -1200,7 +1235,7 @@ class MainWP_Child_Stats { //phpcs:ignore -- NOSONAR - multi methods.
             return 0;
         }
 
-        // Convert bytes → MB
+        // Convert bytes → MB.
         return $size > 0 ? round( $size / 1024 / 1024, 2 ) : 0;
     }
 

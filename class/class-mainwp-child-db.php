@@ -156,7 +156,7 @@ class MainWP_Child_DB {
     public static function is_autoload_option( $option_name ) {
         global $wpdb;
 
-        // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery -- Need to query the database directly to check the autoload value of the option.
+        // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- Need to query the database directly to check the autoload value of the option.
         $autoload_value = $wpdb->get_var( // NOASONAR - WP compatible.
             $wpdb->prepare(
                 "SELECT autoload FROM {$wpdb->options} WHERE option_name = %s",
@@ -253,5 +253,33 @@ class MainWP_Child_DB {
         }
 
         return $size;
+    }
+
+
+    /**
+     * Method cleanup_request_ids()
+     *
+     * Daily checks to clear the dashboard request ids.
+     */
+    public static function cleanup_request_ids() {
+
+        global $wpdb;
+
+        $threshold = 10 * MINUTE_IN_SECONDS;
+
+        $options = $wpdb->get_results( //phpcs:ignore -- NOSONAR -ok.
+            $wpdb->prepare(
+                "SELECT option_name, option_value
+                FROM {$wpdb->options}
+                WHERE option_name LIKE %s",
+                $wpdb->esc_like( 'mainwp_child_request_id_' ) . '%'
+            )
+        );
+
+        foreach ( $options as $option ) {
+            if ( (int) $option->option_value < $threshold ) {
+                delete_option( $option->option_name );
+            }
+        }
     }
 }

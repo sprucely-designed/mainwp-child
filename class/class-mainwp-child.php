@@ -35,14 +35,14 @@ class MainWP_Child {
      *
      * @var string MainWP Child plugin version.
      */
-    public static $version = '6.1-er.2'; // NOSONAR - not IP.
+    public static $version = '6.1.8'; // NOSONAR - not IP.
 
     /**
      * Private variable containing the latest MainWP Child update version.
      *
      * @var string MainWP Child update version.
      */
-    private $update_version = '1.6.3';
+    private $update_version = '1.6.4';
 
     /**
      * Public variable containing the MainWP Child plugin slug.
@@ -401,7 +401,51 @@ class MainWP_Child {
             MainWP_Child_DB::fix_autoload( 'mainwp_child_actions_saved_data' );
         }
 
+        if ( empty( $update_version ) || version_compare( $update_version, '1.6.4', '<' ) ) {
+            $this->maybe_generate_unique_id_for_passwordless_auth();
+        }
+
         MainWP_Helper::update_option( 'mainwp_child_update_version', $this->update_version, 'yes' );
+    }
+
+    /**
+     * Generate a Unique Security ID for legacy passwordless setups.
+     *
+     * @return void
+     */
+    private function maybe_generate_unique_id_for_passwordless_auth() {
+        if ( '' !== MainWP_Helper::get_site_unique_id() ) {
+            return;
+        }
+
+        global $wpdb;
+
+        $disabled_auth_users = get_users(
+            array(
+                'fields'      => 'ID',
+                'number'      => 1,
+                'count_total' => false,
+                'meta_query'  => array( // phpcs:ignore WordPress.DB.SlowDBQuery.slow_db_query_meta_query -- One-time update migration.
+                    'relation' => 'OR',
+                    array(
+                        'key'     => $wpdb->prefix . 'mainwp_child_user_enable_passwd_auth_connect',
+                        'value'   => '0',
+                        'compare' => '=',
+                    ),
+                    array(
+                        'key'     => 'mainwp_child_user_enable_passwd_auth_connect',
+                        'value'   => '0',
+                        'compare' => '=',
+                    ),
+                ),
+            )
+        );
+
+        if ( empty( $disabled_auth_users ) ) {
+            return;
+        }
+
+        MainWP_Helper::update_option( 'mainwp_child_uniqueId', MainWP_Helper::rand_string( 12 ) );
     }
 
     /**
@@ -489,11 +533,12 @@ class MainWP_Child {
         $mainwpsignature = isset( $_POST['mainwpsignature'] ) ? rawurldecode( wp_unslash( $_POST['mainwpsignature'] ) ) : ''; //phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized
         $function        = isset( $_POST['function'] ) ? sanitize_text_field( wp_unslash( $_POST['function'] ) ) : null;
         $nonce           = MainWP_System::instance()->validate_params( 'nonce' );
+        $connect_sign    = isset( $_POST['data_signature'] ) ? wp_unslash( $_POST['data_signature'] ) : null; //phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized
 
         // phpcs:enable
 
         // Authenticate here.
-        $auth = MainWP_Connect::instance()->auth( $mainwpsignature, $function, $nonce );
+        $auth = MainWP_Connect::instance()->auth( $mainwpsignature, $function, $nonce, $connect_sign );
 
         // Parse auth, if it is not correct actions then exit with message or return.
         if ( ! MainWP_Connect::instance()->parse_init_auth( $auth ) ) {
@@ -559,6 +604,12 @@ class MainWP_Child {
                     deactivate_plugins( $this->plugin_slug, true );
                 }
             }
+        }
+
+        $last_cleanup = (int) get_option( 'mainwp_child_request_ids_last_cleanup', 0 );
+        if ( time() - $last_cleanup > HOUR_IN_SECONDS ) {
+            MainWP_Child_DB::cleanup_request_ids();
+            update_option( 'mainwp_child_request_ids_last_cleanup', time(), false );
         }
     }
 

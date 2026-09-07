@@ -5,9 +5,9 @@ Author: mainwp
 Author URI: https://mainwp.com
 Plugin URI: https://mainwp.com
 Requires at least: 6.2
-Tested up to: 6.9.4
+Tested up to: 7.1
 Requires PHP: 7.4
-Stable tag: 6.1-er.2
+Stable tag: 6.1.8
 License: GPLv3 or later
 License URI: https://www.gnu.org/licenses/gpl-3.0.html
 
@@ -95,6 +95,10 @@ Please follow the steps outlined in the [MainWP Feature Requests](https://voice.
 = Where can I find more information about MainWP? =
 We have an extensive FAQ with more questions and answers [here](https://mainwp.com/preinstall-faq/).
 
+= Where do I report security bugs found in this plugin? =
+
+Please report security bugs found in the source code of the MainWP Child plugin through the [Patchstack Vulnerability Disclosure Program](https://patchstack.com/database/vdp/9e5fb39d-412a-44d4-8639-39c3db443381). The Patchstack team will assist you with verification, CVE assignment, and notify the developers of this plugin.
+
 == Screenshots ==
 
 1. Sites - Operations
@@ -111,11 +115,53 @@ We have an extensive FAQ with more questions and answers [here](https://mainwp.c
 
 == Changelog ==
 
-= 6.1 =
+= 6.1.8 - 8-25-2026 =
+
+* Fixed: "Download" and "Hide" buttons in the System Report are now clickable.
+* Fixed: Theme updates performed through WP Admin are now correctly logged in Network Activity.
+* Fixed: Improved BackWPup backup job handling across modern and legacy versions, including validation, progress reporting, and backup start and stop actions.
+* Updated: Improved Clone session authentication and validation for stronger session security.
+
+= 6.1.7 - 8-18-2026 =
+
+* Updated: Improved backup report tracking for BackupBuddy, BackWPup, Time Capsule, and UpdraftPlus.
+* Updated: WooCommerce Status add-on now includes sales from the previous seven days.
+
+= 6.1.6 - 8-5-2026 =
+
+* Fixed: Ensured consistent timezone handling for backup timestamps in the BackWPup integration.
+* Updated: Improved error handling and response processing in the BackWPup integration for more reliable backup operations.
+
+= 6.1.5 - 7-28-2026 =
+
+* Fixed: Corrected Network Activity relationship tracking so previous field values are recorded only when the related post exists.
+* Updated: Expanded support for Wordfence settings, including audit logging, scan controls, IPv4 scanning, remote IP detection, and trusted proxy configuration.
+
+= 6.1.4 - 7-21-2026 =
+
+* Added: Added support for the FastPixel Cache plugin in the "Cache Control" feature.
+* Updated: Improved the handling of report limit selections so saved values are processed more consistently.
+
+= 6.1.3 - 7-7-2026 =
+
+* Fixed: Improved log filtering so the BackWPup backup job logs now include relevant default jobs more reliably.
+* Fixed: Problems with detecting the WP Staging plugin status caused by recent plugin update.
+
+= 6.1.2 - 6-16-2026 =
+
+* Updated: Hardened MainWP Child connection verification and settings behavior for passwordless setups. If Password Authentication is disabled, adding or reconnecting a site now requires the Unique Security ID, including when using the MainWP REST API or other automations. Thanks to Khaled Alenazi (Nxploited).
+
+= 6.1.1 - 6-2-2026 =
+
+* Updated: Improved session cleanup when authentication failures occur to ensure proper logout behavior. [(Pull Request by Sixela)](https://github.com/sixela)
+* Updated: Improved premium theme and plugin update detection to prevent system hangs caused by slow or unreachable servers. [(Pull Request by Contributolo)](https://github.com/Contributolo)
+
+= 6.1 - 5-26-2026 =
 
 * Fixed: Typos and inconsistencies in user login event log descriptions and action identifiers for improved clarity and consistency across Network Activity logs.
 * Updated: Spammed comments are now properly excluded from being counted in reports and token metrics.
 * Updated: Updated the PHPSecLib library to the latest version.
+* Updated: Enhanced plugin and theme health check monitoring with improved background task scheduling and automatic recovery from missed scheduled events.
 
 = 6.0.11 - 5-5-2026 =
 * Fixed: Global `customize_register` hook exposes legacy Customizer UI issues.

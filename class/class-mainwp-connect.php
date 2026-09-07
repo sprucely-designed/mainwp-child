@@ -617,7 +617,7 @@ class MainWP_Connect { //phpcs:ignore -- NOSONAR - multi methods.
             return false;
         }
 
-        $valid_fields = array( 'request_id', 'base_function', 'user', 'nonce', 'expires' );
+        $valid_fields = array( 'req_id', 'base_function', 'user', 'nonce', 'expires' );
 
         if ( 'process_premium_updates' === $func ) {
             $valid_fields = array_merge( $valid_fields, array( 'premium_perform', 'premium_type' ) );
@@ -652,7 +652,7 @@ class MainWP_Connect { //phpcs:ignore -- NOSONAR - multi methods.
         }
 
         // phpcs:disable WordPress.Security.NonceVerification
-        $request_id       = ! empty( $sign_data['request_id'] ) ? sanitize_text_field( wp_unslash( $sign_data['request_id'] ) ) : '';
+        $request_id       = ! empty( $sign_data['req_id'] ) ? sanitize_text_field( wp_unslash( $sign_data['req_id'] ) ) : '';
         $request_function = ! empty( $_REQUEST['function'] ) ? sanitize_text_field( wp_unslash( $_REQUEST['function'] ) ) : '';
         $request_nonce    = isset( $_REQUEST['nonce'] ) ? sanitize_text_field( wp_unslash( $_REQUEST['nonce'] ) ) : '';
         $request_user     = ! empty( $_REQUEST['user'] ) ? sanitize_text_field( wp_unslash( $_REQUEST['user'] ) ) : '';

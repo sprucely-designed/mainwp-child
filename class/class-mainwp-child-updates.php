@@ -1129,7 +1129,7 @@ class MainWP_Child_Updates { //phpcs:ignore -- NOSONAR - multi methods.
             return;
         }
 
-        $premium_action = ! empty( $_GET['_mainwp_premium_update_request'] ) ? sanitize_text_field( wp_unslash( $_GET['_mainwp_premium_update_request'] ) ) : '';
+        $premium_action = ! empty( $_GET['_mainwp_premium_update_req'] ) ? sanitize_text_field( wp_unslash( $_GET['_mainwp_premium_update_req'] ) ) : '';
 
         $legacy_action = '';
         $legacy_type   = '';
@@ -1252,7 +1252,7 @@ class MainWP_Child_Updates { //phpcs:ignore -- NOSONAR - multi methods.
             }
 
             if ( ! empty( $request_action ) ) {
-                $get_args['_mainwp_premium_update_request']    = $request_action;
+                $get_args['_mainwp_premium_update_req']        = $request_action;
                 $get_args['_mainwp_premium_update_nonce_key']  = intval( time() );
                 $get_args['_mainwp_premium_update_nonce_hmac'] = hash_hmac( 'sha256', $get_args['_mainwp_premium_update_nonce_key'], wp_salt( 'nonce' ) );
 

@@ -1229,15 +1229,15 @@ class MainWP_Child_Updraft_Plus_Backups { //phpcs:ignore -- NOSONAR - multi meth
             if ( isset( $settings['updraft_interval'] ) ) {
                 // fix for premium version.
                 $_POST['updraft_interval']        = $settings['updraft_interval'];
-                $_POST['updraft_startday_files']  = $settings['updraft_startday_files'];
-                $_POST['updraft_starttime_files'] = $settings['updraft_starttime_files'];
+                $_POST['updraft_startday_files']  = isset( $settings['updraft_startday_files'] ) ? $settings['updraft_startday_files'] : '';
+                $_POST['updraft_starttime_files'] = isset( $settings['updraft_starttime_files'] ) ? $settings['updraft_starttime_files'] : '';
                 $updraftplus->schedule_backup( $settings['updraft_interval'] );
             }
             if ( isset( $settings['updraft_interval_database'] ) ) {
                 // fix for premium version.
                 $_POST['updraft_interval_database'] = $settings['updraft_interval_database'];
-                $_POST['updraft_startday_db']       = $settings['updraft_startday_db'];
-                $_POST['updraft_starttime_db']      = $settings['updraft_starttime_db'];
+                $_POST['updraft_startday_db']       = isset( $settings['updraft_startday_db'] )  ? $settings['updraft_startday_db'] : '';
+                $_POST['updraft_starttime_db']      = isset( $settings['updraft_starttime_db'] ) ? $settings['updraft_starttime_db'] : '';
                 $updraftplus->schedule_backup_database( $settings['updraft_interval_database'] );
             }
         }
@@ -2099,16 +2099,7 @@ class MainWP_Child_Updraft_Plus_Backups { //phpcs:ignore -- NOSONAR - multi meth
         }
 
         if ( ! empty( $_REQUEST['onlythesetableentities'] ) && is_array( $_REQUEST['onlythesetableentities'] ) ) {
-            $options['onlythesetableentities'] = array_values(
-                array_filter(
-                    array_map(
-                        static function( $table ) {
-                            return sanitize_text_field( wp_unslash( $table ) );
-                        },
-                        $_REQUEST['onlythesetableentities']
-                    )
-                )
-            );
+            $options['onlythesetableentities'] = $_REQUEST['onlythesetableentities'];
         }
 
         do_action( $event, apply_filters( 'updraft_backupnow_options', $options, array() ) );

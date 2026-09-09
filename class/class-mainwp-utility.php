@@ -674,23 +674,171 @@ class MainWP_Utility { //phpcs:ignore -- NOSONAR - multi methods.
      * Close connection.
      *
      * @param array $val Array containing connection information.
+     * @param bool  $http2 http connection close.
      */
-    public static function close_connection( $val = null ) {
-        $output = wp_json_encode( $val );
-        $output = '<mainwp>' . base64_encode( $output ) . '</mainwp>'; // phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions -- base64_encode function is used for backwards compatibility.
-        // Close browser connection so that it can resume AJAX polling.
-        header( 'Content-Length: ' . strlen( $output ) );
-        header( 'Connection: close' );
-        header( 'Content-Encoding: none' );
+    public static function close_connection( $val = null, $http2 = false ) {
+
+        $output = '<mainwp>' . base64_encode( wp_json_encode( $val ) ) . '</mainwp>'; // phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions
+
+        // Clean any pre-existing buffers so we have total control over Content-Length.
+        while ( ob_get_level() > 0 ) {
+            ob_end_clean();
+        }
+
+        // Start a fresh buffer for our output.
+        ob_start();
+        echo $output; // phpcs:ignore WordPress.Security.EscapeOutput
+
+        // Set headers if not already sent.
+        if ( ! $http2 && ! headers_sent() ) {
+            header( 'Content-Length: ' . ob_get_length() );
+            header( 'Connection: close' );
+            header( 'Content-Encoding: none' );
+        }
+
         if ( session_id() ) {
             session_write_close();
         }
-        echo $output; // phpcs:ignore WordPress.Security.EscapeOutput
-        if ( ob_get_level() ) {
+
+        // Flush our specific output buffer to the client.
+        if ( ob_get_length() ) {
             ob_end_flush();
         }
-        flush();
-        sleep( 10 );
+
+        if ( function_exists( 'fastcgi_finish_request' ) ) {
+            fastcgi_finish_request();
+        } else {
+            flush();
+        }
+
+        ignore_user_abort( true );
+    }
+
+    /**
+     * Simulates an authenticated admin visit to execute an internal GET request.
+     *
+     * Generates temporary admin session cookies to perform an authenticated internal
+     * GET request via `wp_remote_get()`.
+     *
+     * @since 6.2
+     *
+     * @param array  $target_path Target path.
+     * @param array  $get_args Payload args.
+     * @param string $perform Perform action.
+     *
+     * @return mixed|array {
+     *     Result array indicating request success or failure state.
+     *
+     *     @type int    $success 1 on success.
+     *     @type string $error   Error message describing what failed.
+     *     @type string $content Raw HTML or JSON body returned by the target URL.
+     * }
+     */
+    public function simulate_admin_visit( $target_path, $get_args, $perform ) { // phpcs:ignore -- NOSONAR - complex.
+
+        // Authorization check.
+        if ( ! current_user_can( 'manage_options' ) ) {
+            return array( 'error' => __( 'Unauthorized access', 'mainwp-child' ) );
+        }
+
+        if ( empty( $target_path ) || ! is_string( $target_path ) || strlen( $target_path ) < 2 ) {
+            return array( 'error' => __( 'Missing or invalid url', 'mainwp-child' ) );
+        }
+
+        // Sanitize relative path safely.
+        $path = ltrim( sanitize_text_field( $target_path ), '/' );
+
+        // Generate Auth Cookies for Current Admin.
+        $current_user = wp_get_current_user();
+        $expiration   = time() + 3600; // 1 hour.
+        $manager      = \WP_Session_Tokens::get_instance( $current_user->ID );
+        $token        = $manager->create( $expiration );
+
+        $secure           = is_ssl();
+        $auth_cookie_name = $secure ? SECURE_AUTH_COOKIE : AUTH_COOKIE;
+        $scheme           = $secure ? 'secure_auth' : 'auth';
+
+        $auth_cookie      = wp_generate_auth_cookie( $current_user->ID, $expiration, $scheme, $token );
+        $logged_in_cookie = wp_generate_auth_cookie( $current_user->ID, $expiration, 'logged_in', $token );
+
+        // Configure Request Arguments for GET.
+        $request_args = array(
+            'redirection' => 5,
+            'decompress'  => false,
+            'timeout'     => 60,
+            'cookies'     => array(
+                new \WP_Http_Cookie(
+                    array(
+                        'name'  => $auth_cookie_name,
+                        'value' => $auth_cookie,
+                    )
+                ),
+                new \WP_Http_Cookie(
+                    array(
+                        'name'  => LOGGED_IN_COOKIE,
+                        'value' => $logged_in_cookie,
+                    )
+                ),
+            ),
+        );
+
+        if ( 'premium_update' === $perform ) {
+            $request_args ['blocking'] = false;
+            $request_args ['timeout']  = 5;
+        }
+
+        // Build Final Target URL.
+        $full_url = add_query_arg( $get_args, admin_url( '/' . $path ) );
+
+        add_filter( 'http_request_args', array( MainWP_Helper::get_class_name(), 'reject_unsafe_urls_child' ), 99, 2 );
+        try {
+            // Execute Remote GET.
+            $response = wp_remote_get( $full_url, $request_args );
+        } finally {
+            remove_filter(
+                'http_request_args',
+                array( MainWP_Helper::get_class_name(), 'reject_unsafe_urls_child' ),
+                99,
+                2
+            );
+        }
+
+        if ( 'premium_update' === $perform ) {
+
+            $dispatch_success = ! is_wp_error( $response );
+
+            $upgrades_started = array();
+
+            if ( ! empty( $get_args['list'] ) ) {
+                foreach ( explode( ',', $get_args['list'] ) as $slug ) {
+                    $slug = trim( $slug );
+                    if ( '' !== $slug ) {
+                        $upgrades_started[ $slug ] = $dispatch_success;
+                    }
+                }
+            }
+
+            return array(
+                'status'           => $dispatch_success ? 'started' : 'failed',
+                'upgrades_started' => $upgrades_started,
+                'message'          => $dispatch_success
+                    ? esc_html__( 'Premium action requested. Please wait a moment and sync the data again later.', 'mainwp-child' )
+                    : esc_html__( 'Premium action request failed. Please try again later.', 'mainwp-child' ),
+                'message_code'     => $dispatch_success ? 'PREMIUM_ACTION_REQUESTED' : 'PREMIUM_ACTION_FAILED',
+            );
+        }
+
+        $http_code = wp_remote_retrieve_response_code( $response );
+
+        if ( 200 === (int) $http_code ) {
+            return array(
+                'success' => 1,
+            );
+        }
+
+        return array(
+            'http_code' => $http_code,
+        );
     }
 
     /**

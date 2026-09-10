@@ -190,7 +190,8 @@ class MainWP_Child_Cache_Purge_Pressable_Cloudflare_Test_Double extends MainWP_C
 	 * @return array Pressable purge result.
 	 */
 	public function pressable_cache_management_auto_purge_cache() {
-		return $this->purge_result( 'Pressable purge result.', $this->pressable_action );
+		$result_basis = 'SUCCESS' === $this->pressable_action ? 'provider_confirmed' : 'attempt_failed';
+		return $this->purge_result( 'Pressable purge result.', $this->pressable_action, $result_basis );
 	}
 
 	/**
@@ -205,7 +206,7 @@ class MainWP_Child_Cache_Purge_Pressable_Cloudflare_Test_Double extends MainWP_C
 			update_option( 'mainwp_cache_control_last_purged', 67890 );
 		}
 
-		return $this->purge_result( 'Cloudflare purge succeeded.', 'SUCCESS' );
+		return $this->purge_result( 'Cloudflare purge succeeded.', 'SUCCESS', 'provider_confirmed' );
 	}
 
 	/**
@@ -229,7 +230,7 @@ class MainWP_Child_Cache_Purge_Legacy_Cloudflare_Override_Test_Double extends Ma
 	 * @return array Cloudflare purge result.
 	 */
 	public function cloudflair_auto_purge_cache() {
-		return $this->purge_result( 'Legacy Cloudflare override succeeded.', 'SUCCESS' );
+		return $this->purge_result( 'Legacy Cloudflare override succeeded.', 'SUCCESS', 'provider_confirmed' );
 	}
 }
 
@@ -266,6 +267,7 @@ class Pressable_Cache_Purge_Test extends WP_UnitTestCase {
 		$result = $purger->pressable_cache_management_auto_purge_cache();
 
 		$this->assertSame( 'SUCCESS', $result['action'] );
+		$this->assertSame( 'provider_confirmed', $result['result_basis'] );
 		$this->assertSame( 1, $purger->edge_cache_purge_calls );
 		$this->assertNotFalse( get_option( 'mainwp_cache_control_last_purged', false ) );
 		$this->assertNotFalse( get_option( 'flush-obj-cache-time-stamp', false ) );
@@ -282,6 +284,7 @@ class Pressable_Cache_Purge_Test extends WP_UnitTestCase {
 		$result                      = $purger->pressable_cache_management_auto_purge_cache();
 
 		$this->assertSame( 'ERROR', $result['action'] );
+		$this->assertSame( 'attempt_failed', $result['result_basis'] );
 		$this->assertNotFalse( strpos( $result['result'], 'Object Cache' ) );
 		$this->assertSame( 1, $purger->edge_cache_purge_calls );
 		$this->assertSame( 12345, get_option( 'mainwp_cache_control_last_purged' ) );

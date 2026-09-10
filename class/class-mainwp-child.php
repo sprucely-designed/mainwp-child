@@ -35,7 +35,7 @@ class MainWP_Child {
      *
      * @var string MainWP Child plugin version.
      */
-    public static $version = '6.1.8'; // NOSONAR - not IP.
+    public static $version = '6.2'; // NOSONAR - not IP.
 
     /**
      * Private variable containing the latest MainWP Child update version.
@@ -534,10 +534,30 @@ class MainWP_Child {
         $function        = isset( $_POST['function'] ) ? sanitize_text_field( wp_unslash( $_POST['function'] ) ) : null;
         $nonce           = MainWP_System::instance()->validate_params( 'nonce' );
 
+        $connect_sign        = isset( $_POST['data_signature'] ) ? rawurldecode( wp_unslash( $_POST['data_signature'] ) ) : null; //phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized
+        $mainwpsignature_adv = isset( $_POST['mainwpsignature_adv'] ) ? rawurldecode( wp_unslash( $_POST['mainwpsignature_adv'] ) ) : ''; //phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized
+
         // phpcs:enable
 
-        // Authenticate here.
-        $auth = MainWP_Connect::instance()->auth( $mainwpsignature, $function, $nonce );
+        try {
+            // Authenticate here.
+            $auth = MainWP_Connect::instance()->auth(
+                $mainwpsignature,
+                $function,
+                $nonce,
+                array(
+                    'connect_sign'        => $connect_sign,
+                    'mainwpsignature_adv' => $mainwpsignature_adv,
+                )
+            );
+        } catch ( MainWP_Exception $ex ) {
+            $error = $ex->getMessage();
+            if ( ! empty( $error ) && is_string( $error ) ) {
+                $code = $ex->get_message_error_code();
+                MainWP_Helper::instance()->error( esc_html( $error ), ! empty( $code ) ? $code : null );
+            }
+            $auth = false;
+        }
 
         // Parse auth, if it is not correct actions then exit with message or return.
         if ( ! MainWP_Connect::instance()->parse_init_auth( $auth ) ) {
@@ -604,6 +624,8 @@ class MainWP_Child {
                 }
             }
         }
+
+        MainWP_Child_DB::maybe_cleanup_request_ids();
     }
 
     /**
